@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.venv
+
+# Project specific
+runs/
+*.pt
+*.pth
+.vscode/
+.idea/

@@ -1,0 +1,41 @@
+env:
+  grid: [40, 48] # 100x120 cm / 2.5cm
+  pallet_size_cm: [80.0, 120.0, 150.0]
+  num_envs: 2
+  buffer_N: 1
+  yaw_orients: [0, 90]
+  seed: 42
+
+model:
+  encoder2d:
+    base_channels: 16
+  unet2d:
+    base_channels: 16
+  policy_heads:
+    hidden: 64
+
+mask:
+  gating_lambda: 1.0
+
+train:
+  run_dir: "runs/test_run"
+  total_steps: 100
+  log_interval: 10
+  ckpt_interval: 50
+
+ppo:
+  lr: 3.0e-4
+  rollout_length: 16
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_coef: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  epochs_per_update: 2
+  minibatches_per_update: 2
+
+reward:
+  alpha_volume: 1.0
+  beta_stable: 0.5
+  gamma_contact: 0.1
+  delta_overflow: 2.0
