@@ -25,9 +25,9 @@ class PolicyHeads(nn.Module):
         logits_y = self.y_head(h)
         if mask is not None:
             eps = 1e-6
-            msum_x = (mask.sum(dim=2).clamp(min=eps))
-            logits_x = logits_x + gating_lambda * msum_x.log()
-            mmean_y = (mask.mean(dim=1).clamp(min=eps))
-            logits_y = logits_y + gating_lambda * mmean_y.log()
+            msum_x = mask.sum(dim=2)
+            logits_x = logits_x.masked_fill(msum_x == 0, -float('inf'))
+            mmean_y = mask.mean(dim=1)
+            logits_y = logits_y.masked_fill(mmean_y == 0, -float('inf'))
         value = self.value(h).squeeze(-1)
         return logits_pick, logits_yaw, logits_x, logits_y, value
