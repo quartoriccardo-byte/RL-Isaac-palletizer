@@ -2,11 +2,11 @@
 import os, argparse
 import numpy as np
 import torch
-from .algo.utils import load_config
-from .envs.vec_env_setup import make_vec_env
-from .models.encoder2d import Encoder2D
-from .models.unet2d import UNet2D
-from .models.policy_heads import PolicyHeads
+from pallet_rl.algo.utils import load_config
+from pallet_rl.envs.vec_env_setup import make_vec_env
+from pallet_rl.models.encoder2d import Encoder2D
+from pallet_rl.models.unet2d import UNet2D
+from pallet_rl.models.policy_heads import PolicyHeads
 
 class ActorCritic(torch.nn.Module):
     def __init__(self, cfg, in_ch:int):

@@ -5,13 +5,13 @@ import torch
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
-from .algo.utils import load_config
-from .envs.vec_env_setup import make_vec_env
-from .models.encoder2d import Encoder2D
-from .models.unet2d import UNet2D
-from .models.policy_heads import PolicyHeads
-from .algo.storage import RolloutBuffer
-from .algo.ppo import ppo_update
+from pallet_rl.algo.utils import load_config
+from pallet_rl.envs.vec_env_setup import make_vec_env
+from pallet_rl.models.encoder2d import Encoder2D
+from pallet_rl.models.unet2d import UNet2D
+from pallet_rl.models.policy_heads import PolicyHeads
+from pallet_rl.algo.storage import RolloutBuffer
+from pallet_rl.algo.ppo import ppo_update
 
 class ActorCritic(torch.nn.Module):
     def __init__(self, cfg, in_ch:int):
