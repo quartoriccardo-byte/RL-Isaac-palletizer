@@ -40,8 +40,13 @@ def main():
     parser.add_argument("--config", type=str, default="configs/base.yaml")
     
     if use_isaac:
-        from omni.isaac.lab.app import AppLauncher
-        AppLauncher.add_app_launcher_args(parser)
+        try:
+            from omni.isaac.lab.app import AppLauncher
+            AppLauncher.add_app_launcher_args(parser)
+        except ImportError:
+            print("WARNING: Failed to import 'omni'. Isaac Lab libraries are missing. Falling back to DummyVecEnv.")
+            use_isaac = False
+            os.environ["USE_ISAACLAB"] = "0"
         
     args = parser.parse_args()
     
