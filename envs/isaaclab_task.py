@@ -345,16 +345,18 @@ class IsaacLabVecEnv:
             
         return masks
 
-    def _update_heightmap_physx(self, roi=None):
+    def _update_heightmap_physx(self, rois=None):
         """
         Raycast based heightmap update using PhysX.
-        roi: Tuple (min_x_idx, max_x_idx, min_y_idx, max_y_idx) inclusive.
-             If None, updates entire grid.
+        rois: List of Tuple (min_x_idx, max_x_idx, min_y_idx, max_y_idx) inclusive.
+             One tuple per environment. If None, updates entire grid for all envs.
         """
         from pxr import Gf
 
         for i in range(self.num_envs):
             origin = self.env_origins[i]
+            
+            roi = rois[i] if rois is not None else None
             
             if roi is None:
                 r_range = range(self.L)

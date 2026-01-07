@@ -16,27 +16,12 @@ def run_micro_sim(sim_iface, thresholds:Dict, T:float, dt:float, substeps:int)->
     stable = (dcom <= thresholds["dcom_m"] and drot <= thresholds["drot_deg"])
     return MicroSimResult(stable, dcom, drot, contact)
 
-def compute_reward(cfg:Dict, box_vol_frac:float, ms:MicroSimResult, overflow:bool)->float:
+def compute_reward(cfg:Dict, box_vol_frac:float, ms:MicroSimResult, overflow:bool, height_std:float=0.0)->float:
     r = cfg["reward"]
     R = r["alpha_volume"] * float(box_vol_frac)
     R += (r["beta_stable"] if ms.stable else -r["beta_stable"])
     R -= r["gamma_contact"] * float(ms.contact_penalty)
     R -= 0.1 * height_std
-    # Height variance penalty
-    # We need height_std in ms or pass it? 
-    # The prompt says: "In compute_reward, add a penalty... Reward -= 0.1 * height_std".
-    # compute_reward signature currently is: (cfg, box_vol_frac, ms, overflow).
-    # It doesn't receive height_std.
-    # I need to change the signature of compute_reward to accept height_std.
-    # OR pass it via ms (MicroSimResult)? No, ms is about stability.
-    # I should add `height_std` argument to `compute_reward`.
-    
-    # Wait, simple replace won't work if I need to change signature.
-    # I will modify the signature in `pallet_task.py` and the call site in `isaaclab_task.py`.
-    # But I am in `pallet_task.py`.
-    
-    # Let's change this file first.
-    pass
     if overflow:
         R -= r["delta_overflow"]
     return R
