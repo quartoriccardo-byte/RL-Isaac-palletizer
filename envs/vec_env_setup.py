@@ -49,6 +49,14 @@ class DummyVecEnv:
         obs[:, 0, :, :] = self.heights
         return obs
 
+    def get_action_mask(self):
+        """
+        Returns a mask of valid actions. For dummy env, all 1.0 (valid).
+        Shape: (num_envs, L*W)
+        """
+        mask = np.ones((self.num_envs, self.L * self.W), dtype=np.float32)
+        return mask
+
 def make_vec_env(config: Dict):
     """
     Factory function to create the vectorized environment.

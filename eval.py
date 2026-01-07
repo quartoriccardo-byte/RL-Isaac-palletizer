@@ -21,11 +21,11 @@ class ActorCritic(torch.nn.Module):
                                  hidden=cfg["model"]["policy_heads"]["hidden"])
         self.gating_lambda = cfg["mask"]["gating_lambda"]
 
-    def forward_policy(self, obs):
+    def forward_policy(self, obs, mask=None):
         enc = self.encoder(obs)
-        mask = self.unet(obs)
-        logits_pick, logits_yaw, logits_x, logits_y, value = self.heads(enc, mask=mask, gating_lambda=self.gating_lambda)
-        return logits_pick, logits_yaw, logits_x, logits_y, value
+        # mask = self.unet(obs) # Ignored
+        logits_pick, logits_yaw, logits_pos, value = self.heads(enc, mask=mask, gating_lambda=self.gating_lambda)
+        return logits_pick, logits_yaw, logits_pos, value
 
 def main():
     parser = argparse.ArgumentParser()
@@ -46,7 +46,26 @@ def main():
     # Dummy evaluation loop
     for _ in range(10):
         with torch.no_grad():
-            logits_pick, logits_yaw, logits_x, logits_y, value = model.forward_policy(obs)
+            # No mask needed for dummy eval? Or get from vecenv?
+            # Model definition expects `mask` optional.
+            # Output unpacking: 4 values
+            logits_pick, logits_yaw, logits_pos, value = model.forward_policy(obs)
+            
+            # Simple greedy or sample debug
+            from torch.distributions.categorical import Categorical
+            dist_p = Categorical(logits=logits_pick)
+            dist_yaw = Categorical(logits=logits_yaw)
+            dist_pos = Categorical(logits=logits_pos)
+            
+            a_pick = dist_p.sample()
+            a_yaw = dist_yaw.sample()
+            a_pos = dist_pos.sample()
+            
+            x = a_pos // W
+            y = a_pos % W
+            
+            print(f"Sampled Action: Pick={a_pick.item()}, Yaw={a_yaw.item()}, X={x.item()}, Y={y.item()}")
+
         obs = torch.zeros_like(obs)
     print("Eval done (dummy). Integrate with Isaac env for real metrics.")
 
