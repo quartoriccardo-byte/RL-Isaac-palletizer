@@ -40,13 +40,19 @@ def ppo_update(model, optimizer, storage, cfg):
             j = idx[i*batch_size:(i+1)*batch_size]
             o = obs[j]; a = acts[j]; R = rets[j]; A = advs[j]; old_lp = old_logp[j]
 
-            logits_pick, logits_yaw, logits_x, logits_y, value = model.forward_policy(o)
+            # Reconstruct joint position action from x, y
+            # a is [pick, yaw, x, y]
+            # Need W from config to compute pos index
+            L, W = cfg["env"]["grid"]
+            a_pos = a[:, 2] * W + a[:, 3]
+            a_pos = a_pos.long()
+
+            logits_pick, logits_yaw, logits_pos, value = model.forward_policy(o)
             dist_p = Categorical(logits=logits_pick)
             dist_yaw = Categorical(logits=logits_yaw)
-            dist_x = Categorical(logits=logits_x)
-            dist_y = Categorical(logits=logits_y)
+            dist_pos = Categorical(logits=logits_pos)
 
-            lp = dist_p.log_prob(a[:,0]) + dist_yaw.log_prob(a[:,1]) + dist_x.log_prob(a[:,2]) + dist_y.log_prob(a[:,3])
+            lp = dist_p.log_prob(a[:,0]) + dist_yaw.log_prob(a[:,1]) + dist_pos.log_prob(a_pos)
             ratio = (lp - old_lp).exp()
 
             unclipped = ratio * A
@@ -54,7 +60,7 @@ def ppo_update(model, optimizer, storage, cfg):
             pg_loss = -torch.min(unclipped, clipped).mean()
 
             v_loss = 0.5 * F.mse_loss(value, R)
-            ent = (dist_p.entropy() + dist_yaw.entropy() + dist_x.entropy() + dist_y.entropy()).mean()
+            ent = (dist_p.entropy() + dist_yaw.entropy() + dist_pos.entropy()).mean()
 
             loss = pg_loss + vf_coef * v_loss - ent_coef * ent
 
