@@ -44,9 +44,16 @@ def main():
             from omni.isaac.lab.app import AppLauncher
             AppLauncher.add_app_launcher_args(parser)
         except ImportError:
-            print("WARNING: Failed to import 'omni'. Isaac Lab libraries are missing. Falling back to DummyVecEnv.")
-            use_isaac = False
-            os.environ["USE_ISAACLAB"] = "0"
+            # Check if strict headless mode is requested
+            import sys
+            if "--headless" in sys.argv:
+                print("FATAL ERROR: '--headless' requested but Isaac Lab libraries ('omni') are missing.")
+                print("Cannot run headless with DummyVecEnv. Please verify your environment variables and python path.")
+                sys.exit(1)
+            else:
+                print("WARNING: Failed to import 'omni'. Isaac Lab libraries are missing. Falling back to DummyVecEnv.")
+                use_isaac = False
+                os.environ["USE_ISAACLAB"] = "0"
         
     args = parser.parse_args()
     
