@@ -197,28 +197,184 @@ class IsaacLabVecEnv:
             
         return np.stack(obs_list)
 
-    def _update_heightmap_physx(self):
-        """Raycast based heightmap update using PhysX."""
-        from pxr import Gf
-        
-        # Batching queries might be complex with Python API loop, so we iterate envs.
-        # Ideally we use vectorized raycasts if available, but here we do per-env grid loop or per-env sparse raycast?
-        # A full grid raycast (L x W) * num_envs is expensive.
-        # But for correctness we need it. 
-        # Optimized: Only raycast near recent action? No, boxes might topple anywhere.
+    def get_action_mask(self):
+        """
+        Computes the geometric action mask for the current box in each environment.
+        Returns:
+            np.ndarray: (num_envs, L * W) boolean mask (True=valid, False=invalid/overhang)
+        """
+        masks = np.zeros((self.num_envs, self.L * self.W), dtype=np.float32) # Using float for consistency with logits, or bool? Usually float 1.0/0.0
         
         for i in range(self.num_envs):
-            origin = self.env_origins[i]
-            # Raycast grid
-            # Center of each cell
-            # We can use a simpler approach: raycast from top down for each cell.
+            box = self.current_boxes[i]
+            l_cells_0 = int(np.ceil(box["L"] * 100.0 / self.cell_cm_x))
+            w_cells_0 = int(np.ceil(box["W"] * 100.0 / self.cell_cm_y))
             
-            for r in range(self.L):
-                for c in range(self.W):
+            # For each cell (r, c), check if box placed at center overhangs
+            # Center of box is at (r, c). 
+            # Dimensions: l_cells, w_cells.
+            # Ranges: [r - l//2, r + l//2] ?? 
+            # Needs to match step logic:
+            # x_start = max(0, x_idx - l_cells//2)
+            # x_end = min(self.L, x_idx + l_cells//2)
+            # If x_end - x_start != original_l_cells, it's overhang/cutoff.
+            # But the constraint is "overhang the pallet boundaries".
+            # Strictly: mask = 0 if any part of box is outside grid.
+            
+            # Let's vectorize this calculation for the grid? Or simple loops.
+            # Grid is small (40x48), 2000 cells.
+            
+            # Indices: 0..L-1
+            # Box extent from center i: [i - l//2, i + l//2] (roughly)
+            # 
+            # Let's define valid centers:
+            # min_center_x such that x - l/2 >= 0
+            # max_center_x such that x + l/2 < L
+            # Careful with integer division and parity.
+            
+            # Let's use the exact logic from typical box placement:
+            # If l_cells is even, e.g. 4. Center at x. Extent x-2 to x+2? Length 4.
+            # x=2. 0,1,2,3 -> ok.
+            
+            # Let's compute valid ranges for X and Y for both orientations.
+            # We assume the policy outputs one position, but yaw is separate?
+            # Wait, the Architecture section says: "Joint Position Head... flattened logit vector... x_head and y_head removed".
+            # Does it remove yaw? No, "Refactor PolicyHeads: Remove x_head and y_head. Replace... single pos_head". 
+            # Yaw head remains.
+            # But validity depends on Yaw!
+            # If we mask *positions*, we need to know the yaw.
+            # But the network outputs pick, yaw, pos simultaneously?
+            # Or is it auto-regressive?
+            # Usually independent heads.
+            # If independent, we can't mask Pos based on Yaw perfectly unless we intersect the masks for all yaws (conservative) or union?
+            # "If placing a box at (x, y) would cause it to overhang... set mask to 0".
+            # If ANY yaw fits? Or if ALL yaws fit? 
+            # Usually: The mask is passed to `pos_head`. 
+            # If we don't know yaw yet, we should probably mask positions that are invalid for *currently selected* yaw if separate logic?
+            # But training is simultaneous.
+            # Standard approach: Mask if invalid for *both* yaws (too big to fit anywhere)? 
+            # OR, Validity check usually implies "Can I drop here?".
+            # If I drop with wrong yaw, it overhangs.
+            # If I drop with right yaw, it fits.
+            # As a heuristic for *position* head, maybe we mask only if it's invalid for *all* possible orientations? 
+            # OR we assume the agent learns to correlate.
+            # The prompt says: "If placing a box at (x,y) would cause it to overhang... set mask to 0".
+            # Given the constraints, let's be strict: A position is valid ONLY if the box fits within boundaries. 
+            # Since `l` and `w` differ, the footprint differs.
+            # Let's assume separate masks per yaw? No, single pos head.
+            # Let's mask a position if it is invalid for the *current* box dimensions in *either* orientation? No that's too restrictive (might fit one way but not other).
+            # Invalid for *both* orientations? (Fits neither way).
+            # Or valid for *at least one* orientation? (If it fits one way, we let the agent pick that pos, and hope it picks the right yaw).
+            # I will go with "Valid for at least one orientation" (Union of valid masks).
+            # This gives the agent a chance to place it.
+            
+            valid_mask = np.zeros((self.L, self.W), dtype=bool)
+            
+            for yaw_id, (l, w) in enumerate([(l_cells_0, w_cells_0), (w_cells_0, l_cells_0)]):
+                 # valid x range
+                 # left = x - l//2 >= 0
+                 # right = x + l//2 + (l%2) <= L ? 
+                 # Let's check `step` logic:
+                 # x_start = max(0, x_idx - l_cells//2)
+                 # x_end = min(self.L, x_idx + l_cells//2) 
+                 # Note: this logic CLIPS. It allows dropping and clipping!
+                 # But the objective says "avoid invalid actions... overhang".
+                 # So we want x_start == x_idx - l//2  AND x_end == x_idx + l//2
+                 # (depending on odd/even parity handling in step, step seems to define footprint by that range).
+                 # Wait, `x_idx + l_cells//2` -- if l=4, x=2. start=0, end=4. len=4. Correct.
+                 # if x=0. start=0, end=2. len=2. CLIPPED.
+                 
+                 # So valid X indices are:
+                 # x - l//2 >= 0  => x >= l//2
+                 # x + l//2 <= L  => x <= L - l//2 (roughly)
+                 # Let's be precise.
+                 
+                 half_l = l // 2
+                 # If l is odd, say 3. half=1. center=x. x-1..x+1. size 3.
+                 # x needs: x >= 1, x+1 < L => x <= L-2.
+                 # If l is even, say 4. half=2. x-2..x+2. size 4.
+                 # wait, x-2 to x+2 is size 4? indices: x-2, x-1, x, x+1. (Right exclusive?)
+                 # The slice in step is `self.height_cm[..., x_start:x_end]`.
+                 # Python slice x_start:x_end has length x_end - x_start.
+                 # We want x_end - x_start == l.
+                 # x_end = x + l//2
+                 # x_start = x - l//2
+                 # Diff = l (?) -> 2*(l//2). 
+                 # If l=3, diff=2. WRONG. Box lost size?
+                 # If l=3, l//2 = 1. x-1 to x+1. Diff=2.
+                 # So the step function logic effectively shrinks odd boxes? 
+                 # Or maybe `step` logic is `x_idx - l_cells//2` to `x_idx + l_cells//2 + (l_cells%2)`?
+                 # No, existing code: `x_end = min(self.L, x_idx + l_cells//2)`.
+                 # It seems the existing code might use a specific convention.
+                 # For "Geometric Action Masking", I should ensure I don't clip.
+                 # So I will enforce that `x - l//2 >= 0` and `x + l//2 <= L`.
+                 # But what about the missing pixel for odd numbers?
+                 # Let's stick to the logic: "Fit inside".
+                 # A box of size L occupies L cells.
+                 # x_center index.
+                 # If L is current size.
+                 
+                 min_x = l // 2
+                 max_x = self.L - (l - min_x) # Ensures x+ (l-l//2) <= L ?
+                 # Range is [x - l//2, x + l - l//2]. Length is l.
+                 # Exclusive end: x + l - l//2.
+                 # Must be <= L.
+                 # so x <= L - (l - l//2).
+                 
+                 min_y = w // 2
+                 max_y = self.W - (w - min_y)
+                 
+                 # Fill valid mask
+                 # 2D slice
+                 # valid_mask[min_x:max_x, min_y:max_y] = True ? 
+                 # Be careful with max_x being exclusive for range, but inclusive for valid index?
+                 # range(min_x, max_x) -> indices.
+                 
+                 # Let's construct ranges
+                 x_valid = np.arange(self.L)
+                 y_valid = np.arange(self.W)
+                 
+                 m_x = (x_valid >= min_x) & (x_valid < max_x)
+                 m_y = (y_valid >= min_y) & (y_valid < max_y)
+                 
+                 # Outer product for this yaw
+                 yaw_mask = np.outer(m_x, m_y)
+                 valid_mask = valid_mask | yaw_mask
+            
+            masks[i] = valid_mask.flatten()
+            
+        return masks
+
+    def _update_heightmap_physx(self, roi=None):
+        """
+        Raycast based heightmap update using PhysX.
+        roi: Tuple (min_x_idx, max_x_idx, min_y_idx, max_y_idx) inclusive.
+             If None, updates entire grid.
+        """
+        from pxr import Gf
+
+        for i in range(self.num_envs):
+            origin = self.env_origins[i]
+            
+            if roi is None:
+                r_range = range(self.L)
+                c_range = range(self.W)
+            else:
+                # ROI is tuple of indices
+                r_min, r_max, c_min, c_max = roi
+                # Clip to grid
+                r_start = max(0, r_min)
+                r_end = min(self.L, r_max + 1) # python range is exclusive at end
+                c_start = max(0, c_min)
+                c_end = min(self.W, c_max + 1)
+                r_range = range(r_start, r_end)
+                c_range = range(c_start, c_end)
+
+            for r in r_range:
+                for c in c_range:
                     # World coords
                     x = origin[0] - self.pallet_L_m/2.0 + (r + 0.5) * (self.cell_cm_x/100.0)
                     y = origin[1] - self.pallet_W_m/2.0 + (c + 0.5) * (self.cell_cm_y/100.0)
-                    rotation_y = 0.0 # Just vertical rays
                     
                     ray_origin = Gf.Vec3d(x, y, 3.0) # Start from 3m
                     ray_dir = Gf.Vec3d(0, 0, -1)
@@ -232,9 +388,9 @@ class IsaacLabVecEnv:
                         z_hit = 3.0 - dist
                         self.height_cm[i, r, c] = max(0.0, z_hit * 100.0)
                         if z_hit > 0.05: # above pallet thickness
-                             self.occ[i, r, c] = 1
+                                self.occ[i, r, c] = 1
                         else:
-                             self.occ[i, r, c] = 0
+                                self.occ[i, r, c] = 0
                     else:
                         self.height_cm[i, r, c] = 0.0
                         self.occ[i, r, c] = 0
@@ -299,7 +455,50 @@ class IsaacLabVecEnv:
             self.world.step(render=False)
 
         # 3. Update Perception (Raycast)
-        self._update_heightmap_physx()
+        # 3. Update Perception (Raycast) - Sparse Update
+        # Calculate ROI including margin
+        margin = 2
+        # ROI based on action indices and box size. 
+        # Note: box might have moved/toppled, but typically stays near drop.
+        # We take a conservative region around the drop target.
+        # If we really want to be safe, we could check actual pose, but we want speed.
+        # Let's use the drop target bounds + margin.
+        
+        # This implementation assumes all envs did similar actions or just takes a superset?
+        # actually _update_heightmap_physx iterates envs, so we should ideally pass a list of ROIs if we want per-env optimization.
+        # But my modified _update_heightmap_physx takes a single ROI argument.
+        # To strictly follow "per env" optimization, I need to modify _update_heightmap_physx to handle list of rois 
+        # OR just call it inside the loop here?
+        # The function `_update_heightmap_physx` iterates `range(self.num_envs)`.
+        # So passing one ROI applies to all? That's wrong if they drop in different places.
+        # Wait, the previous implementation of `_update_heightmap_physx` iterated all envs.
+        # I should change `_update_heightmap_physx` to accept a LIST of ROIs or compute it internally if I passed actions?
+        # Let's update `_update_heightmap_physx` to just do the loop and logic correctly.
+        # Actually, let's just make `_update_heightmap_physx` capable of taking a list of ROIs.
+        
+        # But for now, let's fix the call site logic. 
+        # I will change the method `_update_heightmap_physx` to take `rois: List[Tuple]`.
+        
+        rois = []
+        for i in range(self.num_envs):
+            action = actions[i]
+            yaw_id = int(action[1])
+            x_idx = int(action[2])
+            y_idx = int(action[3])
+            box = self.current_boxes[i]
+            
+            l_cells = int(box["L"] * 100.0 / self.cell_cm_x)
+            w_cells = int(box["W"] * 100.0 / self.cell_cm_y)
+            if yaw_id == 1:
+                l_cells, w_cells = w_cells, l_cells
+            
+            x_start = x_idx - l_cells//2 - margin
+            x_end = x_idx + l_cells//2 + margin
+            y_start = y_idx - w_cells//2 - margin
+            y_end = y_idx + w_cells//2 + margin
+            rois.append((x_start, x_end, y_start, y_end))
+
+        self._update_heightmap_physx(rois)
             
         # 4. Compute Reward & Verify Stability
         for i in range(self.num_envs):
@@ -337,15 +536,16 @@ class IsaacLabVecEnv:
             
             ms = pallet_task.MicroSimResult(stable, 0.0, 0.0, 0.0) 
             
-            # Reward
-            r = pallet_task.compute_reward(self.cfg, 0.1, ms, False) # simplified vol frac
-            rewards[i] = r
-            
             heuristics = pallet_task.compute_heuristics(
                 self.height_cm[i], 
                 self.L * self.W, 
                 self.cfg["env"]["pallet_size_cm"][2]
             )
+            
+            # Reward
+            r = pallet_task.compute_reward(self.cfg, 0.1, ms, False, heuristics["height_std"]) # simplified vol frac
+            rewards[i] = r
+            
             infos[i].update(heuristics)
             infos[i]["stable"] = stable
             

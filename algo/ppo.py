@@ -62,3 +62,9 @@ def ppo_update(model, optimizer, storage, cfg):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
             optimizer.step()
+            
+    return {
+        "loss/policy": pg_loss.item(),
+        "loss/value": v_loss.item(),
+        "loss/entropy": ent.item()
+    }

@@ -12,8 +12,8 @@ class PolicyHeads(nn.Module):
         self.trunk = nn.Sequential(nn.Linear(feat, hidden), nn.ReLU(inplace=True))
         self.pick = nn.Linear(hidden, n_pick)
         self.yaw = nn.Linear(hidden, n_yaw)
-        self.x_head = nn.Linear(hidden, self.L)
-        self.y_head = nn.Linear(hidden, self.W)
+        # Joint position head
+        self.pos_head = nn.Linear(hidden, self.L * self.W)
         self.value = nn.Linear(hidden, 1)
 
     def forward(self, enc_feat, mask=None, gating_lambda=2.0):
@@ -21,13 +21,13 @@ class PolicyHeads(nn.Module):
         h = self.trunk(h)
         logits_pick = self.pick(h)
         logits_yaw = self.yaw(h)
-        logits_x = self.x_head(h)
-        logits_y = self.y_head(h)
+        logits_pos = self.pos_head(h)
+        
         if mask is not None:
-            eps = 1e-6
-            msum_x = mask.sum(dim=2)
-            logits_x = logits_x.masked_fill(msum_x == 0, -float('inf'))
-            mmean_y = mask.mean(dim=1)
-            logits_y = logits_y.masked_fill(mmean_y == 0, -float('inf'))
+            # mask is (B, L*W)
+            # logits_pos is (B, L*W)
+            # Apply -inf where mask is 0 (False)
+            logits_pos = logits_pos.masked_fill(mask == 0, -float('inf'))
+            
         value = self.value(h).squeeze(-1)
-        return logits_pick, logits_yaw, logits_x, logits_y, value
+        return logits_pick, logits_yaw, logits_pos, value

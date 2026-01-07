@@ -26,11 +26,11 @@ class ActorCritic(torch.nn.Module):
                                  hidden=cfg["model"]["policy_heads"]["hidden"])
         self.gating_lambda = cfg["mask"]["gating_lambda"]
 
-    def forward_policy(self, obs):
+    def forward_policy(self, obs, mask=None):
         enc = self.encoder(obs)
-        mask = self.unet(obs)
-        logits_pick, logits_yaw, logits_x, logits_y, value = self.heads(enc, mask=mask, gating_lambda=self.gating_lambda)
-        return logits_pick, logits_yaw, logits_x, logits_y, value
+        # mask = self.unet(obs) # Ignored
+        logits_pick, logits_yaw, logits_pos, value = self.heads(enc, mask=mask, gating_lambda=self.gating_lambda)
+        return logits_pick, logits_yaw, logits_pos, value
 
 def main():
     parser = argparse.ArgumentParser()
@@ -54,18 +54,26 @@ def main():
     while global_steps < cfg["train"]["total_steps"]:
         storage.reset()
         for t in range(cfg["ppo"]["rollout_length"]):
-            logits_pick, logits_yaw, logits_x, logits_y, value = model.forward_policy(obs)
+            # Get action mask
+            # mask: (N, L*W)
+            mask_np = vecenv.get_action_mask()
+            mask = torch.as_tensor(mask_np, device=device)
+
+            logits_pick, logits_yaw, logits_pos, value = model.forward_policy(obs, mask=mask)
 
             dist_p = Categorical(logits=logits_pick)
             dist_yaw = Categorical(logits=logits_yaw)
-            dist_x = Categorical(logits=logits_x)
-            dist_y = Categorical(logits=logits_y)
+            dist_pos = Categorical(logits=logits_pos)
 
             a_pick = dist_p.sample()
             a_yaw = dist_yaw.sample()
-            a_x = dist_x.sample()
-            a_y = dist_y.sample()
-            logprob = dist_p.log_prob(a_pick) + dist_yaw.log_prob(a_yaw) + dist_x.log_prob(a_x) + dist_y.log_prob(a_y)
+            a_pos = dist_pos.sample()
+            
+            # Decode pos
+            a_x = a_pos // W
+            a_y = a_pos % W
+            
+            logprob = dist_p.log_prob(a_pick) + dist_yaw.log_prob(a_yaw) + dist_pos.log_prob(a_pos)
 
             # Pass actions to environment
             actions_np = torch.stack([a_pick, a_yaw, a_x, a_y], dim=1).cpu().numpy()
@@ -79,9 +87,26 @@ def main():
 
             global_steps += cfg["env"]["num_envs"]
             if global_steps % cfg["train"]["log_interval"] == 0:
+                # Log Rewards
                 writer.add_scalar("train/reward_mean", reward.mean().item(), global_steps)
+                
+                # Log KPIs
+                # infos is a list of dicts.
+                vol_eff = np.mean([info.get("volume_ratio", 0.0) for info in infos])
+                stab_rate = np.mean([float(info.get("stable", 0.0)) for info in infos])
+                h_var = np.mean([info.get("height_std", 0.0) for info in infos])
+                surf_cov = np.mean([info.get("surface_coverage", 0.0) for info in infos])
+                
+                writer.add_scalar("train/volume_efficiency", vol_eff, global_steps)
+                writer.add_scalar("train/stability_rate", stab_rate, global_steps)
+                writer.add_scalar("train/height_variance", h_var, global_steps)
+                writer.add_scalar("train/surface_coverage", surf_cov, global_steps)
 
-        ppo_update(model, optim, storage, cfg)
+        loss_metrics = ppo_update(model, optim, storage, cfg)
+        # Log PPO metrics
+        if global_steps % cfg["train"]["log_interval"] == 0 and loss_metrics is not None:
+            for k, v in loss_metrics.items():
+                writer.add_scalar(k, v, global_steps)
 
         if global_steps % cfg["train"]["ckpt_interval"] == 0:
             ckpt_path = os.path.join(cfg["train"]["run_dir"], f"ckpt_{global_steps}.pt")
