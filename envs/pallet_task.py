@@ -47,6 +47,12 @@ class PalletTask(DirectRLEnv):
         self.robot_state_dim = cfg.robot_state_dim
         self.map_size = cfg.map_size
         
+        # Dynamic calculation of observation dimension
+        # Should be done before super().__init__ if DirectRLEnv uses it, 
+        # but DirectRLEnv uses cfg.num_observations.
+        # So we update cfg.num_observations first.
+        cfg.num_observations = (self.robot_state_dim) + (self.map_size * self.map_size)
+        
         super().__init__(cfg, render_mode, **kwargs)
         
         # Warp Rasterizer Init

@@ -141,7 +141,18 @@ def rasterize_heightmap_kernel(
 
 class WarpHeightmapGenerator:
     def __init__(self, device: str, num_envs: int, max_boxes: int, grid_res: float, map_size: int, pallet_dims: tuple):
-        self.device = device
+        # Ensure device is a string compatible with Warp
+        if isinstance(device, torch.device):
+            self.device = str(device)
+        else:
+            self.device = str(device)
+            
+        # Warp expects 'cuda:0' or 'cuda'. 
+        # If 'cuda:0' is passed, it should work.
+        if "cuda" in self.device and ":" not in self.device:
+             self.device = "cuda:0" # Default to 0 if just cuda
+             
+        # self.device = device
         self.num_envs = num_envs
         self.max_boxes = max_boxes
         self.grid_res = grid_res
