@@ -31,6 +31,7 @@ def ppo_update(model, optimizer, storage, cfg):
     rets = returns.reshape(B)
     advs = adv.reshape(B)
     old_logp = storage.logprobs.reshape(B)
+    masks = storage.masks.reshape(B, *storage.masks.shape[2:])
 
     batch_size = max(1, B // minibatches)
 
@@ -38,7 +39,7 @@ def ppo_update(model, optimizer, storage, cfg):
     for _ in range(epochs):
         for i in range(minibatches):
             j = idx[i*batch_size:(i+1)*batch_size]
-            o = obs[j]; a = acts[j]; R = rets[j]; A = advs[j]; old_lp = old_logp[j]
+            o = obs[j]; a = acts[j]; R = rets[j]; A = advs[j]; old_lp = old_logp[j]; m = masks[j]
 
             # Reconstruct joint position action from x, y
             # a is [pick, yaw, x, y]
@@ -47,7 +48,7 @@ def ppo_update(model, optimizer, storage, cfg):
             a_pos = a[:, 2] * W + a[:, 3]
             a_pos = a_pos.long()
 
-            logits_pick, logits_yaw, logits_pos, value = model.forward_policy(o)
+            logits_pick, logits_yaw, logits_pos, value = model.forward_policy(o, mask=m)
             dist_p = Categorical(logits=logits_pick)
             dist_yaw = Categorical(logits=logits_yaw)
             dist_pos = Categorical(logits=logits_pos)

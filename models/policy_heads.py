@@ -2,7 +2,7 @@
 import torch
 import torch.nn as nn
 
-class PolicyHeads(nn.Module):
+class SpatialPolicyHead(nn.Module):
     def __init__(self, enc_out_ch:int, grid_hw, n_pick:int, n_yaw:int, hidden:int=256):
         super().__init__()
         self.L, self.W = grid_hw
@@ -26,8 +26,8 @@ class PolicyHeads(nn.Module):
         if mask is not None:
             # mask is (B, L*W)
             # logits_pos is (B, L*W)
-            # Apply -inf where mask is 0 (False)
-            logits_pos = logits_pos.masked_fill(mask == 0, -float('inf'))
+            # Apply -1e8 where mask is 0 (False)
+            logits_pos = logits_pos.masked_fill(mask == 0, -1e8)
             
         value = self.value(h).squeeze(-1)
         return logits_pick, logits_yaw, logits_pos, value
