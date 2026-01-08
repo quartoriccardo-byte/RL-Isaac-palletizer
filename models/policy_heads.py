@@ -6,8 +6,8 @@ class SpatialPolicyHead(nn.Module):
     def __init__(self, enc_out_ch:int, grid_hw, n_pick:int, n_yaw:int, hidden:int=256):
         super().__init__()
         self.L, self.W = grid_hw
-        # Encoder2D downsamples by 4 (stride 4 total), not 8
-        feat = enc_out_ch * (self.L//4) * (self.W//4)
+        # Encoder2D (New simplified) does NOT downsample
+        feat = enc_out_ch * self.L * self.W
         self.flatten = nn.Flatten()
         self.trunk = nn.Sequential(nn.Linear(feat, hidden), nn.ReLU(inplace=True))
         self.pick = nn.Linear(hidden, n_pick)

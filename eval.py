@@ -13,7 +13,7 @@ class ActorCritic(torch.nn.Module):
         super().__init__()
         L, W = cfg["env"]["grid"]
         base = cfg["model"]["encoder2d"]["base_channels"]
-        self.encoder = Encoder2D(in_ch=in_ch, base=base)
+        self.encoder = Encoder2D(in_channels=in_ch, features=base)
         self.unet = UNet2D(in_ch=in_ch, base=cfg["model"]["unet2d"]["base_channels"])
         self.heads = SpatialPolicyHead(self.encoder.out_ch, (L, W),
                                  n_pick=cfg["env"]["buffer_N"],
