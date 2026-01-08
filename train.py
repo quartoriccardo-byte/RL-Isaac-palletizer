@@ -105,37 +105,10 @@ def main():
                 logprobs[step] = logprob
                 
                 # Execute action
-                # Need to convert flattened action index back to whatever env expects if it expects split
-                # Env `step` usually takes numpy actions.
-                # If env expects (pick, yaw, x, y), we need to decode.
-                # PPO act returns flattened index.
-                # We need a decoder here or env handles it?
-                # The prompt doesn't specify decoder logic, but Phase 1 SpatialPolicyHead output flat logits.
-                # We should probably decode based on grid size.
+                # `action` is a flat index tensor (Batch,)
+                # vecenv.step decodes it internally
+                next_obs_np, reward_np, done_np, infos = vecenv.step(action)
                 
-                # HACK: Assume env helper or decode locally
-                # SpatialHead: (Rot, H, W).
-                # Rotations = 4.
-                # Grid = obs_shape[1], obs_shape[2] ?
-                H, W = obs_shape[1], obs_shape[2]
-                n_rot = 4 
-                
-                # Decode
-                a_idx = action.cpu().numpy()
-                # rot = idx // (H*W)
-                # content = idx % (H*W)
-                # x = content // W
-                # y = content % W
-                
-                rot = a_idx // (H*W)
-                rem = a_idx % (H*W)
-                x = rem // W
-                y = rem % W
-                pick = np.zeros_like(x) # Placeholder for pick? Prompt removed "pick" head. Assuming mostly "place".
-                
-                env_actions = np.stack([pick, rot, x, y], axis=1)
-                
-                next_obs_np, reward_np, done_np, infos = vecenv.step(env_actions)
                 rewards[step] = torch.tensor(reward_np, device=device).view(-1)
                 next_done = torch.as_tensor(done_np, device=device).float()
                 dones[step] = next_done

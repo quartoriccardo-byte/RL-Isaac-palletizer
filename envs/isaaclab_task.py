@@ -15,6 +15,7 @@ import os
 
 from . import pallet_task
 from . import heightmap_channels
+from pallet_rl.algo.utils import decode_action
 
 class IsaacLabVecEnv:
     def __init__(self, cfg:Dict):
@@ -406,10 +407,16 @@ class IsaacLabVecEnv:
         infos = [{} for _ in range(self.num_envs)]
         
         for i in range(self.num_envs):
-            action = actions[i]
-            yaw_id = int(action[1])
-            x_idx = int(action[2])
-            y_idx = int(action[3])
+            # Decode action
+            # Network output is flat index
+            action_idx = actions[i]
+            # Assumes num_rotations = 4 (default). Should match config/model.
+            # Grid width self.W
+            rot_idx, x_idx, y_idx = decode_action(action_idx, self.W, 4)
+            
+            yaw_id = int(rot_idx)
+            x_idx = int(x_idx)
+            y_idx = int(y_idx)
             
             box = self.current_boxes[i]
             prim_path = self.current_box_prims[i]
@@ -483,10 +490,12 @@ class IsaacLabVecEnv:
         
         rois = []
         for i in range(self.num_envs):
-            action = actions[i]
-            yaw_id = int(action[1])
-            x_idx = int(action[2])
-            y_idx = int(action[3])
+            # Re-decode since we are in a new loop (or store them above)
+            action_idx = actions[i]
+            rot_idx, x_idx, y_idx = decode_action(action_idx, self.W, 4)
+            yaw_id = int(rot_idx)
+            x_idx = int(x_idx)
+            y_idx = int(y_idx)
             box = self.current_boxes[i]
             
             l_cells = int(box["L"] * 100.0 / self.cell_cm_x)
