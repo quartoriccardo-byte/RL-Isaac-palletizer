@@ -1,26 +1,24 @@
 
 import yaml
+import torch
 
 def load_config(config_path):
     with open(config_path, "r") as f:
         return yaml.safe_load(f)
 
-def decode_action(action_idx, width, num_rotations):
+def decode_action(action_idx: torch.Tensor, width: int, num_rotations: int):
     """
-    Decodes a flat action index into (rot_idx, x, y).
-    Args:
-        action_idx: Tensor of shape (Batch,)
-        width: Width of the heightmap (e.g., 128)
-        num_rotations: Number of discrete rotations (e.g., 4)
+    Decodes a flat action index into (rot_idx, x, y) coordinates.
+    Formula: index = rot * (W*H) + y * W + x
     """
     area = width * width
     
-    # 1. Determine Rotation Index
+    # 1. Extract Rotation
     rot_idx = action_idx // area
     
-    # 2. Determine Spatial Coordinates
-    remainder = action_idx % area
-    y = remainder // width
-    x = remainder % width
+    # 2. Extract Spatial Position
+    spatial_idx = action_idx % area
+    y = spatial_idx // width
+    x = spatial_idx % width
     
     return rot_idx, x, y

@@ -7,33 +7,9 @@ from torch.distributions import Categorical
 
 from pallet_rl.models.encoder2d import Encoder2D
 from pallet_rl.models.policy_heads import SpatialPolicyHead
+from pallet_rl.models.actor_critic import ActorCritic
 
-class ActorCritic(nn.Module):
-    def __init__(self, in_channels, encoder_features, num_rotations=4):
-        super().__init__()
-        self.encoder = Encoder2D(in_channels=in_channels, features=encoder_features)
-        # Policy Head (Actor)
-        self.actor = SpatialPolicyHead(in_channels=encoder_features, num_rotations=num_rotations)
-        # Value Head (Critic) - needs to process encoder features to scalar
-        # Assuming encoder outputs (B, Features, H, W), we probably need to average pool or flatten for value
-        self.critic_head = nn.Sequential(
-             nn.AdaptiveAvgPool2d(1),
-             nn.Flatten(),
-             nn.Linear(encoder_features, 64),
-             nn.ReLU(),
-             nn.Linear(64, 1)
-        )
 
-    def forward(self, x, mask=None):
-        features = self.encoder(x)
-        logits = self.actor(features, mask=mask)
-        value = self.critic_head(features).squeeze(-1)
-        return logits, value
-
-    def get_value(self, x):
-        features = self.encoder(x)
-        value = self.critic_head(features).squeeze(-1)
-        return value
 
 class PPO:
     def __init__(self, config, obs_shape):
