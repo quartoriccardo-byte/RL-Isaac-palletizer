@@ -2,16 +2,9 @@
 
 This repository contains a Reinforcement Learning implementation for robotic palletizing using NVIDIA Isaac Lab (Isaac Sim) and PPO.
 
-## Prerequisites
+## Quick Start
 
-- **OS**: Linux (tested on Ubuntu 20.04/22.04) or Windows 10/11
-- **GPU**: NVIDIA RTX GPU with drivers supporting CUDA 11.x/12.x
-- **Software**:
-  - [NVIDIA Isaac Sim 4.0+](https://docs.omniverse.nvidia.com/isaacsim/latest/installation/index.html)
-  - [Isaac Lab](https://isaac-sim.github.io/IsaacLab/)
-  - Python 3.10 (bundled with Isaac Sim) or equivalent environment
-
-## Installation
+### Installation
 
 1. **Clone the repository**:
 
@@ -27,50 +20,26 @@ This repository contains a Reinforcement Learning implementation for robotic pal
    pip install -e .
    ```
 
-   *Note: Standard dependencies like `torch` are assumed to be present from Isaac Lab installation.*
-
-## Usage
-
 ### Training
 
-To launch the PPO training loop:
+To launch the training loop in headless mode (recommended for training):
 
 ```bash
-# Run with Isaac Lab (Simulated Env)
-python src/pallet_rl/train.py --config src/pallet_rl/configs/base.yaml --headless
-
-# Run in Headless mode (no GUI)
-python src/pallet_rl/train.py --config src/pallet_rl/configs/base.yaml --headless
+python src/pallet_rl/train.py --headless
 ```
 
-To run with the GUI (for debugging, slower):
+### Architecture
 
-```bash
-python src/pallet_rl/train.py --config src/pallet_rl/configs/base.yaml
-```
+The agent uses an **Actor-Critic** architecture:
 
-**Note**: If Isaac Lab is not found, the script falls back to a dummy environment (for testing logic).
-
-### Visualization / Evaluation
-
-To evaluate a trained checkpoint:
-
-```bash
-python src/pallet_rl/eval.py --checkpoint runs/prod_run/ckpt_500.pt
-```
-
-This runs the policy in inference mode. If running with Isaac Lab, it will open the simulator window to visualize the agent's actions.
+1. **Encoder**: A 3-layer CNN (`Encoder2D`) that processes the heightmap observation into latent features.
+2. **Spatial Policy Head**: A convolutional head that outputs a probability map `(Batch, Rotations, H, W)` representing the logits for placing a box at a specific `(x, y)` location with a specific rotation.
+    * **Action Masking**: Invalid actions (e.g., overhangs) are masked out with `-1e8` to ensure the agent only selects valid placements.
 
 ## Project Structure
 
-- `algo/`: PPO implementation and RolloutBuffer.
-- `configs/`: Hyperparameter configurations (`base.yaml`).
-- `envs/`: Environment logic.
-  - `isaaclab_task.py`: Main Isaac Lab integration (PhysX, Scene, Rewards).
-  - `heightmap_channels.py`: Logic for converting heightmaps to observation tensors.
-- `models/`: Neural Network Architecture.
-  - `encoder2d.py`: ResNet-like 2D Encoder.
-  - `unet2d.py`: U-Net for auxiliary tasks/masking (if used).
-  - `policy_heads.py`: `SpatialPolicyHead` with action masking.
-- `train.py`: Main training entry point.
-- `eval.py`: Evaluation entry point.
+* `algo/`: PPO implementation (`ppo.py`).
+* `configs/`: Hyperparameter configurations (`base.yaml`).
+* `envs/`: Environment logic.
+* `models/`: Neural Network Architecture (`encoder2d.py`, `policy_heads.py`).
+* `train.py`: Main training script.

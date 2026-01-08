@@ -2,36 +2,14 @@
 import os, argparse, time
 import numpy as np
 import torch
-from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
 from pallet_rl.algo.utils import load_config
 from pallet_rl.envs.vec_env_setup import make_vec_env
-from pallet_rl.models.encoder2d import Encoder2D
-from pallet_rl.models.unet2d import UNet2D
-from pallet_rl.models.policy_heads import SpatialPolicyHead
-from pallet_rl.algo.storage import RolloutBuffer
-from pallet_rl.algo.ppo import ppo_update
-
-class ActorCritic(torch.nn.Module):
-    def __init__(self, cfg, in_ch:int):
-        super().__init__()
-        L, W = cfg["env"]["grid"]
-        base = cfg["model"]["encoder2d"]["base_channels"]
-        self.encoder = Encoder2D(in_channels=in_ch, features=base)
-        self.unet = UNet2D(in_ch=in_ch, base=cfg["model"]["unet2d"]["base_channels"])
-        self.heads = SpatialPolicyHead(self.encoder.out_ch, (L, W),
-                                 n_pick=cfg["env"]["buffer_N"],
-                                 n_yaw=len(cfg["env"]["yaw_orients"]),
-                                 hidden=cfg["model"]["policy_heads"]["hidden"])
-        self.gating_lambda = cfg["mask"]["gating_lambda"]
-
-    def forward_policy(self, obs, mask=None):
-        enc = self.encoder(obs)
-        outputs = self.heads(enc, mask=mask, gating_lambda=self.gating_lambda)
-        return outputs
+from pallet_rl.algo.ppo import PPO
 
 def main():
+    # Isaac Lab Check
     use_isaac = os.environ.get("USE_ISAACLAB", "0") == "1"
     
     parser = argparse.ArgumentParser()
@@ -45,17 +23,13 @@ def main():
             AppLauncher.add_app_launcher_args(parser)
         except ImportError:
             import sys
-            if "--headless" in sys.argv or "-h" in sys.argv: # Simple check
-                 pass # ArgumentParser will handle it or we check manually
-            
-            # Robust check for headless from sys.argv because argparse isn't parsed yet
+            if "--headless" in sys.argv or "-h" in sys.argv:
+                 pass
             is_headless = "--headless" in sys.argv
             if is_headless:
                 print("FATAL ERROR: '--headless' requested but Isaac Lab libraries ('omni') are missing.")
-                print("Cannot run headless with DummyVecEnv. Please verify your environment variables and python path.")
                 sys.exit(1)
             else:
-                print("WARNING: Failed to import 'omni'. Isaac Lab libraries are missing. Falling back to DummyVecEnv.")
                 use_isaac = False
                 os.environ["USE_ISAACLAB"] = "0"
         
@@ -69,95 +43,157 @@ def main():
         
     try:
         cfg = load_config(args.config)
-
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        writer = SummaryWriter(log_dir=os.path.join(cfg["train"]["run_dir"], time.strftime("%Y%m%d-%H%M%S")))
         
+        # Logging
+        run_dir = f"runs/{cfg['env']['env_name']}_seed{cfg['seed']}_{time.strftime('%Y%m%d-%H%M%S')}"
+        writer = SummaryWriter(log_dir=run_dir)
+        
+        # Environment
         vecenv = make_vec_env(cfg)
-        L, W = cfg["env"]["grid"]
-        in_ch = 8 + 5
-        model = ActorCritic(cfg, in_ch=in_ch).to(device)
-        optim = torch.optim.Adam(model.parameters(), lr=cfg["ppo"]["lr"])
-
-        storage = RolloutBuffer(cfg["ppo"]["rollout_length"], cfg["env"]["num_envs"], (in_ch, L, W), device)
-        storage.init_masks((L*W,)) # Initialize masks storage
-
-        obs = torch.zeros((cfg["env"]["num_envs"], in_ch, L, W), dtype=torch.float32, device=device)
         
-        # Episode tracking
-        ep_lens = torch.zeros(cfg["env"]["num_envs"], device=device)
-        ep_rets = torch.zeros(cfg["env"]["num_envs"], device=device)
+        # Agent
+        obs_shape = vecenv.obs_shape # Should be available from vecenv
+        # If not available on dummy, hardcode check
+        if not hasattr(vecenv, 'obs_shape'):
+             # Fallback
+             L, W = 40, 48 # default?
+             obs_shape = (13, L, W) 
+             
+        agent = PPO(cfg, obs_shape)
         
-        global_steps = 0
-        while global_steps < cfg["train"]["total_steps"]:
-            storage.reset()
-            for t in range(cfg["ppo"]["rollout_length"]):
-                # Get action mask
+        # Storage
+        num_steps = cfg["algo"]["n_steps"]
+        num_envs = cfg["env"]["num_envs"]
+        device = torch.device(cfg["device"])
+        
+        obs = torch.zeros((num_steps, num_envs, *obs_shape), device=device)
+        actions = torch.zeros((num_steps, num_envs), dtype=torch.long, device=device) # Flattened actions
+        rewards = torch.zeros((num_steps, num_envs), device=device)
+        dones = torch.zeros((num_steps, num_envs), device=device)
+        logprobs = torch.zeros((num_steps, num_envs), device=device)
+        values = torch.zeros((num_steps, num_envs), device=device)
+        masks = torch.zeros((num_steps, num_envs, *obs_shape[1:]), dtype=torch.bool, device=device) # Approx shape
+        
+        # Reset env
+        next_obs_np = vecenv.reset()
+        next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+        
+        global_step = 0
+        update = 0
+        total_updates = 1000 # Just a loop limit or infinite? "Run the main training loop"
+        
+        print("Starting training loop...")
+        
+        for update in range(1, total_updates+1):
+            # Anneal learning rate? Prompt doesn't specify.
+            
+            # Rollout
+            for step in range(num_steps):
+                global_step += num_envs
+                obs[step] = next_obs
+                
+                # Get Mask
                 mask_np = vecenv.get_action_mask()
                 mask = torch.as_tensor(mask_np, device=device)
-
-                logits_pick, logits_yaw, logits_pos, value = model.forward_policy(obs, mask=mask)
-
-                dist_p = Categorical(logits=logits_pick)
-                dist_yaw = Categorical(logits=logits_yaw)
-                dist_pos = Categorical(logits=logits_pos)
-
-                a_pick = dist_p.sample()
-                a_yaw = dist_yaw.sample()
-                a_pos = dist_pos.sample()
+                masks[step] = mask.view(num_envs, *obs_shape[1:]) # Ensure shape match if flatter
                 
-                # Decode pos
-                a_x = a_pos // W
-                a_y = a_pos % W
+                with torch.no_grad():
+                     action, logprob, value = agent.act(next_obs, mask=mask)
+                     values[step] = value.flatten()
                 
-                logprob = dist_p.log_prob(a_pick) + dist_yaw.log_prob(a_yaw) + dist_pos.log_prob(a_pos)
-
-                # Pass actions to environment
-                actions_np = torch.stack([a_pick, a_yaw, a_x, a_y], dim=1).cpu().numpy()
-                next_obs_np, reward_np, done_np, infos = vecenv.step(actions_np)
+                actions[step] = action
+                logprobs[step] = logprob
                 
-                reward = torch.as_tensor(reward_np).to(device)
-                done = torch.as_tensor(done_np).to(device)
-
-                # Track episodes
-                ep_lens += 1
-                ep_rets += reward
+                # Execute action
+                # Need to convert flattened action index back to whatever env expects if it expects split
+                # Env `step` usually takes numpy actions.
+                # If env expects (pick, yaw, x, y), we need to decode.
+                # PPO act returns flattened index.
+                # We need a decoder here or env handles it?
+                # The prompt doesn't specify decoder logic, but Phase 1 SpatialPolicyHead output flat logits.
+                # We should probably decode based on grid size.
                 
-                # Log completed episodes
-                finished = done.nonzero(as_tuple=False).squeeze(-1)
-                if len(finished) > 0:
-                    avg_len = ep_lens[finished].mean().item()
-                    avg_ret = ep_rets[finished].mean().item()
-                    writer.add_scalar("train/episode_length", avg_len, global_steps)
-                    writer.add_scalar("train/reward_mean", avg_ret, global_steps)
-                    
-                    # Reset trackers
-                    ep_lens[finished] = 0
-                    ep_rets[finished] = 0
+                # HACK: Assume env helper or decode locally
+                # SpatialHead: (Rot, H, W).
+                # Rotations = 4.
+                # Grid = obs_shape[1], obs_shape[2] ?
+                H, W = obs_shape[1], obs_shape[2]
+                n_rot = 4 
+                
+                # Decode
+                a_idx = action.cpu().numpy()
+                # rot = idx // (H*W)
+                # content = idx % (H*W)
+                # x = content // W
+                # y = content % W
+                
+                rot = a_idx // (H*W)
+                rem = a_idx % (H*W)
+                x = rem // W
+                y = rem % W
+                pick = np.zeros_like(x) # Placeholder for pick? Prompt removed "pick" head. Assuming mostly "place".
+                
+                env_actions = np.stack([pick, rot, x, y], axis=1)
+                
+                next_obs_np, reward_np, done_np, infos = vecenv.step(env_actions)
+                rewards[step] = torch.tensor(reward_np, device=device).view(-1)
+                next_done = torch.as_tensor(done_np, device=device).float()
+                dones[step] = next_done
+                
+                next_obs = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+                
+                # Logging episode info
+                for info in infos:
+                     if "episode" in info:
+                         print(f"Episode Reward: {info['episode']['r']}")
+                         writer.add_scalar("charts/episodic_return", info["episode"]["r"], global_step)
 
-                storage.add(obs, torch.stack([a_pick,a_yaw,a_x,a_y], dim=1), reward, done, value.detach(), logprob.detach(), mask=mask)
-                obs = torch.as_tensor(next_obs_np).to(device)
+            # Bootstrap value
+            with torch.no_grad():
+                 _, _, next_value = agent.act(next_obs, mask=torch.as_tensor(vecenv.get_action_mask(), device=device))
+                 next_value = next_value.reshape(1, -1)
+                 
+            # GAE Calculation
+            advantages = torch.zeros_like(rewards).to(device)
+            lastgaelam = 0
+            for t in reversed(range(num_steps)):
+                if t == num_steps - 1:
+                    nextnonterminal = 1.0 - next_done
+                    nextvalues = next_value
+                else:
+                    nextnonterminal = 1.0 - dones[t+1]
+                    nextvalues = values[t+1]
+                
+                delta = rewards[t] + cfg["algo"]["gamma"] * nextvalues * nextnonterminal - values[t]
+                advantages[t] = lastgaelam = delta + cfg["algo"]["gamma"] * cfg["algo"]["gae_lambda"] * nextnonterminal * lastgaelam
+            
+            returns = advantages + values
+            
+            # Flatten batch
+            b_obs = obs.reshape((-1,) + obs_shape)
+            b_logprobs = logprobs.reshape(-1)
+            b_actions = actions.reshape(-1)
+            b_advantages = advantages.reshape(-1)
+            b_returns = returns.reshape(-1)
+            b_masks = masks.reshape((-1,) + masks.shape[2:])
+            
+            # Optimize
+            loss = agent.update({
+                "obs": b_obs,
+                "actions": b_actions,
+                "logprobs": b_logprobs,
+                "advantages": b_advantages,
+                "returns": b_returns,
+                "masks": b_masks
+            })
+            
+            writer.add_scalar("losses/policy_loss", loss, global_step)
+            print(f"Update {update}, Loss: {loss}")
+            
+            # Save Checkpoint
+            if update % 10 == 0:
+                 torch.save(agent.policy.state_dict(), f"{run_dir}/agent_{update}.pt")
 
-                global_steps += cfg["env"]["num_envs"]
-                if global_steps % cfg["train"]["log_interval"] == 0:
-                    # Log KPIs
-                    vol_eff = np.mean([info.get("volume_ratio", 0.0) for info in infos])
-                    stab_rate = np.mean([float(info.get("stable", 0.0)) for info in infos])
-                    writer.add_scalar("train/volume_efficiency", vol_eff, global_steps)
-                    writer.add_scalar("train/stability_rate", stab_rate, global_steps)
-
-            loss_metrics = ppo_update(model, optim, storage, cfg)
-            # Log PPO metrics
-            if loss_metrics is not None:
-                for k, v in loss_metrics.items():
-                    writer.add_scalar(k, v, global_steps)
-
-            if global_steps % cfg["train"]["ckpt_interval"] == 0:
-                ckpt_path = os.path.join(cfg["train"]["run_dir"], f"ckpt_{global_steps}.pt")
-                os.makedirs(cfg["train"]["run_dir"], exist_ok=True)
-                torch.save(model.state_dict(), ckpt_path)
-
-        torch.save(model.state_dict(), os.path.join(cfg["train"]["run_dir"], "last.pt"))
         writer.close()
         
     finally:

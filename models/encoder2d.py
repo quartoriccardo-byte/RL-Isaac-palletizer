@@ -1,4 +1,3 @@
-
 import torch
 import torch.nn as nn
 
@@ -15,7 +14,6 @@ class Encoder2D(nn.Module):
             nn.Conv2d(features, features, kernel_size=3, padding=1),
             nn.ReLU()
         )
-        self.out_ch = features # Expose output channels for dynamic policy head
 
     def forward(self, x):
         return self.net(x)

@@ -1,33 +1,27 @@
-
 import torch
 import torch.nn as nn
 
 class SpatialPolicyHead(nn.Module):
-    def __init__(self, enc_out_ch:int, grid_hw, n_pick:int, n_yaw:int, hidden:int=256):
+    """
+    Outputs probability map (H, W) for pick/place and discrete rotation logits.
+    """
+    def __init__(self, in_channels: int, num_rotations: int = 4):
         super().__init__()
-        self.L, self.W = grid_hw
-        # Encoder2D (New simplified) does NOT downsample
-        feat = enc_out_ch * self.L * self.W
-        self.flatten = nn.Flatten()
-        self.trunk = nn.Sequential(nn.Linear(feat, hidden), nn.ReLU(inplace=True))
-        self.pick = nn.Linear(hidden, n_pick)
-        self.yaw = nn.Linear(hidden, n_yaw)
-        # Joint position head
-        self.pos_head = nn.Linear(hidden, self.L * self.W)
-        self.value = nn.Linear(hidden, 1)
+        self.num_rotations = num_rotations
+        # Final 1x1 conv to map features to action logits (Rotations, H, W)
+        self.conv_out = nn.Conv2d(in_channels, num_rotations, kernel_size=1)
 
-    def forward(self, enc_feat, mask=None, gating_lambda=2.0):
-        h = self.flatten(enc_feat)
-        h = self.trunk(h)
-        logits_pick = self.pick(h)
-        logits_yaw = self.yaw(h)
-        logits_pos = self.pos_head(h)
+    def forward(self, x: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        logits = self.conv_out(x)  # Shape: (Batch, Rotations, H, W)
+        
+        # Flatten for PPO Categorical Distribution: (Batch, Actions)
+        B = logits.shape[0]
+        flat_logits = logits.view(B, -1)
         
         if mask is not None:
-            # mask is (B, L*W)
-            # logits_pos is (B, L*W)
-            # Apply -1e8 where mask is 0 (False)
-            logits_pos = logits_pos.masked_fill(mask == 0, -1e8)
+            # Mask must be broadcastable or same shape. 
+            # Apply hard masking (-1e8) to invalid actions.
+            flat_mask = mask.view(B, -1)
+            flat_logits = flat_logits.masked_fill(~flat_mask.bool(), -1.0e8)
             
-        value = self.value(h).squeeze(-1)
-        return logits_pick, logits_yaw, logits_pos, value
+        return flat_logits
