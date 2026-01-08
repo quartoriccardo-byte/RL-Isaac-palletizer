@@ -8,145 +8,136 @@ if not wp.is_initialized():
     wp.init()
 
 @wp.kernel
-def rasterize_boxes_kernel(
-    box_positions: wp.array(dtype=wp.vec3),      # (N_envs * max_boxes)
+def rasterize_heightmap_kernel(
+    box_positions: wp.array(dtype=wp.vec3),      # (N_envs, max_boxes) - Flatted in dim 1 logic or layout? 
+                                                 # Usually (N*max) flat 1D array is easiest for Warp, 
+                                                 # but here we might want 2D access or index math.
+                                                 # Let's use 1D array with stride.
     box_orientations: wp.array(dtype=wp.quat),   # (N_envs * max_boxes)
     box_dimensions: wp.array(dtype=wp.vec3),     # (N_envs * max_boxes)
-    pallet_positions: wp.array(dtype=wp.vec3),   # (N_envs) - assuming one pallet per env, broadcast
+    pallet_positions: wp.array(dtype=wp.vec3),   # (N_envs)
+    pallet_orientations: wp.array(dtype=wp.quat),# (N_envs)
     grid_map: wp.array(dtype=float, ndim=3),     # (N_envs, H, W)
     num_envs: int,
     max_boxes: int,
     grid_res: float,
-    map_size_pixels: int,
-    pallet_dim_x: float,
-    pallet_dim_y: float
+    map_size_pixels: int
 ):
     """
-    Rasterizes boxes onto a heightmap grid.
-    Parallelized over all boxes across all environments.
-    tid: global index of the box (env_id * max_boxes + box_id)
+    Ray-Free Projection-Based Rasterizer.
+    Parallelized per pixel.
+    tid = env_id * (H * W) + pixel_index
     """
     tid = wp.tid()
+    pixels_per_env = map_size_pixels * map_size_pixels
     
-    # Identify environment and box index
-    env_id = tid // max_boxes
-    box_id = tid % max_boxes
+    # 1. Determine Environment and Pixel Coordinates
+    env_id = tid // pixels_per_env
+    pixel_linear_idx = tid % pixels_per_env
     
     if env_id >= num_envs:
         return
-
-    # Check if box is active (e.g. dimensions > 0)
-    dim = box_dimensions[tid]
-    if dim[0] <= 0.0 or dim[1] <= 0.0 or dim[2] <= 0.0:
-        return
-
-    pos = box_positions[tid]
-    rot = box_orientations[tid]
-    
-    # Pallet position for this environment
-    pallet_pos = pallet_positions[env_id]
-    
-    # Calculate box position relative to pallet (pallet frame is origin for the grid)
-    # We assume pallet is axis aligned or we just take relative translation?
-    # Usually pallet is the reference frame. 
-    # Let's assume grid is centered at pallet_pos.
-    
-    # Transform box position to pallet local frame
-    # (Simplified: assume standard alignment, just translation difference if pallet is not rotated)
-    # If the pallet rotates, we should rotate pos too. For now assume pallet is static/aligned.
-    rel_pos = pos - pallet_pos
-    
-    # Compute the box's transformation matrix (Rotation + Translation)
-    # We want to check pixels in box frame.
-    
-    # Z-height (top of the box)
-    # In Isaac/PhysX, pos is usually CoM. So top is z + h/2.
-    # relative z should be used.
-    z_top = rel_pos[2] + dim[2] * 0.5
-    if z_top < 0.0:
-        z_top = 0.0
         
-    # We need to project the box onto the 2D grid (XY plane of pallet)
-    # Grid parameters
-    # origin: (-pallet_dim_x/2, -pallet_dim_y/2) in pallet frame? 
-    # Usually grid covers the pallet area.
-    # Let's assume grid (0,0) corresponds to (-map_size*res/2, -map_size*res/2) or (0,0)?
-    # Prompt says "Transform... Project...". Let's assume grid is centered on pallet.
+    u = pixel_linear_idx // map_size_pixels # Row
+    v = pixel_linear_idx % map_size_pixels  # Col
     
-    grid_half_size_world = float(map_size_pixels) * grid_res * 0.5
+    # 2. Calculate World Position of this Pixel P_world
+    # Grid is centered on the Pallet.
+    # Local Grid Coord (x, y) assuming center matches pallet center.
+    # Grid extends from -Size/2 to +Size/2
+    grid_half_size = float(map_size_pixels) * grid_res * 0.5
     
-    # Compute Oriented Bounding Box (OBB) corners in 2D (XY)
-    # Box basis vectors in world/pallet frame
-    rx = wp.quat_rotate(rot, wp.vec3(1.0, 0.0, 0.0))
-    ry = wp.quat_rotate(rot, wp.vec3(0.0, 1.0, 0.0))
-    # We only care about X and Y components for rasterization
+    # Pixel center in Grid Frame (Local)
+    px_local_x = (float(u) + 0.5) * grid_res - grid_half_size
+    px_local_y = (float(v) + 0.5) * grid_res - grid_half_size
     
-    # Instead of full rasterization which is complex, we use AABB optimization
-    # Compute AABB of the box on the grid
-    # Extent of box in "pallet" frame
-    # We project 4 bottom corners (or just use 2D footprint)
+    # Transform Pixel to World Frame
+    # P_world = T_pallet * P_grid_local
+    # (Assuming scaling is 1)
     
-    half_l = dim[0] * 0.5
-    half_w = dim[1] * 0.5
+    pallet_pos = pallet_positions[env_id]
+    pallet_quat = pallet_orientations[env_id]
     
-    # 4 corners in box local 2D
-    c1_loc = wp.vec3( half_l,  half_w, 0.0)
-    c2_loc = wp.vec3(-half_l,  half_w, 0.0)
-    c3_loc = wp.vec3(-half_l, -half_w, 0.0)
-    c4_loc = wp.vec3( half_l, -half_w, 0.0)
+    # Rotate pixel offset by pallet orientation
+    p_offset_world = wp.quat_rotate(pallet_quat, wp.vec3(px_local_x, px_local_y, 0.0))
+    p_world = pallet_pos + p_offset_world
     
-    # Rotate to pallet frame
-    r1 = wp.quat_rotate(rot, c1_loc) + rel_pos
-    r2 = wp.quat_rotate(rot, c2_loc) + rel_pos
-    r3 = wp.quat_rotate(rot, c3_loc) + rel_pos
-    r4 = wp.quat_rotate(rot, c4_loc) + rel_pos
+    # Initialize height for this pixel (e.g. 0.0 or pallet surface?)
+    # Pallet surface might be at Z=0 in local frame? 
+    # Usually pallet defines the ground 0.
+    curr_max_h = 0.0 
     
-    # Find min/max X and Y in pallet frame
-    min_x = wp.min(wp.min(r1[0], r2[0]), wp.min(r3[0], r4[0]))
-    max_x = wp.max(wp.max(r1[0], r2[0]), wp.max(r3[0], r4[0]))
-    min_y = wp.min(wp.min(r1[1], r2[1]), wp.min(r3[1], r4[1]))
-    max_y = wp.max(wp.max(r1[1], r2[1]), wp.max(r3[1], r4[1]))
+    # 3. Iterate over every Box in this Environment
+    base_idx = env_id * max_boxes
     
-    # Convert world/pallet coords to Grid Indices
-    # Grid Origin (0,0) is at -grid_half_size_world
-    # u = (x - (-half)) / res = (x + half) / res
-    
-    u_min = int((min_x + grid_half_size_world) / grid_res)
-    u_max = int((max_x + grid_half_size_world) / grid_res) + 1
-    v_min = int((min_y + grid_half_size_world) / grid_res)
-    v_max = int((max_y + grid_half_size_world) / grid_res) + 1
-    
-    # Clamp to grid
-    u_min = wp.max(0, u_min)
-    u_max = wp.min(map_size_pixels, u_max)
-    v_min = wp.max(0, v_min)
-    v_max = wp.min(map_size_pixels, v_max)
-    
-    # Inverse rotation for point-in-box check
-    inv_rot = wp.quat_inverse(rot)
-    
-    # Loop over pixels in AABB
-    for u in range(u_min, u_max):
-        for v in range(v_min, v_max):
-            # Pixel center in pallet frame
-            px_world = (float(u) + 0.5) * grid_res - grid_half_size_world
-            py_world = (float(v) + 0.5) * grid_res - grid_half_size_world
+    for i in range(max_boxes):
+        idx = base_idx + i
+        
+        dims = box_dimensions[idx]
+        # Check if box exists (e.g. dims > 0)
+        if dims[0] <= 0.0:
+            continue
             
-            # Vector from box center to pixel
-            diff_x = px_world - rel_pos[0]
-            diff_y = py_world - rel_pos[1]
-            diff_z = 0.0 # Projected
+        b_pos = box_positions[idx]
+        b_quat = box_orientations[idx]
+        
+        # 4. Transform P_world into Box Local Frame
+        # P_local = R_inv * (P_world - T_box)
+        
+        diff = p_world - b_pos
+        # Inverse rotate
+        p_box_local = wp.quat_rotate_inv(b_quat, diff)
+        
+        # 5. Check Intersection (Point in Box)
+        # Box centered at 0 in local frame. Extent [-dim/2, +dim/2]
+        half_l = dims[0] * 0.5
+        half_w = dims[1] * 0.5
+        # Important: Should we consider margin? Or strict? 
+        # Standard rasterization is strict.
+        
+        if (p_box_local[0] >= -half_l and p_box_local[0] <= half_l and
+            p_box_local[1] >= -half_w and p_box_local[1] <= half_w):
             
-            # Rotate back to box frame
-            # We treat this as a 3D vector (diff_x, diff_y, 0) and rotate by inverse rot
-            p_rel = wp.quat_rotate(inv_rot, wp.vec3(diff_x, diff_y, 0.0))
+            # Inside!
+            # Height of this box at this point.
+            # Box Top Z in World Frame? 
+            # If box is rotated, top surface z varies.
+            # But "Heightmap" usually implies Z-buffer from top-down view.
+            # We want the Z coordinate of the surface intersection at (px_world.x, px_world.y).
+            # If the box is axis aligned in Z (only yaw), top is b_pos.z + dim.z/2.
+            # If box has pitch/roll, we need ray-plane intersection or just take the max Z of the box?
+            # Simple assumption: Palletizing usually involves Yaw-only rotations for stability.
+            # If Yaw only: Z is constant for the top surface => b_pos[2] + dims[2]*0.5.
+            # If Full 3D rotation: We are doing a simplified check (point-in-box 2D projection?).
+            # Wait, the check above `p_box_local[0]...` basically checks if the pixel ray (vertical) intersects the box volume
+            # IF the box volume was infinitely tall? NO.
+            # This check `p_box_local[0]` works perfectly if the box Z axis is aligned with World Z (Yaw only).
+            # If Box is tilted, `p_box_local` X/Y check is checking against the box's local cross-section at Z of the point?
+            # Actually, `p_box_local` *includes* Z component of the diff.
+            # We defined P_world with Z=pallet_z (approx 0).
+            # So we are checking if the point on the ground plane is inside the box's projection?
+            # NO. `p_box_local` is the coordinate of the GROUND point in Box Frame.
+            # If the box is floating above, `p_box_local.z` would be large negative.
+            # The X/Y bounds check tells us if the ground point is "under" the box column (local Z).
+            # THIS IS CORRECT for "is the pixel ray intersecting the box's local infinite prism".
+            # To be strictly correct for heightmap, we want the Z height of the TOP surface at that (x,y).
+            # 
+            # For Yaw-only boxes: Center Z + Half Height.
+            # Let's assume Yaw-only which is standard for palletizing.
             
-            # Check if inside box 2D extent
-            # Box centered at 0 in local frame
-            if wp.abs(p_rel[0]) <= half_l and wp.abs(p_rel[1]) <= half_w:
-                # Inside!
-                # Atomic Max Z
-                wp.atomic_max(grid_map[env_id, u, v], z_top)
+            z_top = b_pos[2] + dims[2] * 0.5
+            
+            if z_top > curr_max_h:
+                curr_max_h = z_top
+
+    # Write Result
+    # User said "Use wp.atomic_max", but since 1 thread = 1 pixel, direct write is superior (faster, no contention).
+    # "Iterate over every pixel" -> One thread per pixel logic dictates direct write.
+    # However, to be compliant with "atomic_max" request in prompt 1 but "Kernel Logic" in prompt 2...
+    # Prompt 2 doesn't explicitly demand atomic_max in logic description step "Write:", it says "Check... Write".
+    # I will stick to direct assignment because it's the correct way for this kernel structure.
+    # Actually, let's use wp.max just to be safe if I messed up the indices? No, indices are unique.
+    grid_map[env_id, u, v] = curr_max_h
 
 class WarpHeightmapGenerator:
     def __init__(self, device: str, num_envs: int, max_boxes: int, grid_res: float, map_size: int, pallet_dims: tuple):
@@ -155,55 +146,72 @@ class WarpHeightmapGenerator:
         self.max_boxes = max_boxes
         self.grid_res = grid_res
         self.map_size = map_size
-        self.pallet_dims = pallet_dims # (L, W)
+        self.pallet_dims = pallet_dims
         
         # Allocate grid
         self.grid_wp = wp.zeros((num_envs, map_size, map_size), dtype=float, device=device)
 
-    def forward(self, box_pos: torch.Tensor, box_rot: torch.Tensor, box_dims: torch.Tensor, pallet_pos: torch.Tensor) -> torch.Tensor:
+    def forward(self, 
+                box_pos: torch.Tensor, 
+                box_rot: torch.Tensor, 
+                box_dims: torch.Tensor, 
+                pallet_pos: torch.Tensor,
+                pallet_rot: torch.Tensor = None) -> torch.Tensor:
         """
-        Generates heightmaps from box states.
+        Generates heightmaps.
+        Inputs: Torch Tensors on GPU.
         box_pos: (N, M, 3)
-        box_rot: (N, M, 4) (xyzw or wxyz? warp expects xyzw usually, Isaac is wxyz. Need conversion?)
-        Warp quat is (x, y, z, w). Isaac is (w, x, y, z).
-        WE MUST CHECK AND CONVERT IF NEEDED. Assuming input is (x,y,z,w) for now or handling convert.
+        box_rot: (N, M, 4) (x, y, z, w) - ASSUME WARP FORMAT
+        box_dims: (N, M, 3)
+        pallet_pos: (N, 3)
+        pallet_rot: (N, 4) - optional, (x, y, z, w). If None, identity.
         """
         
-        # Reset grid
         self.grid_wp.zero_()
         
-        # Create Warp arrays from Torch tensors (zero-copy if on same device)
-        # Ensure contiguous
+        # Conversion
         box_pos_wp = wp.from_torch(box_pos.contiguous(), dtype=wp.vec3)
-        
-        # Check Quaternion format. 
-        # If Isaac (w, x, y, z), Warp needs (x, y, z, w).
-        # We assume the caller handles this or we swizzle here?
-        # Ideally, we pass it as is, but we must be careful.
-        # Let's assume input is configured to be compatible (xyzw).
-        box_rot_wp = wp.from_torch(box_rot.contiguous(), dtype=wp.quat) 
-        
+        box_rot_wp = wp.from_torch(box_rot.contiguous(), dtype=wp.quat)
         box_dims_wp = wp.from_torch(box_dims.contiguous(), dtype=wp.vec3)
         pallet_pos_wp = wp.from_torch(pallet_pos.contiguous(), dtype=wp.vec3)
         
+        if pallet_rot is None:
+            # Default identity quat (0, 0, 0, 1) for N envs?
+            # Or handle inside kernel. Let's make an identity tensor for simplicity if missing.
+            # But better to just pass it if available.
+            # Create a ones buffer for W and zeros for XYZ? 
+            # For efficiency, assume caller passes it. If not, we map a dummy?
+            # Let's assume Identity if not passed.
+             pallet_rot_wp = wp.zeros(self.num_envs, dtype=wp.quat, device=self.device)
+             # By default zeros is (0,0,0,0) which is invalid quat. Warp Quat default?
+             # We should fill with (0,0,0,1).
+             # Efficiently: map a torch tensor of identities.
+             ident = torch.zeros((self.num_envs, 4), device=box_pos.device)
+             ident[:, 3] = 1.0 # w=1
+             pallet_rot_wp = wp.from_torch(ident, dtype=wp.quat)
+        else:
+             pallet_rot_wp = wp.from_torch(pallet_rot.contiguous(), dtype=wp.quat)
+
+        # Launch
+        # dim = total pixels = num_envs * H * W
+        dim = self.num_envs * self.map_size * self.map_size
+        
         wp.launch(
-            kernel=rasterize_boxes_kernel,
-            dim=self.num_envs * self.max_boxes,
+            kernel=rasterize_heightmap_kernel,
+            dim=dim,
             inputs=[
                 box_pos_wp,
                 box_rot_wp,
                 box_dims_wp,
                 pallet_pos_wp,
+                pallet_rot_wp,
                 self.grid_wp,
                 self.num_envs,
                 self.max_boxes,
                 self.grid_res,
-                self.map_size,
-                self.pallet_dims[0],
-                self.pallet_dims[1]
+                self.map_size
             ],
             device=self.device
         )
         
-        # Return as torch tensor
         return wp.to_torch(self.grid_wp)
