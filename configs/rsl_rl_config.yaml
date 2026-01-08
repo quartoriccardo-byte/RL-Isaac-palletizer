@@ -9,6 +9,10 @@ policy:
   actor_hidden_dims: [512, 256, 128]
   critic_hidden_dims: [512, 256, 128]
   activation: 'elu'
+  # PalletizerActorCritic specific args
+  num_actor_obs: 4120 # 4096 (Img) + 24 (Proprio)
+  num_critic_obs: 4120
+  num_actions: 4
 
 algorithm:
   value_loss_coef: 1.0
@@ -16,7 +20,7 @@ algorithm:
   clip_param: 0.2
   entropy_coef: 0.01
   num_learning_epochs: 1500
-  num_mini_batches: 4
+  num_mini_batches: 4 # For 4096 envs
   learning_rate: 1.0e-3
   schedule: 'adaptive'
   gamma: 0.99
@@ -27,11 +31,11 @@ algorithm:
 runner:
   policy_class_name: 'PalletizerActorCritic'
   algorithm_class_name: 'PPO'
-  num_steps_per_env: 24 # 24 * 4096 = 98304 per rollout
+  num_steps_per_env: 24
   max_iterations: 1500
   save_interval: 50
-  experiment_name: 'palletizing_ppo'
-  run_name: ''
+  experiment_name: 'palletizing_rsl_rl'
+  run_name: 'warp_unet_v1'
   resume: False
   load_run: -1
   checkpoint: -1
