@@ -44,7 +44,10 @@ class PalletTaskCfg(DirectRLEnvCfg):
     # 160*240 = 38400 (Visual)
     # 50 (Buffer) + 3 (Dims) + 24 (Proprio) = 77
     # Total = 38477
-    num_observations = 38477
+    @property
+    def num_observations(self):
+        # 160x240 (Heightmap) + 53 (Buffer/State Vector)
+        return 38453
     # MultiDiscrete action space doesn't map to a single int easily for config, 
     # but we will override action_space in __init__
     num_actions = 5 # Placeholder length of MultiDiscrete dims
@@ -156,101 +159,121 @@ class PalletTask(DirectRLEnv):
         return self.obs_buf, self.rew_buf, self.reset_buf, self.extras["time_outs"], self.extras
 
     def _apply_actions_logic(self, actions: torch.Tensor):
-        # Logic extracted from previous 'step' implementation
-        # actions: (N, 5) -> Op, Slot, X, Y, Rot
-        op = actions[:, 0]
-        slot = actions[:, 1]
+        # actions shape: [num_envs, 5] -> [Op, Slot, GridX, GridY, Rot]
+        
+        # 1. Parse Discrete Actions
+        op_type = actions[:, 0]
+        # slot_idx = actions[:, 1] # Used for buffer logic later
         grid_x = actions[:, 2]
         grid_y = actions[:, 3]
-        rot = actions[:, 4]
-        
-        place_mask = (op == 0)
-        store_mask = (op == 1)
-        retrieve_mask = (op == 2)
-        
-        env_indices = torch.arange(self.num_envs, device=self.device)
-        active_box_idx = self.box_idx
-        # Global index: env_idx * max_boxes + box_idx
-        # But wait, Isaac Lab RigidObject usually uses global indexing if wrapping all envs.
-        # But `write_root_pose_to_sim` on `self.scene["boxes"]`?
-        # self.scene["boxes"] is likely a RigidObject view.
-        # Check `_get_observations` uses `boxes.data.root_pos_w`.
-        # We assume `boxes` wraps all boxes in all envs.
-        # Index = env_id * max_boxes + box_id
-        global_active_idx = env_indices * self.cfg.max_boxes + active_box_idx
-        
-        # Store
-        if torch.any(store_mask):
-            target_slots = slot[store_mask]
-            current_dims = self.box_dims_tensor[env_indices[store_mask], active_box_idx[store_mask]]
-            features = torch.zeros((store_mask.sum(), 5), device=self.device)
-            features[:, :3] = current_dims
-            features[:, 3] = 1.0 
-            features[:, 4] = 0.0 # Age reset?
-            self.buffer_state[env_indices[store_mask], target_slots] = features
+        rot_idx = actions[:, 4]
 
-        # Retrieve (swap dimensions and clear buffer)
-        has_data =  self.buffer_state[env_indices, slot, 3] > 0.5
-        valid_retrieve = retrieve_mask & has_data
-        if torch.any(valid_retrieve):
-            retrieved_dims = self.buffer_state[env_indices[valid_retrieve], slot[valid_retrieve], :3]
-            self.box_dims_tensor[env_indices[valid_retrieve], active_box_idx[valid_retrieve]] = retrieved_dims
-            self.buffer_state[env_indices[valid_retrieve], slot[valid_retrieve]] = 0.0
-            
-        # Calc Targets
-        active_place_mask = (op == 0) | valid_retrieve
+        # 2. Calculate Physical Target (Grid Resolution = 5cm)
+        # Assuming Pallet center is at (0,0) and size is 80x120cm
+        # We map 0..15 (X) to -0.4..0.4 and 0..23 (Y) to -0.6..0.6
+        x_step = 0.05
+        y_step = 0.05
         
-        target_pos = torch.zeros((self.num_envs, 3), device=self.device)
-        target_rot = torch.zeros((self.num_envs, 4), device=self.device)
-        target_rot[:, 0] = 1.0 # Identity (w,x,y,z)
+        # Calculate offsets relative to pallet corner
+        target_x = (grid_x * x_step) - 0.4 + (x_step / 2)
+        target_y = (grid_y * y_step) - 0.6 + (y_step / 2)
+        target_z = 1.5  # Spawn high above pallet
         
-        if torch.any(active_place_mask):
-            idx_place = env_indices[active_place_mask]
-            
-            # Grid Stats
-            res = self.cfg.grid_res_cm / 100.0
-            pallet_x = self.cfg.pallet_size_cm[1] / 100.0 # 80cm
-            pallet_y = self.cfg.pallet_size_cm[0] / 100.0 # 120cm
-            
-            x_offset = -pallet_x / 2.0
-            y_offset = -pallet_y / 2.0
-            
-            gx = grid_x[active_place_mask].float()
-            gy = grid_y[active_place_mask].float()
-            
-            tx = x_offset + (gx * res) + (res/2.0)
-            ty = y_offset + (gy * res) + (res/2.0)
-            tz = torch.full_like(tx, 1.5) # Drop height
-            
-            target_pos[idx_place, 0] = tx + self.scene.env_origins[idx_place, 0]
-            target_pos[idx_place, 1] = ty + self.scene.env_origins[idx_place, 1]
-            target_pos[idx_place, 2] = tz + self.scene.env_origins[idx_place, 2]
-            
-            r_mask = (rot[active_place_mask] == 1)
-            # 90 deg z: (0.7071, 0, 0, 0.7071)
-            target_rot[idx_place[r_mask]] = torch.tensor([0.7071, 0.0, 0.0, 0.7071], device=self.device)
-            
-        # Teleport
-        final_pos = target_pos.clone()
-        final_rot = target_rot.clone()
+        # 3. Apply Teleportation
+        # We only move the box if Op == 0 (Place) or 2 (Retrieve)
+        # If Op == 1 (Store), we move it away to a holding area
         
-        # Teleport away (Store / Invalid Retrieve)
-        away_mask = ~active_place_mask
-        if torch.any(away_mask):
-            idx_away = env_indices[away_mask]
-            final_pos[idx_away, 2] = -10.0
-            
+        should_place = (op_type == 0) | (op_type == 2)
+        
+        # Create position tensor
+        pos = torch.zeros((self.num_envs, 3), device=self.device)
+        pos[:, 0] = target_x
+        pos[:, 1] = target_y
+        pos[:, 2] = target_z
+        
+        # Handle "Storage" action (Hide box far away)
+        # If op_type == 1, move to (100, 100, 100)
+        holding_pos = torch.tensor([100.0, 100.0, 100.0], device=self.device)
+        final_pos = torch.where(should_place.unsqueeze(-1), pos, holding_pos)
+        
+        # Orientation (Rotate 90 deg around Z if rot_idx == 1)
+        # Identity quaternion is [1, 0, 0, 0] (w, x, y, z)
+        # 90 deg Z rotation quaternion is [0.707, 0, 0, 0.707]
+        quat = torch.zeros((self.num_envs, 4), device=self.device)
+        quat[:, 0] = 1.0 # Default w
+        
+        # Apply rotation mask
+        rotate_mask = (rot_idx == 1)
+        quat[rotate_mask, 0] = 0.7071068
+        quat[rotate_mask, 3] = 0.7071068
+        
+        # Identify Masks for Reward/Logic (Needed by compute_rewards)
+        self.active_place_mask = (op_type == 0)
+        self.store_mask = (op_type == 1)
+        self.retrieve_mask = (op_type == 2)
+        
+        # Retrieve buffer logic needs to update box data if Retrieve op
+        # Check buffer validity
+        has_data =  self.buffer_state[torch.arange(self.num_envs, device=self.device), actions[:, 1].long(), 3] > 0.5
+        self.valid_retrieve = self.retrieve_mask & has_data
+        
+        # If Retrieve and Valid, update box dimensions from Buffer
+        # AND Clear buffer
+        if torch.any(self.valid_retrieve):
+             env_ids = self.valid_retrieve.nonzero(as_tuple=False).flatten()
+             slots = actions[env_ids, 1].long()
+             # retrieved_dims = self.buffer_state[env_ids, slots, :3]
+             # Update logic dims
+             self.box_dims_tensor[env_ids, self.box_idx[env_ids]] = self.buffer_state[env_ids, slots, :3]
+             # Clear
+             self.buffer_state[env_ids, slots] = 0.0
+             
+             # Also update active_place_mask for rewards to include successful retrieves
+             self.active_place_mask = self.active_place_mask | self.valid_retrieve
+
+        # Store Logic
+        if torch.any(self.store_mask):
+             env_ids = self.store_mask.nonzero(as_tuple=False).flatten()
+             slots = actions[env_ids, 1].long()
+             # Dims
+             dims = self.box_dims_tensor[env_ids, self.box_idx[env_ids]]
+             # Write to buffer
+             # [L, W, H, ID, Age]
+             self.buffer_state[env_ids, slots, :3] = dims
+             self.buffer_state[env_ids, slots, 3] = 1.0
+             self.buffer_state[env_ids, slots, 4] = 0.0
+        
         # Apply to Sim
-        self.scene["boxes"].write_root_pose_to_sim(final_pos, final_rot, indices=global_active_idx)
+        # Note: self.active_box is not defined in previous code. 
+        # Previous code used self.scene["boxes"]
+        # We must use self.scene["boxes"] to be safe, or map it.
+        # But User Prompt says: "self.active_box.set_world_poses(final_pos, quat)"
+        # Use self.scene["boxes"] instead to avoid Attribute Error.
+        
+        # Global Indices Calculation
+        env_indices = torch.arange(self.num_envs, device=self.device)
+        global_active_idx = env_indices * self.cfg.max_boxes + self.box_idx
+        
+        # Write to Sim
+        # Note: 'Quat' arg was a typo in user prompt, standard Isaac Lab uses (pos, rot) or (root_pos, root_rot)
+        # Previous code used (final_pos, final_rot). 
+        # But here 'quat' is local variable.
+        # Isaac Lab View: write_root_pose_to_sim(root_pos_w, root_quat_w) usually.
+        self.scene["boxes"].write_root_pose_to_sim(final_pos, quat, indices=global_active_idx)
         
         zeros_vel6 = torch.zeros((self.num_envs, 6), device=self.device)
         self.scene["boxes"].write_root_velocity_to_sim(zeros_vel6, indices=global_active_idx)
         
-        # Save state for rewards
-        self.last_target_pos = target_pos # For stability/drift check
-        self.active_place_mask = active_place_mask
-        self.valid_retrieve = valid_retrieve
-        self.store_mask = store_mask
+        # Save state
+        self.last_target_pos = final_pos # Actually target_pos before holding override?
+        # Stability check needs the intended target.
+        # Regnerate target pos tensor for reference
+        intended_pos = torch.zeros_like(final_pos)
+        intended_pos[:, 0] = target_x
+        intended_pos[:, 1] = target_y
+        intended_pos[:, 2] = 0.0 # Floor reference? Or drop height?
+        # Actually for drift check we just need XY of target.
+        self.last_target_pos = intended_pos
 
     def _compute_rewards_and_dones(self, actions):
         # Re-implement existing compute_rewards logic

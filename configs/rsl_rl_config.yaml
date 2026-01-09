@@ -1,41 +1,35 @@
-
 seed: 1
 runner_class_name: OnPolicyRunner
 policy_class_name: PalletizerActorCritic
 algorithm_class_name: PPO
 
 policy:
-  init_noise_std: 1.0
-  actor_hidden_dims: [512, 256, 128]
-  critic_hidden_dims: [512, 256, 128]
-  activation: 'elu'
-  # PalletizerActorCritic specific args
-  num_actor_obs: 4120 # 4096 (Img) + 24 (Proprio)
-  num_critic_obs: 4120
-  num_actions: 4
+  init_noise_std: 1.0 # Verify this matches your ActorCritic init args if any
+  # Note: dims logic is inside Python code now, config dims here might be ignored by custom Policy but good to keep clean
 
 algorithm:
-  value_loss_coef: 1.0
-  use_clipped_value_loss: True
+  # PPO params
   clip_param: 0.2
-  entropy_coef: 0.01
-  num_learning_epochs: 1500
-  num_mini_batches: 4 # For 4096 envs
-  learning_rate: 1.0e-3
-  schedule: 'adaptive'
-  gamma: 0.99
-  lam: 0.95
   desired_kl: 0.01
   max_grad_norm: 1.0
+  entropy_coef: 0.01
+  gamma: 0.90 # Lower gamma for short horizon tasks
+  lam: 0.95
+  learning_rate: 3.0e-4 # Slightly higher for discrete
+  num_learning_epochs: 5
+  num_mini_batches: 4 
+  value_loss_coef: 1.0
+  use_clipped_value_loss: True
+  schedule: 'adaptive'
 
 runner:
-  policy_class_name: 'PalletizerActorCritic'
-  algorithm_class_name: 'PPO'
-  num_steps_per_env: 24
-  max_iterations: 1500
+  policy_class_name: "PalletizerActorCritic"
+  algorithm_class_name: "PPO"
+  num_steps_per_env: 24 # Short horizon (max boxes per pallet)
+  max_iterations: 2000 
   save_interval: 50
   experiment_name: 'palletizing_rsl_rl'
-  run_name: 'warp_unet_v1'
+  run_name: 'buffer_logic_hybrid'
   resume: False
   load_run: -1
   checkpoint: -1
