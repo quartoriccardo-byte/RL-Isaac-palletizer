@@ -5,6 +5,7 @@ from rsl_rl.modules import ActorCritic
 from pallet_rl.models.unet2d import UNet2D
 from pallet_rl.models.encoder2d import Encoder2D
 
+
 class PalletizerActorCritic(ActorCritic):
     def __init__(self, num_actor_obs, num_critic_obs, num_actions, 
                  actor_hidden_dims=[256, 256, 256], 
@@ -16,114 +17,161 @@ class PalletizerActorCritic(ActorCritic):
         
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
-        self.num_actions = num_actions
+        self.num_actions = num_actions # This might be the sum of logits (55) or number of dims? 
+        # RSL-RL wrapper passes num_actions from env.num_actions in train.py? 
+        # In train.py: `num_actions = env.cfg.num_actions`.
+        # In PalletTask, num_actions was set to 5 (num dims).
+        # We need the ACTUAL counts for each dim.
+        # Hardcoding per user spec for now as `action_dims`.
+        self.action_dims = [3, 10, 16, 24, 2]
+        self.total_logits = sum(self.action_dims)
         
-        # 1. Perception Specs (Matches config)
-        self.image_dim = 64 * 64
-        self.proprio_dim = num_actor_obs - self.image_dim
+        # 1. Perception Specs
+        self.image_shape = (160, 240)
+        self.image_dim = 160 * 240
+        self.vector_dim = 53 # 3 (Box Dims) + 50 (Buffer)
+        # Proprio (24) is excluded from Network Input per User Spec, but present in Obs.
+        # We will strip it.
         
-        # 2. Shared Backbone (Visual Encoder)
-        # We reuse UNet or Encoder? User requested UNet2D + Encoder2D.
-        # "Instantiate your custom UNet2D + Encoder2D... once as a shared visual feature extractor".
-        # This implies a composite backbone?
-        # Maybe UNet for dense features (segmentation-like) and Encoder for latent?
-        # Or maybe Encoder extracts features FROM UNet?
-        # Let's assume standard RL visual backbone: CNN -> Latent.
-        # I'll use Encoder2D as the primary feature extractor for the latent vector.
-        # And wrapping it inside a sequential if needed.
-        
-        self.feature_extractor = nn.Sequential(
-            Encoder2D(in_channels=1, features=32), # Output: (B, 32, H, W)
-            nn.AdaptiveAvgPool2d(1),              # Output: (B, 32, 1, 1)
-            nn.Flatten(),                         # Output: (B, 32)
-            nn.Linear(32, 128),
+        # 2. Visual Head (CNN)
+        # Input: (B, 1, 160, 240)
+        # Output: 256
+        # Simple 3-layer CNN
+        self.cnn = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=5, stride=2, padding=2), # (80, 120)
+            nn.ELU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), # (40, 60)
+            nn.ELU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), # (20, 30)
+            nn.ELU(),
+            nn.Flatten(),
+            nn.Linear(64 * 20 * 30, 256),
             nn.ELU()
         )
         
-        feature_dim = 128 + self.proprio_dim
+        # 3. Vector Head (MLP)
+        # Input: 53
+        # Output: 64
+        self.mlp = nn.Sequential(
+            nn.Linear(self.vector_dim, 128),
+            nn.ELU(),
+            nn.Linear(128, 64),
+            nn.ELU()
+        )
         
-        # 3. Actor Head (MLP)
-        actor_layers = []
-        dims = [feature_dim] + actor_hidden_dims
-        for i in range(len(dims)-1):
-            actor_layers.append(nn.Linear(dims[i], dims[i+1]))
-            actor_layers.append(nn.ELU())
-        actor_layers.append(nn.Linear(dims[-1], num_actions))
-        self.actor_head = nn.Sequential(*actor_layers)
+        # 4. Fusion
+        fusion_dim = 256 + 64 # 320
         
-        # 4. Critic Head (MLP)
-        critic_layers = []
-        dims = [feature_dim] + critic_hidden_dims
-        for i in range(len(dims)-1):
-            critic_layers.append(nn.Linear(dims[i], dims[i+1]))
-            critic_layers.append(nn.ELU())
-        critic_layers.append(nn.Linear(dims[-1], 1))
-        self.critic_head = nn.Sequential(*critic_layers)
+        # 5. Actor Head
+        # Maps Fusion -> MultiDiscrete Logits (55)
+        # User said "Linear layers mapping Fusion -> MultiDiscrete logits"
+        self.actor_head = nn.Sequential(
+            nn.Linear(fusion_dim, 128),
+            nn.ELU(),
+            nn.Linear(128, self.total_logits)
+        )
         
-        # Noise
-        self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-        self.distribution = None
+        # 6. Critic Head
+        # Maps Fusion -> Scalar
+        self.critic_head = nn.Sequential(
+            nn.Linear(fusion_dim, 128),
+            nn.ELU(),
+            nn.Linear(128, 1)
+        )
         
-        # Disable Init?
-        # super().init_weights(...)
+        # Init weights
+        # self.apply(self.init_weights) # If needed
 
     def _process_obs(self, obs):
-        """
-        Internal method to slice and encode observations.
-        Returns: concatenated features (visual + proprio)
-        """
-        # Slice
-        # Assuming [image (N), proprio (M)]
+        # Flattened Obs: [Visual (38400) | Vector (53) | Proprio (24)]
+        # Total 38477.
+        
+        # Slice Visual
         images = obs[:, :self.image_dim]
-        proprio = obs[:, self.image_dim:]
+        images = images.view(-1, 1, 160, 240)
         
-        # Reshape Image
-        images = images.view(-1, 1, 64, 64) # (B, 1, 64, 64)
+        # Slice Vector
+        # 38400 : 38453
+        vector = obs[:, self.image_dim : self.image_dim + self.vector_dim]
         
-        # Encode (Shared)
-        visual_latent = self.feature_extractor(images)
+        # Proprio ignored
         
-        # Concatenate
-        features = torch.cat([visual_latent, proprio], dim=1)
-        return features
+        vis_latent = self.cnn(images)
+        vec_latent = self.mlp(vector)
+        
+        fusion = torch.cat([vis_latent, vec_latent], dim=1)
+        return fusion
 
     def act(self, obs, **kwargs):
         features = self._process_obs(obs)
+        logits = self.actor_head(features)
         
-        # Update Distribution
-        mean = self.actor_head(features)
-        self.distribution = torch.distributions.Normal(mean, mean*0. + self.std)
+        # Split Logits & Sample
+        actions = []
+        start = 0
+        log_probs = 0
         
-        return self.distribution.sample()
-    
+        # To support RSL-RL which often expects distribution in self.distribution
+        # We can create a list of distributions? Or one Independent Categorical?
+        # Typically RSL-RL stores `self.distribution` for `get_actions_log_prob`.
+        # We will create a comprehensive distribution object or list.
+        # But RSL-RL Runner logic usually calls `get_actions_log_prob(actions)`.
+        # So we need to store the logits or distributions.
+        
+        self.distributions = []
+        action_list = []
+        
+        for dim in self.action_dims:
+            end = start + dim
+            l = logits[:, start:end]
+            dist = torch.distributions.Categorical(logits=l)
+            self.distributions.append(dist)
+            
+            a = dist.sample()
+            action_list.append(a)
+            start = end
+            
+        actions = torch.stack(action_list, dim=-1) # (B, 5)
+        return actions
+
     def get_actions_log_prob(self, actions):
-        # rsl-rl calls this after act() has set self.distribution usually?
-        # OR it passes obs? 
-        # RSL-RL PPO Algorithm:
-        # actions_log_prob = self.actor_critic.get_actions_log_prob(actions)
-        # It relies on self.distribution being set by act() or evaluate() called just before.
-        # But wait, evaluate() sets distribution?
-        # Let's ensure Robustness: If distribution is not set/fresh, this fails.
-        # RSL-RL typical flow: act() -> buffer. update() -> evaluate blocks.
-        # In update: evaluate(obs_batch, ...) is called.
-        return self.distribution.log_prob(actions).sum(dim=-1)
+        # actions: (B, 5)
+        log_prob = 0
+        for i, dist in enumerate(self.distributions):
+            a = actions[:, i]
+            log_prob += dist.log_prob(a)
+        
+        return log_prob
 
     def act_inference(self, obs):
         features = self._process_obs(obs)
-        return self.actor_head(features)
+        logits = self.actor_head(features)
+        
+        # Deterministic: Argmax
+        actions = []
+        start = 0
+        for dim in self.action_dims:
+            end = start + dim
+            l = logits[:, start:end]
+            a = torch.argmax(l, dim=-1)
+            actions.append(a)
+            start = end
+            
+        return torch.stack(actions, dim=-1)
 
     def evaluate(self, obs, **kwargs):
-        """
-        Called during PPO update to get value and log_prob of actions (implicitly via distribution update).
-        Returns: value
-        """
         features = self._process_obs(obs)
-        
-        # Critic Value
         value = self.critic_head(features)
         
-        # Update distribution for log_prob calculation downstream
-        mean = self.actor_head(features)
-        self.distribution = torch.distributions.Normal(mean, mean*0. + self.std)
-        
+        # Re-populate distributions for downstream PPO
+        logits = self.actor_head(features)
+        self.distributions = []
+        start = 0
+        for dim in self.action_dims:
+            end = start + dim
+            l = logits[:, start:end]
+            dist = torch.distributions.Categorical(logits=l)
+            self.distributions.append(dist)
+            start = end
+            
         return value
