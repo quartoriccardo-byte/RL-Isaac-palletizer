@@ -58,7 +58,7 @@ except ImportError:
 
 # Import Task
 from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
-from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
+from pallet_rl.models.actor_critic import PalletizerActorCritic
 
 # RSL-RL Imports
 from rsl_rl.runners import OnPolicyRunner

@@ -83,14 +83,14 @@ class PalletTask(DirectRLEnv):
         # Shape: (num_envs, 10, 5) -> 10 slots, 5 dims: [L, W, H, ID, Age]
         self.buffer_state = torch.zeros((self.num_envs, 10, 5), device=self.device)
         
-        # --- Action Space ---
-        # MultiDiscrete([3, 10, 16, 24, 2])
-        # 0: Op (Place, Store, Retrieve)
-        # 1: Buffer Slot (0-9)
-        # 2: Grid X (0-15)
-        # 3: Grid Y (0-23)
-        # 4: Rot (0-1)
+        # --- Action Space (User Override: Step 2) ---
+        # Use gym.spaces.MultiDiscrete
+        # [Operation(3), BufferSlot(10), GridX(16), GridY(24), Rotation(2)]
         self.action_space = gym.spaces.MultiDiscrete([3, 10, 16, 24, 2])
+        
+        # Internal buffers for Step
+        self.dones_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.bool)
+        self.rewards_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
 
     def _setup_scene(self):
         pass
@@ -125,8 +125,38 @@ class PalletTask(DirectRLEnv):
         # If not, we rely on physics simulation handling "sleeping" boxes.
         # We will teleport the active box in step() anyway.
 
-    def step(self, actions: torch.Tensor):
-        # 1. Parse Actions
+    # User Override Step 3: Implement Physics Settlement Loop
+    def step(self, actions):
+        """Apply actions, step physics, compute returns."""
+        # 1. Apply Action logic (Teleport active box)
+        self._apply_actions_logic(actions)
+        
+        # 2. PHYSICS SETTLING LOOP ("Drop Test")
+        # We act as a turn-based system. 
+        # We step the physics 50 times (approx 0.5s) to let gravity work.
+        for _ in range(50):
+            self.sim.step(render=self.enable_render)
+                
+        # 3. Compute observations & rewards AFTER the box has settled
+        # obs dictionary
+        self.obs_buf = self._get_observations() 
+        
+        # Compute rewards and dones (split logic or kept together)
+        # Helper returns (rew, dones)
+        self.rew_buf, self.reset_buf = self._compute_rewards_and_dones(actions)
+        
+        self.extras["time_outs"] = self.episode_length_buf >= self.max_episode_length
+        self.reset_buf = self.reset_buf | self.extras["time_outs"]
+        
+        # 4. Handle resets
+        if torch.sum(self.reset_buf) > 0:
+            self._reset_idx(self.reset_buf.nonzero(as_tuple=False).flatten())
+            
+        # Return 5-tuple for DirectRLEnv/Gymnasium compliance
+        return self.obs_buf, self.rew_buf, self.reset_buf, self.extras["time_outs"], self.extras
+
+    def _apply_actions_logic(self, actions: torch.Tensor):
+        # Logic extracted from previous 'step' implementation
         # actions: (N, 5) -> Op, Slot, X, Y, Rot
         op = actions[:, 0]
         slot = actions[:, 1]
@@ -134,295 +164,142 @@ class PalletTask(DirectRLEnv):
         grid_y = actions[:, 3]
         rot = actions[:, 4]
         
-        # Identify Masks
         place_mask = (op == 0)
         store_mask = (op == 1)
         retrieve_mask = (op == 2)
         
-        # 2. Logic & Teleport
-        
-        # Current Active Box Indices
-        # We need strict indexing
         env_indices = torch.arange(self.num_envs, device=self.device)
-        active_box_idx = self.box_idx # (N,)
-        
-        # Convert to Global Rigid Body Indices
-        # Assuming flattened: global_idx = env_idx * max_boxes + box_idx
-        # NOTE: This depends on how the Scene initializes the RigidObject.
-        # If "boxes" has num_instances = num_envs * max_boxes.
+        active_box_idx = self.box_idx
+        # Global index: env_idx * max_boxes + box_idx
+        # But wait, Isaac Lab RigidObject usually uses global indexing if wrapping all envs.
+        # But `write_root_pose_to_sim` on `self.scene["boxes"]`?
+        # self.scene["boxes"] is likely a RigidObject view.
+        # Check `_get_observations` uses `boxes.data.root_pos_w`.
+        # We assume `boxes` wraps all boxes in all envs.
+        # Index = env_id * max_boxes + box_id
         global_active_idx = env_indices * self.cfg.max_boxes + active_box_idx
         
-        # --- Handle STORE ---
-        # Move current box data to buffer
-        # Slot validation: 0-9.
-        # If slot occupied, penalize? For now, overwrite.
-        # buffer_state: [L, W, H, ID, Age]
-        # ID could be just 1.0 (valid).
+        # Store
         if torch.any(store_mask):
             target_slots = slot[store_mask]
-            
-            # Get dims of current box
             current_dims = self.box_dims_tensor[env_indices[store_mask], active_box_idx[store_mask]]
-            
-            # Create feature vector: [L, W, H, 1, 0]
-            # ID=1, Age=0
             features = torch.zeros((store_mask.sum(), 5), device=self.device)
             features[:, :3] = current_dims
-            features[:, 3] = 1.0 # Exists
-            
+            features[:, 3] = 1.0 
+            features[:, 4] = 0.0 # Age reset?
             self.buffer_state[env_indices[store_mask], target_slots] = features
-            
-            # Hide the physical box? 
-            # We teleport it far away so it doesn't interfere.
-            # We'll handle teleport batching below.
-            
-        # --- Handle RETRIEVE ---
-        # If Retrieve, we want to place a box FROM buffer.
-        # We need to know WHICH physical box to use?
-        # A simple hack: Use the "active_box" physical object, but resize it to match buffer data?
-        # Valid logic: "Swap" properties of active physical box to match buffer content.
-        # Verify if buffer has data
-        has_data =  self.buffer_state[env_indices, slot, 3] > 0.5 # ID > 0
+
+        # Retrieve (swap dimensions and clear buffer)
+        has_data =  self.buffer_state[env_indices, slot, 3] > 0.5
         valid_retrieve = retrieve_mask & has_data
-        
         if torch.any(valid_retrieve):
-            # Fetch from buffer
             retrieved_dims = self.buffer_state[env_indices[valid_retrieve], slot[valid_retrieve], :3]
-            
-            # Update physical dims?
-            # RigidBody scale/size update at runtime is tricky in PhysX without respawn.
-            # ISAAC LAB: "root_scale_w"? 
-            # If we generally assume boxes are same size or we can scale them.
-            # self.scene["boxes"].write_root_scale_to_sim(...)
-            # Let's assume we update the logic state `box_dims_tensor` for reward calc,
-            # and hopefully visual/collision scale if supported.
             self.box_dims_tensor[env_indices[valid_retrieve], active_box_idx[valid_retrieve]] = retrieved_dims
-            
-            # Clear buffer slot
             self.buffer_state[env_indices[valid_retrieve], slot[valid_retrieve]] = 0.0
             
-            # Treat as PLACE now
-            # We will fall through to logic for position calculation
-            pass
-            
-        # --- Calculate Target Poses for Placement (Place OR Retrieve) ---
-        # Target: Grid -> (x,y,z)
-        # Grid: 5cm res.
-        # Pallet center at (0,0,0) (relative to env root).
-        # Pallet Dims: 120 (Y), 80 (X). 
-        # Grid X: 0-15 -> 0-80cm.
-        # Grid Y: 0-23 -> 0-120cm.
-        # Pos = (Grid * Res) - (Size/2) + (BoxDim/2)
-        # Z = Top of heightmap? Or we assume "Drop" means spawn at fixed Height?
-        # "Drop & Settle" -> Spawn high, let physics settle.
-        
-        # Which envs are effectively placing? (Op==0 OR Valid Retrieve)
+        # Calc Targets
         active_place_mask = (op == 0) | valid_retrieve
         
         target_pos = torch.zeros((self.num_envs, 3), device=self.device)
         target_rot = torch.zeros((self.num_envs, 4), device=self.device)
-        target_rot[:, 0] = 1.0 # Identity
+        target_rot[:, 0] = 1.0 # Identity (w,x,y,z)
         
         if torch.any(active_place_mask):
             idx_place = env_indices[active_place_mask]
             
-            # Grid to Local Pos
-            # X
+            # Grid Stats
             res = self.cfg.grid_res_cm / 100.0
             pallet_x = self.cfg.pallet_size_cm[1] / 100.0 # 80cm
             pallet_y = self.cfg.pallet_size_cm[0] / 100.0 # 120cm
             
-            # Center offset
             x_offset = -pallet_x / 2.0
             y_offset = -pallet_y / 2.0
             
-            # Coords
             gx = grid_x[active_place_mask].float()
             gy = grid_y[active_place_mask].float()
             
-            tx = x_offset + (gx * res) + (res/2.0) # Center of slot
+            tx = x_offset + (gx * res) + (res/2.0)
             ty = y_offset + (gy * res) + (res/2.0)
-            
-            # Z: Spawn at fixed height above max heightmap?
-            # Or retrieve current stack height at that pos?
-            # Simplest: Spawn at Z=1.5m (drop).
-            tz = torch.full_like(tx, 1.5)
+            tz = torch.full_like(tx, 1.5) # Drop height
             
             target_pos[idx_place, 0] = tx + self.scene.env_origins[idx_place, 0]
             target_pos[idx_place, 1] = ty + self.scene.env_origins[idx_place, 1]
-            target_pos[idx_place, 2] = tz + self.scene.env_origins[idx_place, 2] # Abs World
+            target_pos[idx_place, 2] = tz + self.scene.env_origins[idx_place, 2]
             
-            # Rotation: 0=0deg, 1=90deg
-            # Quat for 90 deg around Z: [0.707, 0, 0, 0.707] (Example)
-            # 0 deg: [1, 0, 0, 0]
-            # 90 deg: [0.7071, 0, 0, 0.7071]
             r_mask = (rot[active_place_mask] == 1)
-            # Default identity already set
-             # Set 90 deg
-            # q = (w, x, y, z) in Isaac Lab order
+            # 90 deg z: (0.7071, 0, 0, 0.7071)
             target_rot[idx_place[r_mask]] = torch.tensor([0.7071, 0.0, 0.0, 0.7071], device=self.device)
-
-        # Apply Teleportation
-        # For ALL envs: 
-        #   Place/Retrieve: Go to Target
-        #   Store: Go to "Holding" (e.g. -10 Z)
-        
+            
+        # Teleport
         final_pos = target_pos.clone()
         final_rot = target_rot.clone()
         
-        # Stores (and Invalid Retrieves) -> Teleport Away
-        away_mask = ~(active_place_mask)
+        # Teleport away (Store / Invalid Retrieve)
+        away_mask = ~active_place_mask
         if torch.any(away_mask):
             idx_away = env_indices[away_mask]
-            final_pos[idx_away, 2] = -10.0 # Under ground
+            final_pos[idx_away, 2] = -10.0
             
-        # Write to Sim
-        # We need to act on `global_active_idx`
-        # But `write_root_pose_to_sim` usually takes ALL indices?
-        # NO, we can modify specific indices if the View supports it.
-        # RigidObject view usually supports `env_indices` if wrapping all?
-        # `write_root_pose_to_sim` takes `pose` (N,7) and `env_ids`?
-        # Usually it writes to ALL if no indices specified.
-        # `set_world_poses(pos, rot, indices)`
-        
-        # We need to construct full tensors for the view
-        # Or simpler: Update ALL root poses? No, too expensive.
-        # Just update the ACTIVE boxes?
-        # The view "boxes" might be *all* boxes.
-        # We want to update `global_active_idx`.
-        
-        # Because `global_active_idx` are scattered, we might need a gathered write.
-        # Isaac Lab `RigidObject.write_root_pose_to_sim(root_pos, root_rot, env_ids=...)`
-        # Wait, if `env_ids` is passed, it updates *all bodies in those envs*?
-        # OR does it take indices of the BODIES?
-        # Docs: `indices` (Tensor, optional): Indices of the prims to update.
-        
+        # Apply to Sim
         self.scene["boxes"].write_root_pose_to_sim(final_pos, final_rot, indices=global_active_idx)
         
-        # Reset velocities
-        zeros_vel = torch.zeros_like(final_pos)
-        # velocity is 6D (lin + ang)
         zeros_vel6 = torch.zeros((self.num_envs, 6), device=self.device)
         self.scene["boxes"].write_root_velocity_to_sim(zeros_vel6, indices=global_active_idx)
-
-        # 3. Physics Loop
-        # Check if we need to run physics
-        if torch.any(active_place_mask):
-            # 50 Frames
-            for _ in range(50):
-                self.sim.step(render=False) # Or self.enable_render
-                
-            # Update buffers after physics
-            self.scene.update(dt=self.sim.dt * 50)
-            
-        # 4. Stability Check & Rewards
-        # Compare Final Pose vs Target Pose (Height/Drift)
         
-        # Get final poses
+        # Save state for rewards
+        self.last_target_pos = target_pos # For stability/drift check
+        self.active_place_mask = active_place_mask
+        self.valid_retrieve = valid_retrieve
+        self.store_mask = store_mask
+
+    def _compute_rewards_and_dones(self, actions):
+        # Re-implement existing compute_rewards logic
+        # Using state saved in _apply
+        
+        active_place_mask = self.active_place_mask
+        
+        global_active_idx = torch.arange(self.num_envs, device=self.device) * self.cfg.max_boxes + self.box_idx
         current_pos = self.scene["boxes"].data.root_pos_w[global_active_idx]
         
-        # Stability: 
-        # Check 1: Did it fall? Z < 0
-        # Check 2: Drift? dist(xy) > threshold
+        dist = torch.norm(current_pos[:, :2] - self.last_target_pos[:, :2], dim=-1)
         
-        # We need Target (x,y) from before.
-        # target_pos was Absolute World.
+        # op from actions requires refetch or recompute? 
+        # Easier to call self.compute_rewards with args? 
+        # But logic is simple.
         
-        dist = torch.norm(current_pos[:, :2] - target_pos[:, :2], dim=-1)
-        z_diff = torch.abs(current_pos[:, 2] - target_pos[:, 2]) # Might be large if it dropped?
-        # Actually target_z was drop spawn height (1.5). Final z should be resting.
-        # What is expected resting Z? Depends on stack.
-        # We just check if it fell off pallet.
-        
-        # Logic:
-        # If Z < 0.1 (Floor): Failed.
-        # If Dist > 10cm: Unstable?
-        
-        # Compute Reward
-        rew, dones = self.compute_rewards(op, active_place_mask, valid_retrieve, dist, current_pos)
-        
-        # Done logic (Max Boxes or Crash)
-        # Crash/Fall -> Done
-        fell = current_pos[:, 2] < 0.05
-        dones = dones | fell
-        
-        # Advance Box Index
-        # Only advance if we Placed or Stored.
-        # Retrieve: We "consumed" a buffer item. The `active_box` was used as the vessel.
-        # So we effectively used up one physical box slot? Yes.
-        self.box_idx += 1
-        
-        # Max Boxes Done
-        dones = dones | (self.box_idx >= self.cfg.max_boxes)
-        
-        # Aging Buffer
-        self.buffer_state[:, :, 4] += 1.0 # Age
-        
-        # Handle Reset
-        reset_ids = env_indices[dones]
-        if len(reset_ids) > 0:
-            self._reset_idx(reset_ids)
-            
-        # Observations
-        obs = self._get_observations()
-        # Add buffer state to obs? 
-        # _get_observations returns dict. 
-        # "policy" key usually expects flattened vector.
-        # Hybrid NN expects separate inputs?
-        # User said: "Visual Head... Vector Head... Fusion".
-        # We should return dict with keys "visual" and "vector".
-        # But `DirectRLEnv` usually flattens to "policy".
-        # We'll update `_get_observations` to return structured dict needed by custom model.
-        # OR we pack it into "policy" and let model unpack?
-        # User said "Vector Head... Input shape (3 + 50) (Current Box dims + Flattened Buffer State)".
-        # Plus Proprio? 
-        # We need to align with `actor_critic.py` later.
-        
-        return obs, rew, dones, {}
-
-    def compute_rewards(self, op, place_mask, retrieve_mask, dist, final_pos):
-        # Buffer Storage: -0.1
-        # Buffer Retrieval: +2.0
-        # Buffer Aging: -0.01 * sum(ages)
-        # Pallet Success: +1.0 + Volume Bonus
-        # Stability Failure: -10.0
+        op = actions[:, 0]
         
         rew = torch.zeros(self.num_envs, device=self.device)
+        rew[self.store_mask] -= 0.1
+        rew[self.valid_retrieve] += 2.0
         
-        # Storage
-        store_mask = (op == 1)
-        rew[store_mask] -= 0.1
-        
-        # Retrieval
-        rew[retrieve_mask] += 2.0
-        
-        # Aging
         ages = self.buffer_state[:, :, 4].sum(dim=1)
         rew -= 0.01 * ages
         
-        # Pallet Success (Place OR Retrieve that resulted in place)
-        # Conditions: Not fell, Stable.
-        fell = final_pos[:, 2] < 0.05
-        unstable = dist > 0.10 # 10cm drift tolerance
+        fell = current_pos[:, 2] < 0.05
+        unstable = dist > 0.10
         
-        failure = place_mask & (fell | unstable)
-        success = place_mask & (~failure)
+        failure = active_place_mask & (fell | unstable)
+        success = active_place_mask & (~failure)
         
         rew[failure] -= 10.0
         rew[success] += 1.0
         
-        # Volume Bonus?
-        # Need volume of active box.
+        # Volume Bonus
         idx = self.box_idx
-        dims = self.box_dims_tensor[torch.arange(self.num_envs), idx]
+        dims = self.box_dims_tensor[torch.arange(self.num_envs, device=self.device), idx]
         vol = dims[:, 0] * dims[:, 1] * dims[:, 2]
+        rew[success] += vol[success]
         
-        # Total Volume (approx 2.4 m3?)
-        # Just proportional bonus
-        rew[success] += vol[success] # Simple
-        
-        # Return Dones for immediate failures
         dones = failure
         
+        # Advance Box Index
+        self.box_idx += 1
+        dones = dones | (self.box_idx >= self.cfg.max_boxes)
+        
+        # Buffer Age Update (Once per step)
+        self.buffer_state[:, :, 4] += 1.0
+        
         return rew, dones
+
 

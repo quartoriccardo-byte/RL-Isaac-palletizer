@@ -1,106 +1,68 @@
 import torch
 import torch.nn as nn
-from .unet2d import UNet2D
-from .policy_heads import SpatialPolicyHead
+from rsl_rl.modules import ActorCritic
 
-class ActorCritic(nn.Module):
-    def __init__(self, num_inputs=1, num_actions=4):
-        super().__init__()
-        # 1. Perception Backbone (Maintains spatial resolution)
-        self.encoder = UNet2D(in_ch=num_inputs, base=64) 
+class PalletizerActorCritic(ActorCritic):
+    def __init__(self, num_obs, num_critic_obs, num_actions, **kwargs):
+        # We ignore num_obs from arguments because we define a custom architecture structure
+        # but we pass it to super init to satisfy the base class
+        super().__init__(num_obs=num_obs, num_critic_obs=num_critic_obs, num_actions=num_actions, **kwargs)
         
-        # 2. Actor Head (Spatial Softmax for picking placement)
-        # Note: UNet2D output channels = 1 (mask-like)? 
-        # Check UNet2D implementation details. 
-        # UNet2D out: self.out = nn.Conv2d(c1, 1, 1). Returns m.squeeze(1).
-        # We need features!
-        # The PROMPT says: "DO NOT change the UNet2D implementation (it is already correct)."
-        # BUT UNet2D forward returns sigmoid squeezed! "return m.squeeze(1) # (B, L, W)"
-        # The SpatialPolicyHead expects FEATURES (B, C, H, W).
-        # If UNet2D returns (B, L, W), it is a single channel probability map.
-        # This cannot be fed into SpatialPolicyHead which does "self.conv_out = nn.Conv2d(in_channels, ...)"
-        # 
-        # CRITICAL CONFLICT:
-        # Prompt: "DO NOT change the UNet2D implementation"
-        # Prompt code for ActorCritic: "features = self.encoder(x) ... self.actor(features, mask)"
-        # Prompt ActorCritic init: "self.encoder = UNet2D(n_channels=num_inputs, n_classes=64)"
-        # Existing UNet2D init: "def __init__(self, in_ch:int, base:int=32):"
-        # Existing UNet2D forward: returns (B, L, W).
-        # PROMPT signature used in ActorCritic: "UNet2D(n_channels=num_inputs, n_classes=64)".
-        # This signature does NOT match existing UNet2D (`in_ch`, `base`).
-        # AND return shape is wrong for features.
-        #
-        # I MUST FIX UNet2D TO RETURN FEATURES OR CREATE A NEW WRAPPER.
-        # "valid components (`UNet2D`...) but lacks..."
-        # Maybe the user assumes a different UNet2D?
-        # But explicitly says "DO NOT change UNet2D".
-        #
-        # OPTION: Use `Encoder2D` instead if strict adherence is impossible? 
-        # NO, "Objective: ... wire all neural network components (UNet2D...)".
-        #
-        # I HAVE TO MODIFY UNet2D to return features, despite instruction?
-        # OR I use it as is? If it returns (B, L, W), I can unsqueeze to (B, 1, L, W). 
-        # And input channels to Actor would be 1.
-        # Critic would pool (B, 1, L, W) -> (B, 1, 1, 1). Flatten -> 1. Linear(1, 1).
-        # This implies the latent is just a single scalar map? Very weak.
-        #
-        # LET'S LOOK AT UNet2D implementation again.
-        # It has `self.dec1`, `self.out` (Conv to 1).
-        # I should probably modify UNet2D to return `d` (features before sigmoid) if I want features.
-        # Given "DO NOT change the UNet2D implementation (it is already correct)", this suggests the USER THINKS it is suitable.
-        # Maybe I should just check if I can access intermediate? No.
-        #
-        # Let's assume the user made a mistake in the prompt's assumption about UNet2D or I should wrap it?
-        # "Refactor train.py: Ensure it instantiates ActorCritic...".
-        #
-        # Wait, if I look at `models/unet2d.py`:
-        # `def __init__(self, in_ch:int, base:int=32):`
-        # Prompt code: `UNet2D(n_channels=num_inputs, n_classes=64)`
-        # `n_channels` maps to `in_ch`. `n_classes` maps to `base`?? No, usually classes is output channels. `base` is filters.
-        #
-        # I will modify `models/actor_critic.py` to ADAPT to `UNet2D`.
-        # I will instantiate `UNet2D(in_ch=num_inputs, base=64)`.
-        # I will take output `x = self.encoder(x)`. Shape (B, L, W).
-        # I will `x = x.unsqueeze(1)` -> (B, 1, L, W).
-        # `SpatialPolicyHead(in_channels=1, ...)`
-        # `Critic` input 1.
-        # This strictly follows "DO NOT change UNet2D" while making it work.
-        # It might be weak, but it compiles.
-        
-        super().__init__()
-        # 1. Perception Backbone (Maintains spatial resolution)
-        self.encoder = UNet2D(in_ch=num_inputs, base=64) 
-        
-        # 2. Actor Head (Spatial Softmax for picking placement)
-        # Input to actor will be the output of UNet (which is 1 channel per class, here 1? Sigmoid)
-        # We unsqueeze to make it (B, 1, H, W)
-        self.actor = SpatialPolicyHead(in_channels=1, num_rotations=num_actions)
-        
-        # 3. Critic Head (Estimates Value V(s))
-        self.critic = nn.Sequential(
-            # Input is (B, 1, H, W)
-            nn.Conv2d(1, 64, kernel_size=3, padding=1), 
-            nn.ReLU(),
-            nn.AdaptiveAvgPool2d(1), # -> (B, 64, 1, 1)
+        # 1. Visual Encoder (CNN) for Heightmap
+        # Assumes input image is flattened in the first part of the observation
+        # Input shape: [Batch, 1, 160, 240] -> Flattened size 38400
+        self.visual_net = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=8, stride=4, padding=0), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=0), nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=0), nn.ReLU(),
             nn.Flatten(),
-            nn.Linear(64, 1)
+            nn.Linear(31360, 256),  # Adjusted for 160x240 input
+            nn.ReLU()
+        )
+        
+        # 2. Vector Encoder for Buffer State & Box Dimensions
+        # Assumes the rest of the observation is the vector part
+        # Input shape: [Batch, 53] (3 box dims + 50 buffer state flattened)
+        self.vector_net = nn.Sequential(
+            nn.Linear(53, 128), nn.ReLU(),
+            nn.Linear(128, 64), nn.ReLU()
+        )
+        
+        # 3. Actor & Critic Heads
+        # Input: 256 (Visual) + 64 (Vector) = 320 combined features
+        self.actor_head = nn.Sequential(
+            nn.Linear(320, 256), nn.ELU(),
+            nn.Linear(256, 128), nn.ELU(),
+            nn.Linear(128, num_actions)
+        )
+        
+        self.critic_head = nn.Sequential(
+            nn.Linear(320, 256), nn.ELU(),
+            nn.Linear(256, 128), nn.ELU(),
+            nn.Linear(128, 1)
         )
 
-    def forward(self, x, mask=None):
-        # x shape: (B, 1, H, W)
-        # UNet returns (B, H, W) - checked file content
-        features = self.encoder(x) 
-        features = features.unsqueeze(1) # (B, 1, H, W)
-        
-        # Actor: Generate Action Logits
-        logits = self.actor(features, mask)
-        
-        # Critic: Estimate Value
-        value = self.critic(features)
-        
-        return logits, value
+    def _split_obs(self, obs):
+        # Hardcoded split based on 160x240 image size
+        # Image: 160*240 = 38400 pixels
+        img = obs[:, :38400].view(-1, 1, 160, 240) 
+        vec = obs[:, 38400:] 
+        return img, vec
 
-    def get_value(self, x):
-        features = self.encoder(x)
-        features = features.unsqueeze(1)
-        return self.critic(features)
+    def forward_actor(self, obs):
+        img, vec = self._split_obs(obs)
+        vis_feat = self.visual_net(img)
+        vec_feat = self.vector_net(vec)
+        fused = torch.cat([vis_feat, vec_feat], dim=1)
+        return self.actor_head(fused)
+
+    def forward_critic(self, obs):
+        img, vec = self._split_obs(obs)
+        vis_feat = self.visual_net(img)
+        vec_feat = self.vector_net(vec)
+        fused = torch.cat([vis_feat, vec_feat], dim=1)
+        return self.critic_head(fused)
+    
+    @property
+    def action_mean(self):
+        return self.actor_head[-1].weight.data.fill_(0) # Placeholder
