@@ -58,7 +58,7 @@ except ImportError:
 
 # Import Task
 from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
-from pallet_rl.models.actor_critic import PalletizerActorCritic
+from pallet_rl.models.actor_critic import ActorCritic
 
 # RSL-RL Imports
 from rsl_rl.runners import OnPolicyRunner
@@ -83,7 +83,7 @@ def main():
     
     # Inject Custom Policy
     import rsl_rl.modules
-    rsl_rl.modules.PalletizerActorCritic = PalletizerActorCritic
+    rsl_rl.modules.ActorCritic = ActorCritic
     
     # Runner
     log_dir = "runs/rsl_rl_palletizer"
