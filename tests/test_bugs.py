@@ -107,9 +107,41 @@ def test_terminated_truncated_types():
     print("✓ terminated/truncated type handling test passed")
 
 
+def test_rsl_rl_wrapper_entropy():
+    """Test that PalletizerActorCritic has entropy method for RSL-RL PPO."""
+    from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
+    
+    # Create model with minimal params
+    model = PalletizerActorCritic(
+        num_actor_obs=38477,
+        num_critic_obs=38477,
+        num_actions=55
+    )
+    
+    # Create dummy observation
+    batch_size = 4
+    obs = torch.randn(batch_size, 38477)
+    
+    # Call act to populate distributions
+    actions = model.act(obs)
+    assert actions.shape == (batch_size, 5), f"Expected (4,5), got {actions.shape}"
+    
+    # Now entropy should work
+    entropy = model.entropy()
+    assert entropy.shape == (batch_size,), f"Expected ({batch_size},), got {entropy.shape}"
+    assert torch.all(entropy >= 0), "Entropy should be non-negative"
+    
+    # get_actions_log_prob should also work now
+    log_prob = model.get_actions_log_prob(actions)
+    assert log_prob.shape == (batch_size,), f"Expected ({batch_size},), got {log_prob.shape}"
+    
+    print("✓ RSL-RL wrapper entropy test passed")
+
+
 if __name__ == "__main__":
     test_decode_action_rectangular()
     test_action_mean_no_mutation()
     test_mask_shape_contract()
     test_terminated_truncated_types()
+    test_rsl_rl_wrapper_entropy()
     print("\n✅ All static tests passed!")

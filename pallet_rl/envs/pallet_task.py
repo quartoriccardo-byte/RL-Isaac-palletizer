@@ -96,7 +96,87 @@ class PalletTask(DirectRLEnv):
         self.rewards_buf = torch.zeros(self.num_envs, device=self.device, dtype=torch.float)
 
     def _setup_scene(self):
+        """
+        Scene setup for PalletTask.
+        
+        ARCHITECTURE NOTE:
+        Isaac Lab DirectRLEnv uses declarative scene configuration via
+        InteractiveSceneCfg. The 'boxes' RigidObjectCollection should be
+        pre-configured in the scene config, not created here dynamically.
+        
+        This method is intentionally minimal as the scene objects are:
+        1. Defined in PalletTaskCfg.scene (InteractiveSceneCfg)
+        2. Created by DirectRLEnv.__init__() before calling this method
+        
+        If you need to add objects dynamically, do so here using:
+            self.scene.add_object(...)
+        """
+        # Scene is configured declaratively - no dynamic setup needed
+        # The 'boxes' rigid object collection must exist in self.scene
         pass
+    
+    def _get_observations(self) -> dict:
+        """
+        Constructs observation dict required by RSL-RL wrapper.
+        
+        Observation structure (flattened):
+            [Heightmap (38400) | Buffer (50) | BoxDims (3) | Proprio (24)]
+            Total: 38477 (matches cfg.num_observations)
+        
+        Returns:
+            dict: {'policy': Tensor[N, obs_dim], 'critic': Tensor[N, obs_dim]}
+        """
+        # 1. Generate heightmap from current box positions
+        # Access box poses from scene - shape depends on how boxes are registered
+        # Assuming boxes are registered as RigidObjectCollection with shape (N*max_boxes, ...)
+        if "boxes" in self.scene.keys():
+            all_box_pos = self.scene["boxes"].data.root_pos_w  # (N*max_boxes, 3)
+            all_box_rot = self.scene["boxes"].data.root_quat_w  # (N*max_boxes, 4)
+            
+            # Reshape to (N, max_boxes, dim)
+            box_pos = all_box_pos.view(self.num_envs, self.cfg.max_boxes, 3)
+            box_rot = all_box_rot.view(self.num_envs, self.cfg.max_boxes, 4)
+        else:
+            # Fallback for testing without scene
+            box_pos = torch.zeros(self.num_envs, self.cfg.max_boxes, 3, device=self.device)
+            box_rot = torch.zeros(self.num_envs, self.cfg.max_boxes, 4, device=self.device)
+            box_rot[:, :, 0] = 1.0  # Identity quaternion w=1
+        
+        # Pallet positions (centered at origin for each env)
+        pallet_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        
+        # Generate heightmap using Warp rasterizer
+        heightmap = self.heightmap_gen.forward(
+            box_pos.view(-1, 3),  # Flatten for Warp
+            box_rot.view(-1, 4),
+            self.box_dims_tensor.view(-1, 3),
+            pallet_pos
+        )  # Returns (N, H, W)
+        
+        # 2. Normalize heightmap to [0, 1]
+        heightmap_norm = heightmap / self.cfg.max_height
+        heightmap_flat = heightmap_norm.view(self.num_envs, -1)  # (N, 38400)
+        
+        # 3. Buffer state (N, 10, 5) -> (N, 50)
+        buffer_flat = self.buffer_state.view(self.num_envs, -1)
+        
+        # 4. Current box dimensions (N, 3)
+        idx = self.box_idx.clamp(0, self.cfg.max_boxes - 1)
+        env_indices = torch.arange(self.num_envs, device=self.device)
+        current_dims = self.box_dims_tensor[env_indices, idx]
+        
+        # 5. Proprioceptive state (placeholder - robot state would come from scene)
+        proprio = torch.zeros(self.num_envs, self.robot_state_dim, device=self.device)
+        
+        # 6. Concatenate all components
+        obs = torch.cat([heightmap_flat, buffer_flat, current_dims, proprio], dim=-1)
+        
+        # Shape assertion for early failure detection
+        expected_dim = self.map_shape[0] * self.map_shape[1] + 50 + 3 + self.robot_state_dim
+        assert obs.shape[-1] == expected_dim, \
+            f"Observation shape mismatch: got {obs.shape[-1]}, expected {expected_dim}"
+        
+        return {"policy": obs, "critic": obs}
 
     def _reset_idx(self, env_ids: torch.Tensor | None):
         super()._reset_idx(env_ids)

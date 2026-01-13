@@ -20,5 +20,14 @@ algo:
   n_epochs: 4
 
 model:
-  image_size: [128, 128]
+  # IMPORTANT: These dimensions must match PalletTaskCfg.map_shape
+  image_size: [160, 240]  # [H, W] - heightmap resolution
   encoder_features: 64
+  
+  # Observation structure:
+  # - Heightmap: 160 * 240 = 38400
+  # - Buffer: 10 * 5 = 50
+  # - Box dims: 3
+  # - Proprio: 24
+  # Total: 38477
+

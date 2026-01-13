@@ -147,11 +147,27 @@ class PalletizerActorCritic(ActorCritic):
         return actions
 
     def get_actions_log_prob(self, actions):
-        # actions: (B, 5)
-        log_prob = 0
+        """
+        Computes log probability of actions under current distributions.
+        
+        INVARIANT: self.distributions must be populated by a prior act() or evaluate()
+        call on the SAME observations. RSL-RL PPO calls act() then get_actions_log_prob()
+        in sequence, so this invariant should hold.
+        
+        Args:
+            actions: (B, 5) tensor of discrete action indices
+            
+        Returns:
+            log_prob: (B,) tensor of summed log probabilities across action dims
+        """
+        # Sanity check: distributions must exist and match action dimensions
+        assert hasattr(self, 'distributions') and len(self.distributions) == len(self.action_dims), \
+            f"distributions not set or wrong length. Call act() or evaluate() first. " \
+            f"Got {len(getattr(self, 'distributions', []))} distributions, expected {len(self.action_dims)}"
+        
+        log_prob = torch.zeros(actions.shape[0], device=actions.device)
         for i, dist in enumerate(self.distributions):
-            a = actions[:, i]
-            log_prob += dist.log_prob(a)
+            log_prob = log_prob + dist.log_prob(actions[:, i])
         
         return log_prob
 
@@ -187,3 +203,37 @@ class PalletizerActorCritic(ActorCritic):
             start = end
             
         return value
+    
+    def entropy(self):
+        """
+        Computes sum of entropies across all action dimensions.
+        Used by RSL-RL PPO for entropy regularization.
+        
+        INVARIANT: self.distributions must be set by prior act() or evaluate() call.
+        
+        Returns:
+            entropy: (B,) tensor of summed entropies
+        """
+        assert hasattr(self, 'distributions') and len(self.distributions) > 0, \
+            "distributions not set. Call act() or evaluate() first."
+        
+        entropy = torch.zeros(self.distributions[0].probs.shape[0], 
+                              device=self.distributions[0].probs.device)
+        for dist in self.distributions:
+            entropy = entropy + dist.entropy()
+        
+        return entropy
+    
+    @property
+    def action_mean(self):
+        """
+        Discrete policy has no continuous action mean.
+        Returns dummy tensor for RSL-RL API compatibility.
+        """
+        return torch.zeros(1, device=next(self.parameters()).device)
+    
+    @property
+    def action_std(self):
+        """Discrete policy has no action std."""
+        return torch.zeros(1, device=next(self.parameters()).device)
+
