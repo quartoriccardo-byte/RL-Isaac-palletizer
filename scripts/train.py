@@ -1,118 +1,211 @@
+"""
+Isaac Lab 4.0+ Training Script
 
-import os
+High-performance training pipeline using:
+- Isaac Lab AppLauncher
+- RSL-RL OnPolicyRunner
+- GPU-only data flow
+
+Usage:
+    python scripts/train.py --headless --num_envs 4096
+"""
+
+from __future__ import annotations
+
 import argparse
+import os
 import sys
-import torch
 
-from omni.isaac.lab.app import AppLauncher
+# =============================================================================
+# Step 1: Parse arguments and launch app BEFORE any other imports
+# =============================================================================
 
-# 1. Launch App first
-parser = argparse.ArgumentParser(description="Train Palletizer with RSL-RL")
-parser.add_argument("--headless", action="store_true", default=False, help="Run in headless mode")
-parser.add_argument("--config", type=str, default="pallet_rl/configs/base.yaml", help="Path to config (Env)") 
-parser.add_argument("--rsl_config", type=str, default="pallet_rl/configs/rsl_rl_config.yaml", help="Path to RSL-RL config")
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train Palletizer with RSL-RL")
+    
+    # Simulation
+    parser.add_argument("--headless", action="store_true", help="Run headless")
+    parser.add_argument("--num_envs", type=int, default=4096, help="Number of environments")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Compute device")
+    
+    # Training
+    parser.add_argument("--max_iterations", type=int, default=2000, help="Training iterations")
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Checkpoint path")
+    
+    # Logging
+    parser.add_argument("--log_dir", type=str, default="runs/palletizer", help="Log directory")
+    parser.add_argument("--experiment_name", type=str, default="palletizer_ppo", help="Experiment name")
+    
+    # Add Isaac Lab launcher args
+    from isaaclab.app import AppLauncher
+    AppLauncher.add_app_launcher_args(parser)
+    
+    return parser.parse_args()
 
-AppLauncher.add_app_launcher_args(parser)
-args = parser.parse_args()
 
+# Parse args first
+args = parse_args()
+
+# Launch Isaac Lab app (MUST be before other imports)
+from isaaclab.app import AppLauncher
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
-# 2. Imports after App Launch
-from omni.isaac.lab.utils import configclass
-# Using standard wrapper location for Isaac Lab
-# Try importing from typical locations
-try:
-    from omni.isaac.lab_tasks.utils.wrappers.rsl_rl import RslRlVecEnvWrapper
-except ImportError:
-    try:
-        from omni.isaac.lab.wrappers.rsl_rl import RslRlVecEnvWrapper
-    except ImportError:
-        # Fallback to local definition if official one moves/is missing
-        from omni.isaac.lab.envs import DirectRLEnv
-        class RslRlVecEnvWrapper:
-             """
-             Minimal RSL-RL wrapper fallback.
-             WARNING: This is a fallback - prefer official Isaac Lab wrapper.
-             """
-             def __init__(self, env):
-                self.env = env
-                self.num_envs = env.num_envs
-                self.num_obs = env.cfg.num_observations
-                self.num_critic_obs = self.num_obs
-                self.num_actions = env.cfg.num_actions
-                self.device = env.device
 
-             def get_observations(self):
-                obs = self.env._get_observations()
-                return obs["policy"], obs.get("critic", obs["policy"])
+# =============================================================================
+# Step 2: Imports AFTER app launch
+# =============================================================================
 
-             def step(self, actions):
-                obs, rew, terminated, truncated, extras = self.env.step(actions)
-                
-                # FIXED: Tensor type safety for terminated/truncated
-                # Isaac Lab may return bool, Tensor, or numpy arrays
-                if not torch.is_tensor(terminated):
-                    terminated = torch.tensor(terminated, device=self.device, dtype=torch.bool)
-                if not torch.is_tensor(truncated):
-                    if isinstance(truncated, bool):
-                        truncated = torch.full_like(terminated, truncated)
-                    else:
-                        truncated = torch.tensor(truncated, device=self.device, dtype=torch.bool)
-                
-                dones = terminated | truncated
-                return obs["policy"], obs.get("critic", obs["policy"]), rew, dones, extras
+import torch
+import gymnasium
 
-             def reset(self):
-                obs, _ = self.env.reset()
-                return obs["policy"], obs.get("critic", obs["policy"])
-             
-             @property
-             def episode_length_buf(self):
-                return self.env.episode_length_buf
-
-# Import Task
-from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
-from pallet_rl.models.actor_critic import ActorCritic
-
-# RSL-RL Imports
+# RSL-RL imports
 from rsl_rl.runners import OnPolicyRunner
 
-# Utils
+# Isaac Lab imports
+from isaaclab.envs import DirectRLEnvCfg
+from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
+
+# Project imports
+from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
+from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
+
+# Load RSL-RL config
 import yaml
 
+
+# =============================================================================
+# RSL-RL Configuration
+# =============================================================================
+
+def get_rsl_rl_cfg(args) -> dict:
+    """
+    Build RSL-RL configuration dictionary.
+    
+    Compatible with OnPolicyRunner expectations.
+    """
+    return {
+        "seed": 42,
+        
+        "runner": {
+            "policy_class_name": "ActorCritic",
+            "algorithm_class_name": "PPO",
+            "num_steps_per_env": 24,
+            "max_iterations": args.max_iterations,
+            "save_interval": 100,
+            "experiment_name": args.experiment_name,
+            "run_name": "run",
+            "resume": args.resume,
+            "load_run": -1,
+            "checkpoint": -1 if args.checkpoint is None else args.checkpoint,
+        },
+        
+        "policy": {
+            "init_noise_std": 1.0,
+            "actor_hidden_dims": [256, 256],
+            "critic_hidden_dims": [256, 256],
+            "activation": "elu",
+        },
+        
+        "algorithm": {
+            "value_loss_coef": 1.0,
+            "use_clipped_value_loss": True,
+            "clip_param": 0.2,
+            "entropy_coef": 0.01,
+            "num_learning_epochs": 5,
+            "num_mini_batches": 4,
+            "learning_rate": 3e-4,
+            "schedule": "adaptive",
+            "gamma": 0.99,
+            "lam": 0.95,
+            "desired_kl": 0.01,
+            "max_grad_norm": 1.0,
+        },
+    }
+
+
+# =============================================================================
+# Main Training Loop
+# =============================================================================
+
 def main():
-    # Load RSL-RL Config
-    with open(args.rsl_config, 'r') as f:
-        rsl_cfg = yaml.safe_load(f)
+    """Main training entry point."""
     
-    # Env Config
+    print(f"\n{'='*60}")
+    print("Isaac Lab 4.0+ Palletizer Training")
+    print(f"{'='*60}")
+    print(f"Device: {args.device}")
+    print(f"Environments: {args.num_envs}")
+    print(f"Max iterations: {args.max_iterations}")
+    print(f"Headless: {args.headless}")
+    print(f"{'='*60}\n")
+    
+    # -------------------------------------------------------------------------
+    # Step 1: Create environment configuration
+    # -------------------------------------------------------------------------
     env_cfg = PalletTaskCfg()
-    env_cfg.num_envs = 4096
+    env_cfg.scene.num_envs = args.num_envs
+    env_cfg.sim.device = args.device
     
-    # Create Environment
-    env = PalletTask(cfg=env_cfg, render_mode="rgb_array" if args.headless else None)
+    # -------------------------------------------------------------------------
+    # Step 2: Create environment
+    # -------------------------------------------------------------------------
+    print("Creating environment...")
+    env = PalletTask(cfg=env_cfg, render_mode=None if args.headless else "rgb_array")
     
-    # Wrap
+    # -------------------------------------------------------------------------
+    # Step 3: Wrap for RSL-RL
+    # -------------------------------------------------------------------------
+    print("Wrapping environment for RSL-RL...")
     env = RslRlVecEnvWrapper(env)
     
-    # Inject Custom Policy
+    # -------------------------------------------------------------------------
+    # Step 4: Inject custom policy class
+    # -------------------------------------------------------------------------
+    # RSL-RL uses module-level lookup for policy class
+    # We monkey-patch to use our custom CNN-based policy
     import rsl_rl.modules
-    rsl_rl.modules.ActorCritic = ActorCritic
+    rsl_rl.modules.ActorCritic = PalletizerActorCritic
     
-    # Runner
-    log_dir = "runs/rsl_rl_palletizer"
-    runner = OnPolicyRunner(env, rsl_cfg, log_dir=log_dir, device=env.device)
+    # -------------------------------------------------------------------------
+    # Step 5: Create RSL-RL runner
+    # -------------------------------------------------------------------------
+    print("Initializing RSL-RL runner...")
+    rsl_cfg = get_rsl_rl_cfg(args)
     
-    # Learn
-    runner.learn(num_learning_iterations=rsl_cfg["runner"]["max_iterations"], init_at_random_ep_len=True)
+    runner = OnPolicyRunner(
+        env=env,
+        train_cfg=rsl_cfg,
+        log_dir=args.log_dir,
+        device=args.device
+    )
     
-    # Close
-    # env.close() # RslRlVecEnvWrapper might not have close, access inner?
-    # env.env.close() if manual wrapper
+    # -------------------------------------------------------------------------
+    # Step 6: Load checkpoint if resuming
+    # -------------------------------------------------------------------------
+    if args.resume and args.checkpoint is not None:
+        print(f"Resuming from checkpoint: {args.checkpoint}")
+        runner.load(args.checkpoint)
     
-    if simulation_app:
+    # -------------------------------------------------------------------------
+    # Step 7: Train!
+    # -------------------------------------------------------------------------
+    print(f"\nStarting training for {args.max_iterations} iterations...\n")
+    
+    runner.learn(
+        num_learning_iterations=args.max_iterations,
+        init_at_random_ep_len=True
+    )
+    
+    # -------------------------------------------------------------------------
+    # Step 8: Cleanup
+    # -------------------------------------------------------------------------
+    print("\nTraining complete. Shutting down...")
+    
+    if simulation_app is not None:
         simulation_app.close()
+
 
 if __name__ == "__main__":
     main()

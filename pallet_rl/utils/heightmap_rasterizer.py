@@ -1,11 +1,26 @@
+"""
+Warp-based GPU Heightmap Rasterizer
+
+High-performance heightmap generation using NVIDIA Warp.
+All operations stay on GPU - no numpy, no CPU transfers.
+
+Input: PyTorch GPU tensors
+Output: PyTorch GPU tensors
+"""
+
+from __future__ import annotations
 
 import torch
 import warp as wp
-import numpy as np
 
-# Initialize Warp
+# Initialize Warp if not already done
 if not wp.is_initialized():
     wp.init()
+
+
+# =============================================================================
+# Warp Kernel
+# =============================================================================
 
 @wp.kernel
 def rasterize_heightmap_kernel(
@@ -18,59 +33,46 @@ def rasterize_heightmap_kernel(
     num_envs: int,
     max_boxes: int,
     grid_res: float,
-    map_size_x: int, # Rows (corresponding to X axis usually if mapped u->x)
-    map_size_y: int  # Cols (corresponding to Y axis usually if mapped v->y)
+    map_size_x: int,  # Height (rows)
+    map_size_y: int   # Width (cols)
 ):
     """
-    Ray-Free Projection-Based Rasterizer.
-    Parallelized per pixel.
-    tid = env_id * (SizeX * SizeY) + pixel_index
+    GPU-parallel heightmap rasterizer.
     
-    Grid Map Dimensions: (N, map_size_x, map_size_y)
-    u -> 0..map_size_x (Index 1)
-    v -> 0..map_size_y (Index 2)
+    Each thread handles one pixel across all boxes in one environment.
+    Thread ID = env_id * (H * W) + pixel_index
     """
     tid = wp.tid()
     pixels_per_env = map_size_x * map_size_y
     
-    # 1. Determine Environment and Pixel Coordinates
+    # Determine environment and pixel coordinates
     env_id = tid // pixels_per_env
-    pixel_linear_idx = tid % pixels_per_env
+    pixel_idx = tid % pixels_per_env
     
     if env_id >= num_envs:
         return
-        
-    u = pixel_linear_idx // map_size_y # Row index (0..X-1) 
-    v = pixel_linear_idx % map_size_y  # Col index (0..Y-1)
     
-    # Note: Logic above implies grid_map is contiguous row-major: R0[0..W], R1[0..W]...
-    # u is index for SizeX (Rows), v is index for SizeY (Cols).
+    # Row (u) and column (v) indices
+    u = pixel_idx // map_size_y  # Row [0..H-1]
+    v = pixel_idx % map_size_y   # Col [0..W-1]
     
-    # 2. Calculate World Position of this Pixel P_world
-    # Grid is centered on the Pallet.
-    # Local Grid Coord (x, y).
-    # map_size_x corresponds to spatial dimension X? 
-    # Let's assume u -> X axis, v -> Y axis.
-    
+    # Grid physical dimensions
     grid_size_x = float(map_size_x) * grid_res
     grid_size_y = float(map_size_y) * grid_res
     
-    # Pixel center in Grid Frame (Local)
-    # u=0 -> -size_x/2 + res/2
+    # Pixel center in local grid frame
     px_local_x = (float(u) + 0.5) * grid_res - (grid_size_x * 0.5)
     px_local_y = (float(v) + 0.5) * grid_res - (grid_size_y * 0.5)
     
-    # Transform Pixel to World Frame
+    # Transform pixel to world frame
     pallet_pos = pallet_positions[env_id]
     pallet_quat = pallet_orientations[env_id]
     
-    # Rotate pixel offset by pallet orientation
     p_offset_world = wp.quat_rotate(pallet_quat, wp.vec3(px_local_x, px_local_y, 0.0))
     p_world = pallet_pos + p_offset_world
     
-    curr_max_h = 0.0 
-    
-    # 3. Iterate over every Box in this Environment
+    # Find maximum height at this pixel
+    max_height = 0.0
     base_idx = env_id * max_boxes
     
     for i in range(max_boxes):
@@ -79,102 +81,147 @@ def rasterize_heightmap_kernel(
         dims = box_dimensions[idx]
         if dims[0] <= 0.0:
             continue
-            
+        
         b_pos = box_positions[idx]
         b_quat = box_orientations[idx]
         
-        # 4. Transform P_world into Box Local Frame
+        # Transform pixel to box local frame
         diff = p_world - b_pos
-        # Inverse rotate
         p_box_local = wp.quat_rotate_inv(b_quat, diff)
         
-        # 5. Check Intersection (Point in Box)
+        # Check if pixel is inside box footprint
         half_l = dims[0] * 0.5
         half_w = dims[1] * 0.5
         
-        # Check X/Y bounds in box frame (infinite prism check effectively)
         if (p_box_local[0] >= -half_l and p_box_local[0] <= half_l and
             p_box_local[1] >= -half_w and p_box_local[1] <= half_w):
             
-            # Inside!
-            # Simplified Z height: Top of box at box center Z. 
-            # Valid for flat-stacked boxes.
+            # Pixel is inside - get box top height
             z_top = b_pos[2] + dims[2] * 0.5
             
-            if z_top > curr_max_h:
-                curr_max_h = z_top
+            if z_top > max_height:
+                max_height = z_top
+    
+    # Write result
+    grid_map[env_id, u, v] = max_height
 
-    # Write Result
-    grid_map[env_id, u, v] = curr_max_h
+
+# =============================================================================
+# Python Wrapper
+# =============================================================================
 
 class WarpHeightmapGenerator:
-    def __init__(self, device: str, num_envs: int, max_boxes: int, grid_res: float, map_size: tuple, pallet_dims: tuple):
-        # map_size is now (size_x, size_y)
-        # Ensure device is a string compatible with Warp
+    """
+    GPU-only heightmap generator using NVIDIA Warp.
+    
+    All inputs and outputs are PyTorch tensors on CUDA.
+    No numpy arrays are used anywhere in the pipeline.
+    
+    Usage:
+        gen = WarpHeightmapGenerator(device="cuda:0", ...)
+        heightmap = gen.forward(box_pos, box_rot, box_dims, pallet_pos)
+    """
+    
+    def __init__(
+        self,
+        device: str,
+        num_envs: int,
+        max_boxes: int,
+        grid_res: float,
+        map_size: tuple[int, int],
+        pallet_dims: tuple[float, float]
+    ):
+        """
+        Initialize the heightmap generator.
+        
+        Args:
+            device: CUDA device string (e.g., "cuda:0")
+            num_envs: Number of parallel environments
+            max_boxes: Maximum boxes per environment
+            grid_res: Grid resolution in meters
+            map_size: (height, width) in pixels
+            pallet_dims: (length, width) of pallet in meters
+        """
+        # Normalize device string
         if isinstance(device, torch.device):
-            self.device = str(device)
-        else:
-            self.device = str(device)
-            
-        if "cuda" in self.device and ":" not in self.device:
-             self.device = "cuda:0"
-             
+            device = str(device)
+        if "cuda" in device and ":" not in device:
+            device = "cuda:0"
+        
+        self.device = device
         self.num_envs = num_envs
         self.max_boxes = max_boxes
         self.grid_res = grid_res
         
+        # Map dimensions
         if isinstance(map_size, int):
             self.map_size_x = map_size
             self.map_size_y = map_size
         else:
             self.map_size_x = map_size[0]
             self.map_size_y = map_size[1]
-            
+        
         self.pallet_dims = pallet_dims
         
-        # Allocate grid
-        self.grid_wp = wp.zeros((num_envs, self.map_size_x, self.map_size_y), dtype=float, device=device)
-
-    def forward(self, 
-                box_pos: torch.Tensor, 
-                box_rot: torch.Tensor, 
-                box_dims: torch.Tensor, 
-                pallet_pos: torch.Tensor,
-                pallet_rot: torch.Tensor = None) -> torch.Tensor:
+        # Pre-allocate Warp output buffer
+        self.grid_wp = wp.zeros(
+            (num_envs, self.map_size_x, self.map_size_y),
+            dtype=float,
+            device=device
+        )
+    
+    def forward(
+        self,
+        box_pos: torch.Tensor,
+        box_rot: torch.Tensor,
+        box_dims: torch.Tensor,
+        pallet_pos: torch.Tensor,
+        pallet_rot: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
-        Generates heightmaps.
-        Inputs: Torch Tensors on GPU.
-        box_pos: (N, M, 3)
-        box_rot: (N, M, 4) (x, y, z, w)
-        box_dims: (N, M, 3)
-        pallet_pos: (N, 3)
-        pallet_rot: (N, 4)
-        """
+        Generate heightmaps from box states.
         
+        All inputs must be contiguous PyTorch GPU tensors.
+        
+        Args:
+            box_pos: Box positions, shape (N*max_boxes, 3) or (N, max_boxes, 3)
+            box_rot: Box quaternions (x,y,z,w), shape (N*max_boxes, 4)
+            box_dims: Box dimensions (L,W,H), shape (N*max_boxes, 3)
+            pallet_pos: Pallet positions, shape (N, 3)
+            pallet_rot: Pallet quaternions, shape (N, 4), optional
+            
+        Returns:
+            heightmap: Tensor of shape (N, H, W)
+        """
+        # Ensure inputs are contiguous
+        box_pos = box_pos.contiguous().view(-1, 3)
+        box_rot = box_rot.contiguous().view(-1, 4)
+        box_dims = box_dims.contiguous().view(-1, 3)
+        pallet_pos = pallet_pos.contiguous()
+        
+        # Default pallet rotation (identity)
+        if pallet_rot is None:
+            pallet_rot = torch.zeros(self.num_envs, 4, device=pallet_pos.device)
+            pallet_rot[:, 3] = 1.0  # w=1 for identity (x,y,z,w)
+        else:
+            pallet_rot = pallet_rot.contiguous()
+        
+        # Clear output buffer
         self.grid_wp.zero_()
         
-        # Conversion
-        box_pos_wp = wp.from_torch(box_pos.contiguous(), dtype=wp.vec3)
-        box_rot_wp = wp.from_torch(box_rot.contiguous(), dtype=wp.quat)
-        box_dims_wp = wp.from_torch(box_dims.contiguous(), dtype=wp.vec3)
-        pallet_pos_wp = wp.from_torch(pallet_pos.contiguous(), dtype=wp.vec3)
+        # Convert to Warp arrays (zero-copy)
+        box_pos_wp = wp.from_torch(box_pos, dtype=wp.vec3)
+        box_rot_wp = wp.from_torch(box_rot, dtype=wp.quat)
+        box_dims_wp = wp.from_torch(box_dims, dtype=wp.vec3)
+        pallet_pos_wp = wp.from_torch(pallet_pos, dtype=wp.vec3)
+        pallet_rot_wp = wp.from_torch(pallet_rot, dtype=wp.quat)
         
-        if pallet_rot is None:
-             # Identity quat (0, 0, 0, 1) to (0, 0, 0, 1) scalar real part? 
-             # Warp/Isaac Lab usually (x,y,z,w). w real.
-             # Identity is (0,0,0,1).
-             ident = torch.zeros((self.num_envs, 4), device=box_pos.device)
-             ident[:, 3] = 1.0 # w=1
-             pallet_rot_wp = wp.from_torch(ident, dtype=wp.quat)
-        else:
-             pallet_rot_wp = wp.from_torch(pallet_rot.contiguous(), dtype=wp.quat)
-
-        # Launch
-        dim = self.num_envs * self.map_size_x * self.map_size_y
+        # Launch kernel
+        total_threads = self.num_envs * self.map_size_x * self.map_size_y
         
         wp.launch(
             kernel=rasterize_heightmap_kernel,
-            dim=dim,
+            dim=total_threads,
             inputs=[
                 box_pos_wp,
                 box_rot_wp,
@@ -191,4 +238,5 @@ class WarpHeightmapGenerator:
             device=self.device
         )
         
+        # Convert back to PyTorch (zero-copy)
         return wp.to_torch(self.grid_wp)

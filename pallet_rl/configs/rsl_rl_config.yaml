@@ -1,35 +1,111 @@
-seed: 1
-runner_class_name: OnPolicyRunner
-policy_class_name: PalletizerActorCritic
-algorithm_class_name: PPO
+# RSL-RL Configuration for Palletizer
+# Isaac Lab 4.0+ Compatible
 
-policy:
-  init_noise_std: 1.0 # Verify this matches your ActorCritic init args if any
-  # Note: dims logic is inside Python code now, config dims here might be ignored by custom Policy but good to keep clean
-
-algorithm:
-  # PPO params
-  clip_param: 0.2
-  desired_kl: 0.01
-  max_grad_norm: 1.0
-  entropy_coef: 0.01
-  gamma: 0.90 # Lower gamma for short horizon tasks
-  lam: 0.95
-  learning_rate: 3.0e-4 # Slightly higher for discrete
-  num_learning_epochs: 5
-  num_mini_batches: 4 
-  value_loss_coef: 1.0
-  use_clipped_value_loss: True
-  schedule: 'adaptive'
+seed: 42
 
 runner:
-  policy_class_name: "ActorCritic"
-  algorithm_class_name: "PPO"
-  num_steps_per_env: 24 # Short horizon (max boxes per pallet)
-  max_iterations: 2000 
-  save_interval: 50
-  experiment_name: 'palletizing_rsl_rl'
-  run_name: 'buffer_logic_hybrid'
-  resume: False
+  # Runner class to use
+  class_name: OnPolicyRunner
+  
+  # Policy and algorithm class names
+  policy_class_name: ActorCritic
+  algorithm_class_name: PPO
+  
+  # Rollout settings
+  num_steps_per_env: 24  # Short horizon for palletizing
+  
+  # Training settings
+  max_iterations: 2000
+  save_interval: 100
+  
+  # Experiment tracking
+  experiment_name: palletizer_ppo
+  run_name: isaac_lab_v4
+  
+  # Resume settings
+  resume: false
   load_run: -1
   checkpoint: -1
+
+policy:
+  # Custom policy class will be injected via monkey-patch
+  # These dims are for reference - actual architecture is in PalletizerActorCritic
+  
+  init_noise_std: 1.0
+  
+  # Actor network (hidden dims only - first layer is vision encoder)
+  actor_hidden_dims: [256, 128]
+  
+  # Critic network
+  critic_hidden_dims: [256, 128]
+  
+  # Activation function
+  activation: elu
+  
+  # Vision encoder config (used by PalletizerActorCritic)
+  # Input: (N, 1, 160, 240) heightmap
+  # Output: 256-dim latent
+  vision:
+    type: cnn
+    channels: [16, 32, 64]
+    kernel_sizes: [5, 3, 3]
+    strides: [2, 2, 2]
+    output_dim: 256
+  
+  # Vector encoder config (buffer state)
+  # Input: 53 (50 buffer + 3 box dims)
+  # Output: 64-dim latent
+  vector:
+    type: mlp
+    hidden_dims: [128, 64]
+    activation: elu
+
+algorithm:
+  # PPO hyperparameters
+  
+  # Value loss coefficient
+  value_loss_coef: 1.0
+  use_clipped_value_loss: true
+  
+  # Policy clipping
+  clip_param: 0.2
+  
+  # Entropy bonus for exploration
+  entropy_coef: 0.01
+  
+  # Training epochs per rollout
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  
+  # Optimization
+  learning_rate: 3.0e-4
+  schedule: adaptive
+  
+  # GAE parameters
+  gamma: 0.99
+  lam: 0.95
+  
+  # KL divergence target
+  desired_kl: 0.01
+  
+  # Gradient clipping
+  max_grad_norm: 1.0
+
+# Environment-specific (for reference)
+env:
+  num_envs: 4096
+  
+  # Observation structure
+  obs_dim: 38477
+  # - Heightmap: 160 * 240 = 38400
+  # - Buffer: 10 * 5 = 50
+  # - Box dims: 3
+  # - Proprio: 24
+  
+  # Action space (MultiDiscrete)
+  action_dims: [3, 10, 16, 24, 2]
+  # - Operation: 3 (Place, Store, Retrieve)
+  # - Buffer slot: 10
+  # - Grid X: 16
+  # - Grid Y: 24
+  # - Rotation: 2
