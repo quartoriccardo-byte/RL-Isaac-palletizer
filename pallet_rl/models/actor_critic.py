@@ -88,7 +88,28 @@ class ActorCritic(RslActorCritic):
         fused = torch.cat([vis_feat, vec_feat], dim=1)
         
         return self.critic_head(fused)
-        
+    
+    # REMOVED: Catastrophic bug - action_mean was calling fill_(0) on weights!
+    # Original code:
+    #   @property
+    #   def action_mean(self):
+    #       return self.actor_head[-1].weight.data.fill_(0)
+    #
+    # This destroyed learned parameters on EVERY access. For discrete policies,
+    # there is no "action mean" - use logits or sampled actions instead.
+    #
+    # If RSL-RL requires this property, return zeros without mutation:
     @property
     def action_mean(self):
-        return self.actor_head[-1].weight.data.fill_(0)
+        """
+        Discrete policies have no continuous action mean.
+        Returns zeros tensor of appropriate shape for API compatibility.
+        """
+        # Return zeros without mutating weights
+        return torch.zeros(1, device=next(self.parameters()).device)
+    
+    @property
+    def action_std(self):
+        """Discrete policy has no action std."""
+        return torch.zeros(1, device=next(self.parameters()).device)
+

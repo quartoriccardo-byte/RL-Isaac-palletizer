@@ -7,13 +7,25 @@ from pallet_rl.models.encoder2d import Encoder2D
 
 
 class PalletizerActorCritic(ActorCritic):
+    """
+    Custom ActorCritic for MultiDiscrete palletizing actions.
+    
+    Inherits from RSL-RL ActorCritic but overrides all methods to support:
+    - CNN visual encoder for heightmap
+    - MLP vector encoder for buffer state
+    - MultiDiscrete action space (5 dimensions: op, slot, x, y, rot)
+    """
     def __init__(self, num_actor_obs, num_critic_obs, num_actions, 
                  actor_hidden_dims=[256, 256, 256], 
                  critic_hidden_dims=[256, 256, 256], 
                  activation='elu', 
                  init_noise_std=1.0, 
                  **kwargs):
-        super(ActorCritic, self).__init__()
+        # FIXED: Was using super(ActorCritic, self).__init__() which skips
+        # the RSL-RL ActorCritic.__init__() entirely (goes to nn.Module).
+        # Since we override ALL methods and attributes, we intentionally
+        # call nn.Module.__init__() directly - no base class state needed.
+        nn.Module.__init__(self)
         
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs

@@ -412,7 +412,7 @@ class IsaacLabVecEnv:
             action_idx = actions[i]
             # Assumes num_rotations = 4 (default). Should match config/model.
             # Grid width self.W
-            rot_idx, x_idx, y_idx = decode_action(action_idx, self.W, 4)
+            rot_idx, x_idx, y_idx = decode_action(action_idx, self.W, self.L, 4)
             
             yaw_id = int(rot_idx)
             x_idx = int(x_idx)
@@ -492,7 +492,7 @@ class IsaacLabVecEnv:
         for i in range(self.num_envs):
             # Re-decode since we are in a new loop (or store them above)
             action_idx = actions[i]
-            rot_idx, x_idx, y_idx = decode_action(action_idx, self.W, 4)
+            rot_idx, x_idx, y_idx = decode_action(action_idx, self.W, self.L, 4)
             yaw_id = int(rot_idx)
             x_idx = int(x_idx)
             y_idx = int(y_idx)

@@ -1,45 +1,82 @@
-# PalletRL: Isaac Lab Palletizing Agent
+# RL-Isaac-Palletizer
 
-This repository contains a Reinforcement Learning implementation for robotic palletizing using NVIDIA Isaac Lab (Isaac Sim) and PPO.
+Reinforcement Learning for robotic palletization using Isaac Lab and RSL-RL.
 
-## Quick Start
+## Architecture
 
-### Installation
+**Chosen Pipeline:** Isaac Lab + RSL-RL PPO + MultiDiscrete Actions
 
-1. **Clone the repository**:
+| Component | Implementation |
+|:----------|:---------------|
+| Environment | `pallet_rl.envs.pallet_task.PalletTask` (Isaac Lab DirectRLEnv) |
+| Policy | `pallet_rl.models.rsl_rl_wrapper.PalletizerActorCritic` |
+| Algorithm | RSL-RL `OnPolicyRunner` with PPO |
+| Actions | MultiDiscrete: [Operation(3), Slot(10), X(16), Y(24), Rotation(2)] |
 
-   ```bash
-   git clone https://github.com/quartoriccardo-byte/RL-Isaac-palletizer.git
-   cd RL-Isaac-palletizer
-   ```
-
-2. **Install dependencies**:
-   Ensure you are in the python environment where Isaac Lab is installed.
-
-   ```bash
-   pip install -e .
-   ```
-
-### Training
-
-To launch the training loop in headless mode (recommended for training):
+## Installation
 
 ```bash
-python src/pallet_rl/train.py --headless
+# Clone and install
+cd rl-isaac-palletizer
+pip install -e .
+
+# Verify
+python -c "import pallet_rl; print('OK')"
 ```
 
-### Architecture
+## Training
 
-The agent uses an **Actor-Critic** architecture:
+```bash
+# Inside Isaac Lab environment
+python scripts/train.py --headless --config pallet_rl/configs/base.yaml
+```
 
-1. **Encoder**: A 3-layer CNN (`Encoder2D`) that processes the heightmap observation into latent features.
-2. **Spatial Policy Head**: A convolutional head that outputs a probability map `(Batch, Rotations, H, W)` representing the logits for placing a box at a specific `(x, y)` location with a specific rotation.
-    * **Action Masking**: Invalid actions (e.g., overhangs) are masked out with `-1e8` to ensure the agent only selects valid placements.
+## Evaluation
+
+```bash
+python scripts/eval.py --checkpoint runs/rsl_rl_palletizer/model.pt
+```
+
+## Known Isaac Lab / RSL-RL Constraints
+
+1. **AppLauncher must be first**: Import `AppLauncher` and call it before any other Isaac imports
+2. **Wrapper import paths change**: Isaac Lab ~1.0 uses `omni.isaac.lab_tasks.utils.wrappers.rsl_rl`
+3. **MultiDiscrete actions**: RSL-RL expects continuous; we override ActorCritic to handle discrete
+
+## Fixed Critical Bugs (v0.1.0)
+
+| Bug | File | Fix |
+|:----|:-----|:----|
+| Square grid assumption | `algo/utils.py` | `decode_action` now uses `width * height` |
+| Weight destruction | `models/actor_critic.py` | `action_mean` no longer calls `fill_(0)` |
+| Invalid super() | `models/rsl_rl_wrapper.py` | Uses `nn.Module.__init__(self)` |
+| Mask shape mismatch | `models/policy_heads.py` | Added shape assertion |
+| Tensor type mismatch | `scripts/train.py` | `terminated\|truncated` normalized to tensors |
+
+## Runtime Validation Checklist
+
+Before running on a new machine:
+
+- [ ] Isaac Lab installed and `isaacsim` command works
+- [ ] `pip install -e .` succeeds
+- [ ] `python -c "import pallet_rl"` succeeds
+- [ ] `python tests/test_imports.py` passes
+- [ ] `python tests/test_bugs.py` passes
 
 ## Project Structure
 
-* `algo/`: PPO implementation (`ppo.py`).
-* `configs/`: Hyperparameter configurations (`base.yaml`).
-* `envs/`: Environment logic.
-* `models/`: Neural Network Architecture (`encoder2d.py`, `policy_heads.py`).
-* `train.py`: Main training script.
+```
+pallet_rl/
+├── envs/           # Isaac Lab environments
+├── models/         # Neural network architectures
+├── algo/           # Utility functions (decode_action, etc.)
+├── configs/        # YAML configurations
+├── utils/          # Warp heightmap rasterizer
+└── legacy/         # Archived code (custom PPO, storage)
+scripts/
+├── train.py        # Training entrypoint
+└── eval.py         # Evaluation entrypoint
+tests/
+├── test_imports.py
+└── test_bugs.py
+```

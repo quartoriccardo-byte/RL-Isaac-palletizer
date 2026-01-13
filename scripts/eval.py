@@ -30,7 +30,7 @@ def main():
     use_isaac = os.environ.get("USE_ISAACLAB", "0") == "1"
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/base.yaml")
+    parser.add_argument("--config", type=str, default="pallet_rl/configs/base.yaml")
     parser.add_argument("--checkpoint", type=str, required=True)
     
     # Isaac Lab Imports

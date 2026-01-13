@@ -9,8 +9,8 @@ from omni.isaac.lab.app import AppLauncher
 # 1. Launch App first
 parser = argparse.ArgumentParser(description="Train Palletizer with RSL-RL")
 parser.add_argument("--headless", action="store_true", default=False, help="Run in headless mode")
-parser.add_argument("--config", type=str, default="configs/base.yaml", help="Path to config (Env)") 
-parser.add_argument("--rsl_config", type=str, default="configs/rsl_rl_config.yaml", help="Path to RSL-RL config")
+parser.add_argument("--config", type=str, default="pallet_rl/configs/base.yaml", help="Path to config (Env)") 
+parser.add_argument("--rsl_config", type=str, default="pallet_rl/configs/rsl_rl_config.yaml", help="Path to RSL-RL config")
 
 AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
@@ -31,6 +31,10 @@ except ImportError:
         # Fallback to local definition if official one moves/is missing
         from omni.isaac.lab.envs import DirectRLEnv
         class RslRlVecEnvWrapper:
+             """
+             Minimal RSL-RL wrapper fallback.
+             WARNING: This is a fallback - prefer official Isaac Lab wrapper.
+             """
              def __init__(self, env):
                 self.env = env
                 self.num_envs = env.num_envs
@@ -45,6 +49,17 @@ except ImportError:
 
              def step(self, actions):
                 obs, rew, terminated, truncated, extras = self.env.step(actions)
+                
+                # FIXED: Tensor type safety for terminated/truncated
+                # Isaac Lab may return bool, Tensor, or numpy arrays
+                if not torch.is_tensor(terminated):
+                    terminated = torch.tensor(terminated, device=self.device, dtype=torch.bool)
+                if not torch.is_tensor(truncated):
+                    if isinstance(truncated, bool):
+                        truncated = torch.full_like(terminated, truncated)
+                    else:
+                        truncated = torch.tensor(truncated, device=self.device, dtype=torch.bool)
+                
                 dones = terminated | truncated
                 return obs["policy"], obs.get("critic", obs["policy"]), rew, dones, extras
 
