@@ -446,12 +446,11 @@ class PalletTask(DirectRLEnv):
             inactive_quat = torch.zeros(n_total, 4, device=device)
             inactive_quat[:, 0] = 1.0  # Identity quaternion (w,x,y,z)
             
-            # Compute global indices for all boxes in reset envs
-            global_indices = []
-            for env_id in env_ids:
-                base_idx = int(env_id) * self.cfg.max_boxes
-                global_indices.extend(range(base_idx, base_idx + self.cfg.max_boxes))
-            global_indices = torch.tensor(global_indices, device=device, dtype=torch.long)
+            # Compute global indices for all boxes in reset envs (vectorized, GPU-safe)
+            env_ids_long = env_ids.long()
+            base = env_ids_long * self.cfg.max_boxes  # (num_reset_envs,)
+            offsets = torch.arange(self.cfg.max_boxes, device=device)  # (max_boxes,)
+            global_indices = (base[:, None] + offsets[None, :]).reshape(-1)  # (num_reset_envs * max_boxes,)
             
             self.scene["boxes"].write_root_pose_to_sim(
                 inactive_pos, inactive_quat, indices=global_indices

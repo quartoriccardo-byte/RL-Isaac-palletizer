@@ -15,28 +15,6 @@ from __future__ import annotations
 import argparse
 import os
 
-import torch
-
-# RSL-RL imports with clear error message
-try:
-    from rsl_rl.runners import OnPolicyRunner
-except ImportError as e:
-    raise ImportError(
-        "Failed to import rsl_rl. Please install RSL-RL:\n"
-        "  Option 1 (recommended): pip install git+https://github.com/leggedrobotics/rsl_rl.git@<commit>\n"
-        "  Option 2: pip install -e /path/to/rsl_rl\n"
-        "  Option 3: If using Isaac Lab environment, rsl_rl may already be available.\n"
-        f"Original error: {e}"
-    ) from e
-
-# Isaac Lab imports
-from isaaclab.app import AppLauncher
-from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
-
-# Project imports
-from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
-from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Palletizer policy (Isaac Lab + RSL-RL)")
@@ -48,6 +26,7 @@ def parse_args():
     parser.add_argument("--max_episodes", type=int, default=10, help="Max evaluation episodes per env")
     parser.add_argument("--log_dir", type=str, default="runs/eval", help="Eval log directory")
 
+    from isaaclab.app import AppLauncher
     AppLauncher.add_app_launcher_args(parser)
     return parser.parse_args()
 
@@ -56,10 +35,39 @@ def main():
     args = parse_args()
 
     # Launch Isaac Lab app before other imports that touch simulation
+    from isaaclab.app import AppLauncher
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
 
     try:
+        # ==========================================================================
+        # IMPORTS AFTER AppLauncher (required for Isaac Lab compatibility)
+        # ==========================================================================
+        import torch
+
+        # RSL-RL imports with clear error message
+        try:
+            from rsl_rl.runners import OnPolicyRunner
+        except ImportError as e:
+            raise ImportError(
+                "Failed to import rsl_rl. Please install RSL-RL:\n"
+                "  Option 1 (recommended): pip install git+https://github.com/leggedrobotics/rsl_rl.git@<commit>\n"
+                "  Option 2: pip install -e /path/to/rsl_rl\n"
+                "  Option 3: If using Isaac Lab environment, rsl_rl may already be available.\n"
+                f"Original error: {e}"
+            ) from e
+
+        # Isaac Lab imports
+        from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
+
+        # Project imports
+        from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
+        from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
+
+        # ==========================================================================
+        # Evaluation
+        # ==========================================================================
+
         device = torch.device(args.device)
 
         # Environment configuration
@@ -146,4 +154,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

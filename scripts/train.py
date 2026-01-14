@@ -45,73 +45,6 @@ def parse_args():
 
 
 # =============================================================================
-# Step 2: Imports (no side effects)
-# =============================================================================
-
-import torch
-import gymnasium
-import yaml
-
-# RSL-RL imports with clear error message
-try:
-    from rsl_rl.runners import OnPolicyRunner
-except ImportError as e:
-    raise ImportError(
-        "Failed to import rsl_rl. Please install RSL-RL:\n"
-        "  Option 1 (recommended): pip install git+https://github.com/leggedrobotics/rsl_rl.git@<commit>\n"
-        "  Option 2: pip install -e /path/to/rsl_rl\n"
-        "  Option 3: If using Isaac Lab environment, rsl_rl may already be available.\n"
-        f"Original error: {e}"
-    ) from e
-
-# Isaac Lab imports
-from isaaclab.app import AppLauncher
-from isaaclab.envs import DirectRLEnvCfg
-from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
-
-# Project imports
-from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
-from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
-
-
-# =============================================================================
-# RSL-RL Configuration
-# =============================================================================
-
-def get_rsl_rl_cfg(args) -> dict:
-    """
-    Load and adapt the RSL-RL configuration dictionary.
-
-    The base configuration is stored in `pallet_rl/configs/rsl_rl_config.yaml`.
-    CLI arguments (iterations, resume, checkpoint, experiment_name) override
-    the corresponding fields to keep a single source of truth for defaults.
-    """
-    cfg_path = os.path.join(
-        os.path.dirname(__file__),
-        "..",
-        "pallet_rl",
-        "configs",
-        "rsl_rl_config.yaml",
-    )
-    cfg_path = os.path.abspath(cfg_path)
-
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
-
-    # Override a few fields from CLI for convenience
-    runner_cfg = cfg.setdefault("runner", {})
-    runner_cfg["max_iterations"] = args.max_iterations
-    runner_cfg["experiment_name"] = args.experiment_name
-    runner_cfg["resume"] = args.resume
-
-    # RSL-RL encodes checkpoint selection via `load_run`/`checkpoint`.
-    if args.checkpoint is not None:
-        runner_cfg["checkpoint"] = args.checkpoint
-
-    return cfg
-
-
-# =============================================================================
 # Main Training Loop
 # =============================================================================
 
@@ -121,9 +54,76 @@ def main():
     args = parse_args()
     
     # Launch Isaac Lab app (MUST be before other imports that touch simulation)
+    from isaaclab.app import AppLauncher
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
     
+    # ==========================================================================
+    # IMPORTS AFTER AppLauncher (required for Isaac Lab compatibility)
+    # ==========================================================================
+    import torch
+    import yaml
+
+    # RSL-RL imports with clear error message
+    try:
+        from rsl_rl.runners import OnPolicyRunner
+    except ImportError as e:
+        raise ImportError(
+            "Failed to import rsl_rl. Please install RSL-RL:\n"
+            "  Option 1 (recommended): pip install git+https://github.com/leggedrobotics/rsl_rl.git@<commit>\n"
+            "  Option 2: pip install -e /path/to/rsl_rl\n"
+            "  Option 3: If using Isaac Lab environment, rsl_rl may already be available.\n"
+            f"Original error: {e}"
+        ) from e
+
+    # Isaac Lab imports
+    from isaaclab.envs import DirectRLEnvCfg
+    from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
+
+    # Project imports
+    from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
+    from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
+
+    # ==========================================================================
+    # RSL-RL Configuration
+    # ==========================================================================
+
+    def get_rsl_rl_cfg(args) -> dict:
+        """
+        Load and adapt the RSL-RL configuration dictionary.
+
+        The base configuration is stored in `pallet_rl/configs/rsl_rl_config.yaml`.
+        CLI arguments (iterations, resume, checkpoint, experiment_name) override
+        the corresponding fields to keep a single source of truth for defaults.
+        """
+        cfg_path = os.path.join(
+            os.path.dirname(__file__),
+            "..",
+            "pallet_rl",
+            "configs",
+            "rsl_rl_config.yaml",
+        )
+        cfg_path = os.path.abspath(cfg_path)
+
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f)
+
+        # Override a few fields from CLI for convenience
+        runner_cfg = cfg.setdefault("runner", {})
+        runner_cfg["max_iterations"] = args.max_iterations
+        runner_cfg["experiment_name"] = args.experiment_name
+        runner_cfg["resume"] = args.resume
+
+        # RSL-RL encodes checkpoint selection via `load_run`/`checkpoint`.
+        if args.checkpoint is not None:
+            runner_cfg["checkpoint"] = args.checkpoint
+
+        return cfg
+
+    # ==========================================================================
+    # Training
+    # ==========================================================================
+
     print(f"\n{'='*60}")
     print("Isaac Lab 4.0+ Palletizer Training")
     print(f"{'='*60}")
@@ -201,3 +201,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
