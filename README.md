@@ -33,11 +33,30 @@ pip install -e .
 python -c "import pallet_rl; print('pallet_rl OK')"
 ```
 
-You also need RSL‑RL installed (either as a dependency in your Isaac Lab env, or manually):
+- **Install RSL-RL** (required dependency):
 
+RSL-RL is listed in `pyproject.toml`, but installation may vary by environment. Choose one:
+
+**Option 1 (recommended, pinned version):**
 ```bash
-pip install rsl-rl
+pip install git+https://github.com/leggedrobotics/rsl_rl.git@<commit-hash>
 ```
+Replace `<commit-hash>` with a specific commit hash for reproducibility (e.g., `@abc123def456`).
+
+**Option 2 (editable from local clone):**
+```bash
+git clone https://github.com/leggedrobotics/rsl_rl.git
+cd rsl_rl
+pip install -e .
+```
+
+**Option 3 (Isaac Lab environment):**
+Some Isaac Lab environments may already include `rsl_rl`. Verify with:
+```bash
+python -c "import rsl_rl; print('rsl_rl OK')"
+```
+
+If import fails, use Option 1 or 2 above. The scripts will show a clear error message if `rsl_rl` is missing.
 
 ## Training (Canonical)
 
@@ -55,11 +74,16 @@ python scripts/train.py \
 ```
 
 The script:
-- Launches Isaac Lab via `isaaclab.app.AppLauncher`.
+- Launches Isaac Lab via `isaaclab.app.AppLauncher` (inside `main()` to avoid import-time side effects).
 - Instantiates `PalletTask` with `PalletTaskCfg` (DirectRLEnv).
 - Wraps it with `RslRlVecEnvWrapper` for RSL‑RL.
 - Loads RSL‑RL hyper‑parameters from `pallet_rl/configs/rsl_rl_config.yaml` (then applies CLI overrides).
 - Monkey‑patches `rsl_rl.modules.ActorCritic` to use `PalletizerActorCritic` (MultiDiscrete policy).
+
+**Logs and checkpoints:**
+- RSL‑RL writes logs and checkpoints under `--log_dir` and `--experiment_name`.
+- With the default flags, you will see runs in `runs/palletizer/palletizer_ppo/*`
+  including TensorBoard `events.*` files and `.pt` checkpoints.
 
 ## Evaluation (Canonical)
 
