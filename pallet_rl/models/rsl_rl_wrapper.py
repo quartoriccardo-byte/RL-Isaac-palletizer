@@ -70,8 +70,8 @@ class PalletizerActorCritic(ActorCritic):
         # Observation structure
         self.image_shape = (160, 240)
         self.image_dim = 160 * 240  # 38400
-        self.vector_dim = 53  # Buffer (50) + Box dims (3)
-        # Proprio (24) is present but ignored by network
+        self.vector_dim = 77  # Buffer (50) + Box dims (3) + Proprio (24)
+        # Proprio is now integrated into the vector encoder (Option A: safer, less breaking)
         
         # ---------------------------------------------------------------------
         # Visual Encoder (CNN)
@@ -101,7 +101,7 @@ class PalletizerActorCritic(ActorCritic):
         
         # ---------------------------------------------------------------------
         # Vector Encoder (MLP)
-        # Input: (N, 53)
+        # Input: (N, 77) = Buffer (50) + Box dims (3) + Proprio (24)
         # Output: (N, 64)
         # ---------------------------------------------------------------------
         self.mlp = nn.Sequential(
@@ -153,8 +153,8 @@ class PalletizerActorCritic(ActorCritic):
         images = obs[:, :self.image_dim]
         images = images.view(-1, 1, 160, 240)
         
+        # Vector = Buffer (50) + Box dims (3) + Proprio (24) = 77 dims
         vector = obs[:, self.image_dim:self.image_dim + self.vector_dim]
-        # Proprio is ignored (last 24 dims)
         
         # Encode
         vis_latent = self.cnn(images)

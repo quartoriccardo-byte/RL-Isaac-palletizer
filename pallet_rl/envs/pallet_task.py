@@ -154,6 +154,9 @@ class PalletTask(DirectRLEnv):
         # Box dimensions tensor: (N, max_boxes, 3)
         self.box_dims = torch.zeros(n, self.cfg.max_boxes, 3, device=device)
         
+        # Preallocated buffer for heightmap generation (avoids per-step clone)
+        self._box_dims_for_hmap = torch.zeros(n, self.cfg.max_boxes, 3, device=device)
+        
         # Buffer state: (N, buffer_slots, buffer_features)
         self.buffer_state = torch.zeros(
             n, self.cfg.buffer_slots, self.cfg.buffer_features, device=device
@@ -170,6 +173,9 @@ class PalletTask(DirectRLEnv):
         
         # Target position for stability check
         self.last_target_pos = torch.zeros(n, 3, device=device)
+        
+        # Off-map position for inactive boxes (far away to ensure they never pollute heightmap)
+        self._inactive_box_pos = torch.tensor([1e6, 1e6, -1e6], device=device)
     
     def _setup_scene(self):
         """
@@ -278,17 +284,23 @@ class PalletTask(DirectRLEnv):
         
         # 2. Generate heightmap (GPU-only via Warp)
         # Only boxes up to the current index are considered "active" for
-        # rasterization; future boxes are masked out so they don't pollute
-        # the heightmap.
-        box_dims_for_hmap = self.box_dims.view(n, self.cfg.max_boxes, 3).clone()
+        # rasterization. Inactive boxes are moved off-map and have zero dims
+        # to guarantee they cannot pollute the heightmap.
         box_indices = torch.arange(self.cfg.max_boxes, device=device).view(1, -1)
-        active_mask = box_indices <= self.box_idx.view(-1, 1)
-        box_dims_for_hmap[~active_mask] = 0.0
+        active_mask = box_indices <= self.box_idx.view(-1, 1)  # (N, max_boxes)
+        
+        # Update preallocated buffer: copy active dims, zero inactive
+        self._box_dims_for_hmap.copy_(self.box_dims)
+        self._box_dims_for_hmap[~active_mask] = 0.0
+        
+        # Move inactive boxes off-map (guarantees they're never in rasterization bounds)
+        box_pos_for_hmap = box_pos.clone()
+        box_pos_for_hmap[~active_mask] = self._inactive_box_pos
 
         heightmap = self.heightmap_gen.forward(
-            box_pos.reshape(-1, 3),
+            box_pos_for_hmap.reshape(-1, 3),
             box_rot.reshape(-1, 4),
-            box_dims_for_hmap.reshape(-1, 3),
+            self._box_dims_for_hmap.reshape(-1, 3),
             pallet_pos,
         )  # (N, H, W)
         
@@ -310,9 +322,11 @@ class PalletTask(DirectRLEnv):
         # 7. Concatenate all observations
         obs = torch.cat([heightmap_flat, buffer_flat, current_dims, proprio], dim=-1)
         
-        # Shape assertion
+        # Shape/device assertion (fast, only runs in debug or once per step)
         assert obs.shape == (n, self.cfg.num_observations), \
             f"Obs shape {obs.shape} != expected ({n}, {self.cfg.num_observations})"
+        assert obs.device == device, \
+            f"Obs device {obs.device} != expected {device}"
         
         return {"policy": obs, "critic": obs}
     
@@ -423,6 +437,25 @@ class PalletTask(DirectRLEnv):
         base_dims = torch.tensor([0.4, 0.3, 0.2], device=device)
         rand_offset = torch.rand(len(env_ids), self.cfg.max_boxes, 3, device=device) * 0.2 - 0.1
         self.box_dims[env_ids] = base_dims + rand_offset
+        
+        # Move all boxes off-map initially (they'll be placed when actions are taken)
+        # This ensures inactive boxes never pollute the heightmap
+        if "boxes" in self.scene.keys():
+            n_total = len(env_ids) * self.cfg.max_boxes
+            inactive_pos = self._inactive_box_pos.expand(n_total, 3)
+            inactive_quat = torch.zeros(n_total, 4, device=device)
+            inactive_quat[:, 0] = 1.0  # Identity quaternion (w,x,y,z)
+            
+            # Compute global indices for all boxes in reset envs
+            global_indices = []
+            for env_id in env_ids:
+                base_idx = int(env_id) * self.cfg.max_boxes
+                global_indices.extend(range(base_idx, base_idx + self.cfg.max_boxes))
+            global_indices = torch.tensor(global_indices, device=device, dtype=torch.long)
+            
+            self.scene["boxes"].write_root_pose_to_sim(
+                inactive_pos, inactive_quat, indices=global_indices
+            )
     
     def _apply_action(self, action: torch.Tensor):
         """
@@ -572,13 +605,19 @@ class PalletTask(DirectRLEnv):
         """
         Return an action mask over the flattened MultiDiscrete logits.
 
-        Shape: (num_envs, sum(action_dims)), dtype=bool.
+        Shape: (num_envs, sum(action_dims)), dtype=bool, device matches env device.
 
         The current implementation marks all actions as valid (all True),
         but the interface is provided so that task-specific constraints
         (e.g. collision-based invalid placements) can be injected without
         changing the policy class.
+        
+        This mask is compatible with PalletizerActorCritic.act() and evaluate()
+        methods, which expect (N, total_logits) bool tensors.
         """
         n = self.num_envs
         total_logits = sum(self.cfg.action_dims)
-        return torch.ones(n, total_logits, dtype=torch.bool, device=self._device)
+        # Ensure correct dtype, shape, and device for policy compatibility
+        mask = torch.ones(n, total_logits, dtype=torch.bool, device=self._device)
+        assert mask.device == self._device, "Action mask device mismatch"
+        return mask

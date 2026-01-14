@@ -17,7 +17,7 @@ import os
 import sys
 
 # =============================================================================
-# Step 1: Parse arguments and launch app BEFORE any other imports
+# Step 1: Parse arguments (no side effects at import time)
 # =============================================================================
 
 def parse_args():
@@ -37,42 +37,41 @@ def parse_args():
     parser.add_argument("--log_dir", type=str, default="runs/palletizer", help="Log directory")
     parser.add_argument("--experiment_name", type=str, default="palletizer_ppo", help="Experiment name")
     
-    # Add Isaac Lab launcher args
+    # Add Isaac Lab launcher args (import only when needed, inside function)
     from isaaclab.app import AppLauncher
     AppLauncher.add_app_launcher_args(parser)
     
     return parser.parse_args()
 
 
-# Parse args first
-args = parse_args()
-
-# Launch Isaac Lab app (MUST be before other imports)
-from isaaclab.app import AppLauncher
-app_launcher = AppLauncher(args)
-simulation_app = app_launcher.app
-
-
 # =============================================================================
-# Step 2: Imports AFTER app launch
+# Step 2: Imports (no side effects)
 # =============================================================================
 
 import torch
 import gymnasium
+import yaml
 
-# RSL-RL imports
-from rsl_rl.runners import OnPolicyRunner
+# RSL-RL imports with clear error message
+try:
+    from rsl_rl.runners import OnPolicyRunner
+except ImportError as e:
+    raise ImportError(
+        "Failed to import rsl_rl. Please install RSL-RL:\n"
+        "  Option 1 (recommended): pip install git+https://github.com/leggedrobotics/rsl_rl.git@<commit>\n"
+        "  Option 2: pip install -e /path/to/rsl_rl\n"
+        "  Option 3: If using Isaac Lab environment, rsl_rl may already be available.\n"
+        f"Original error: {e}"
+    ) from e
 
 # Isaac Lab imports
+from isaaclab.app import AppLauncher
 from isaaclab.envs import DirectRLEnvCfg
 from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
 
 # Project imports
 from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
 from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
-
-# Load RSL-RL config
-import yaml
 
 
 # =============================================================================
@@ -118,6 +117,12 @@ def get_rsl_rl_cfg(args) -> dict:
 
 def main():
     """Main training entry point."""
+    # Parse arguments (inside main to avoid import-time side effects)
+    args = parse_args()
+    
+    # Launch Isaac Lab app (MUST be before other imports that touch simulation)
+    app_launcher = AppLauncher(args)
+    simulation_app = app_launcher.app
     
     print(f"\n{'='*60}")
     print("Isaac Lab 4.0+ Palletizer Training")
