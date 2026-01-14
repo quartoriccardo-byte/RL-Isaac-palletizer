@@ -128,8 +128,12 @@ class WarpHeightmapGenerator:
         num_envs: int,
         max_boxes: int,
         grid_res: float,
-        map_size: tuple[int, int],
-        pallet_dims: tuple[float, float]
+        map_size: tuple[int, int] | int | None = None,
+        pallet_dims: tuple[float, float] | None = None,
+        *,
+        # Backwards-compatible alias used by some call sites / configs.
+        # If both map_size and map_shape are provided they must agree.
+        map_shape: tuple[int, int] | int | None = None,
     ):
         """
         Initialize the heightmap generator.
@@ -153,14 +157,45 @@ class WarpHeightmapGenerator:
         self.max_boxes = max_boxes
         self.grid_res = grid_res
         
-        # Map dimensions
-        if isinstance(map_size, int):
-            self.map_size_x = map_size
-            self.map_size_y = map_size
+        # Resolve map size from alias arguments.
+        # Prefer explicit map_size, but allow map_shape as a drop-in alias.
+        if map_size is None and map_shape is None:
+            raise ValueError("WarpHeightmapGenerator requires either map_size or map_shape.")
+
+        if map_size is None:
+            resolved = map_shape
+        elif map_shape is None:
+            resolved = map_size
         else:
-            self.map_size_x = map_size[0]
-            self.map_size_y = map_size[1]
-        
+            # Both provided – ensure they match to avoid silent shape bugs.
+            if isinstance(map_size, int) and isinstance(map_shape, int):
+                if map_size != map_shape:
+                    raise ValueError(f"map_size ({map_size}) != map_shape ({map_shape})")
+                resolved = map_size
+            else:
+                # Normalize to (H, W) then compare elementwise.
+                if isinstance(map_size, int):
+                    ms = (map_size, map_size)
+                else:
+                    ms = tuple(map_size)
+                if isinstance(map_shape, int):
+                    msh = (map_shape, map_shape)
+                else:
+                    msh = tuple(map_shape)
+                if ms != msh:
+                    raise ValueError(f"map_size {ms} != map_shape {msh}")
+                resolved = ms
+
+        if isinstance(resolved, int):
+            self.map_size_x = resolved
+            self.map_size_y = resolved
+        else:
+            self.map_size_x = int(resolved[0])
+            self.map_size_y = int(resolved[1])
+
+        assert self.map_size_x > 0 and self.map_size_y > 0, \
+            f"Invalid heightmap size ({self.map_size_x}, {self.map_size_y})"
+
         self.pallet_dims = pallet_dims
         
         # Pre-allocate Warp output buffer
@@ -198,6 +233,37 @@ class WarpHeightmapGenerator:
         box_rot = box_rot.contiguous().view(-1, 4)
         box_dims = box_dims.contiguous().view(-1, 3)
         pallet_pos = pallet_pos.contiguous()
+
+        # ------------------------------------------------------------------
+        # Basic device / shape sanity checks (fail fast with clear messages)
+        # ------------------------------------------------------------------
+        expected_boxes = self.num_envs * self.max_boxes
+        if box_pos.shape[0] != expected_boxes or box_dims.shape[0] != expected_boxes:
+            raise ValueError(
+                f"box_pos/box_dims first dim must be num_envs*max_boxes "
+                f"({expected_boxes}), got "
+                f"box_pos={box_pos.shape}, box_dims={box_dims.shape}"
+            )
+        if box_rot.shape[0] != expected_boxes or box_rot.shape[1] != 4:
+            raise ValueError(
+                f"box_rot must have shape (num_envs*max_boxes, 4), got {box_rot.shape}"
+            )
+        if pallet_pos.shape[0] != self.num_envs or pallet_pos.shape[1] != 3:
+            raise ValueError(
+                f"pallet_pos must have shape (num_envs, 3), got {pallet_pos.shape}"
+            )
+
+        # Device consistency between PyTorch and Warp.
+        # We only support CUDA tensors here since the env is GPU-only.
+        if not box_pos.is_cuda or not box_rot.is_cuda or not box_dims.is_cuda or not pallet_pos.is_cuda:
+            raise RuntimeError(
+                "WarpHeightmapGenerator expects all inputs on CUDA (GPU tensors)."
+            )
+        if not self.device.startswith("cuda"):
+            raise RuntimeError(
+                f"WarpHeightmapGenerator was constructed with device='{self.device}', "
+                "but CUDA tensors were provided. Use a matching CUDA device string."
+            )
         
         # Default pallet rotation (identity, x=y=z=0, w=1 in (x,y,z,w) convention)
         if pallet_rot is None:

@@ -11,7 +11,17 @@ dependencies = [
     "torch",
     "gymnasium",
     "warp-lang",
+    "pyyaml",
+    "rsl-rl",
 ]
 
 [tool.setuptools.packages.find]
 include = ["pallet_rl*"]
+
+[project.optional-dependencies]
+# Extra dependencies used only by legacy utilities (CPU heightmap channels, etc.).
+# These are not required for the main Isaac Lab + RSL-RL training/eval pipeline.
+legacy = [
+    "numpy",
+    "scipy",
+]

@@ -51,7 +51,8 @@ class PalletTaskCfg(DirectRLEnvCfg):
     )
     
     # Decimation (physics steps per RL step)
-    decimation: int = 10
+    # Default kept at 50 to match the previous hardcoded behaviour in step().
+    decimation: int = 50
     
     # Episode length
     episode_length_s: float = 60.0
@@ -276,11 +277,19 @@ class PalletTask(DirectRLEnv):
         pallet_pos = torch.zeros(n, 3, device=device)
         
         # 2. Generate heightmap (GPU-only via Warp)
+        # Only boxes up to the current index are considered "active" for
+        # rasterization; future boxes are masked out so they don't pollute
+        # the heightmap.
+        box_dims_for_hmap = self.box_dims.view(n, self.cfg.max_boxes, 3).clone()
+        box_indices = torch.arange(self.cfg.max_boxes, device=device).view(1, -1)
+        active_mask = box_indices <= self.box_idx.view(-1, 1)
+        box_dims_for_hmap[~active_mask] = 0.0
+
         heightmap = self.heightmap_gen.forward(
             box_pos.reshape(-1, 3),
             box_rot.reshape(-1, 4),
-            self.box_dims.reshape(-1, 3),
-            pallet_pos
+            box_dims_for_hmap.reshape(-1, 3),
+            pallet_pos,
         )  # (N, H, W)
         
         # 3. Normalize and flatten heightmap
@@ -532,8 +541,8 @@ class PalletTask(DirectRLEnv):
         # Apply action
         self._apply_action(action)
         
-        # Step physics (settling loop)
-        for _ in range(50):
+        # Step physics (settling loop controlled via cfg.decimation)
+        for _ in range(self.cfg.decimation):
             self.sim.step(render=self._render)
         
         # Advance box index
