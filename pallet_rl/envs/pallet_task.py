@@ -26,6 +26,7 @@ from isaaclab.sim.spawners import shapes as shape_spawners
 import gymnasium as gym
 
 from pallet_rl.utils.heightmap_rasterizer import WarpHeightmapGenerator
+from pallet_rl.utils.quaternions import wxyz_to_xyzw
 
 
 # =============================================================================
@@ -172,18 +173,80 @@ class PalletTask(DirectRLEnv):
     def _setup_scene(self):
         """
         Configure scene objects using Isaac Lab declarative API.
-        
+
         Scene contains:
-        - Pallet (static rigid body)
-        - Boxes (rigid object collection)
-        - Robot (articulation) - optional, can be added in subclass
+        - Ground plane (static)
+        - Pallet volume (static box)
+        - Boxes collection (rigid objects)
+
+        Notes:
+        - We keep this implementation minimal and declarative to avoid
+          over-constraining asset paths. A production setup would replace
+          the primitive pallet with a USD asset and tune physical materials.
+        - Downstream code expects a `boxes` view available as
+          `self.scene["boxes"]` exposing `data.root_pos_w` and
+          `data.root_quat_w` tensors.
         """
-        # Note: In Isaac Lab 4.0+, scene config is typically declarative
-        # through InteractiveSceneCfg. This method can add dynamic objects.
-        
-        # For now, we assume boxes are configured in scene and accessed via
-        # self.scene["boxes"]. The actual spawning is done by Isaac Lab.
-        pass
+        # Ground plane (simple infinite plane primitive)
+        shape_spawners.spawn_ground_plane(self.scene)
+
+        # Pallet as a simple box at the origin of each env.
+        pallet_cfg = RigidObjectCfg(
+            prim_path="{ENV_REGEX_NS}/Pallet",
+            spawn=RigidObjectCfg.SpawnCfg(
+                func=shape_spawners.spawn_box,
+                extents=(self.cfg.pallet_size[0], self.cfg.pallet_size[1], 0.15),
+            ),
+            init_state=RigidObjectCfg.InitialStateCfg(
+                pos=(0.0, 0.0, 0.075),
+                rot=(1.0, 0.0, 0.0, 0.0),  # (w,x,y,z) for Isaac scene
+                lin_vel=(0.0, 0.0, 0.0),
+                ang_vel=(0.0, 0.0, 0.0),
+            ),
+            rigid_props=RigidObjectCfg.RigidPropsCfg(
+                disable_gravity=False,
+                linear_damping=0.0,
+                angular_damping=0.0,
+            ),
+            collision_props=RigidObjectCfg.CollisionPropsCfg(
+                collision_enabled=True,
+                contact_offset=0.02,
+                rest_offset=0.0,
+            ),
+        )
+
+        boxes_cfg = RigidObjectCollectionCfg(
+            prim_path="{ENV_REGEX_NS}/Boxes",
+            base_cfg=RigidObjectCfg(
+                prim_path="{ENV_REGEX_NS}/Boxes/box",
+                spawn=RigidObjectCfg.SpawnCfg(
+                    func=shape_spawners.spawn_box,
+                    # Extents will be overridden at reset based on `box_dims`.
+                    extents=(0.4, 0.3, 0.2),
+                ),
+                init_state=RigidObjectCfg.InitialStateCfg(
+                    pos=(0.0, 0.0, 1.5),
+                    rot=(1.0, 0.0, 0.0, 0.0),
+                    lin_vel=(0.0, 0.0, 0.0),
+                    ang_vel=(0.0, 0.0, 0.0),
+                ),
+                rigid_props=RigidObjectCfg.RigidPropsCfg(
+                    disable_gravity=False,
+                    linear_damping=0.0,
+                    angular_damping=0.0,
+                ),
+                collision_props=RigidObjectCfg.CollisionPropsCfg(
+                    collision_enabled=True,
+                    contact_offset=0.01,
+                    rest_offset=0.0,
+                ),
+            ),
+            count_per_env=self.cfg.max_boxes,
+        )
+
+        # Register rigid objects with the interactive scene
+        self.scene.add(pallet_cfg, "pallet")
+        self.scene.add(boxes_cfg, "boxes")
     
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """
@@ -198,10 +261,11 @@ class PalletTask(DirectRLEnv):
         # 1. Get box poses from scene (GPU tensors)
         if "boxes" in self.scene.keys():
             all_pos = self.scene["boxes"].data.root_pos_w  # (N*max_boxes, 3)
-            all_rot = self.scene["boxes"].data.root_quat_w  # (N*max_boxes, 4)
+            all_rot_wxyz = self.scene["boxes"].data.root_quat_w  # (N*max_boxes, 4) (w,x,y,z)
             
             box_pos = all_pos.view(n, self.cfg.max_boxes, 3)
-            box_rot = all_rot.view(n, self.cfg.max_boxes, 4)
+            # Convert Isaac (w,x,y,z) → Warp (x,y,z,w) before rasterization
+            box_rot = wxyz_to_xyzw(all_rot_wxyz).view(n, self.cfg.max_boxes, 4)
         else:
             # Fallback for testing
             box_pos = torch.zeros(n, self.cfg.max_boxes, 3, device=device)
@@ -494,3 +558,18 @@ class PalletTask(DirectRLEnv):
             self._reset_idx(reset_ids)
         
         return obs, rewards, terminated, truncated, info
+
+    def get_action_mask(self) -> torch.Tensor:
+        """
+        Return an action mask over the flattened MultiDiscrete logits.
+
+        Shape: (num_envs, sum(action_dims)), dtype=bool.
+
+        The current implementation marks all actions as valid (all True),
+        but the interface is provided so that task-specific constraints
+        (e.g. collision-based invalid placements) can be injected without
+        changing the policy class.
+        """
+        n = self.num_envs
+        total_logits = sum(self.cfg.action_dims)
+        return torch.ones(n, total_logits, dtype=torch.bool, device=self._device)

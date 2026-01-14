@@ -165,7 +165,7 @@ class PalletizerActorCritic(ActorCritic):
         
         return fusion
     
-    def act(self, obs: torch.Tensor, **kwargs) -> torch.Tensor:
+    def act(self, obs: torch.Tensor, action_mask: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
         """
         Sample actions from policy.
         
@@ -177,6 +177,14 @@ class PalletizerActorCritic(ActorCritic):
         """
         features = self._process_obs(obs)
         logits = self.actor_head(features)
+
+        # Optional action masking: mask is shaped (N, total_logits)
+        if action_mask is not None:
+            assert action_mask.shape == logits.shape, (
+                f"Action mask shape {action_mask.shape} must match logits {logits.shape}"
+            )
+            # Invalid actions get very negative logits so their prob ~ 0
+            logits = logits.masked_fill(~action_mask, -1e9)
         
         # Split logits and create distributions
         self.distributions = []
@@ -242,7 +250,7 @@ class PalletizerActorCritic(ActorCritic):
         
         return torch.stack(action_list, dim=-1)
     
-    def evaluate(self, obs: torch.Tensor, **kwargs) -> torch.Tensor:
+    def evaluate(self, obs: torch.Tensor, action_mask: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
         """
         Compute value estimate and set distributions.
         
@@ -254,9 +262,15 @@ class PalletizerActorCritic(ActorCritic):
         """
         features = self._process_obs(obs)
         value = self.critic_head(features)
-        
+
         # Also populate distributions for get_actions_log_prob
         logits = self.actor_head(features)
+
+        if action_mask is not None:
+            assert action_mask.shape == logits.shape, (
+                f"Action mask shape {action_mask.shape} must match logits {logits.shape}"
+            )
+            logits = logits.masked_fill(~action_mask, -1e9)
         self.distributions = []
         start = 0
         

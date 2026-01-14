@@ -185,10 +185,10 @@ class WarpHeightmapGenerator:
         
         Args:
             box_pos: Box positions, shape (N*max_boxes, 3) or (N, max_boxes, 3)
-            box_rot: Box quaternions (x,y,z,w), shape (N*max_boxes, 4)
+            box_rot: Box quaternions **(x, y, z, w)**, shape (N*max_boxes, 4)
             box_dims: Box dimensions (L,W,H), shape (N*max_boxes, 3)
             pallet_pos: Pallet positions, shape (N, 3)
-            pallet_rot: Pallet quaternions, shape (N, 4), optional
+            pallet_rot: Pallet quaternions **(x, y, z, w)**, shape (N, 4), optional
             
         Returns:
             heightmap: Tensor of shape (N, H, W)
@@ -199,10 +199,10 @@ class WarpHeightmapGenerator:
         box_dims = box_dims.contiguous().view(-1, 3)
         pallet_pos = pallet_pos.contiguous()
         
-        # Default pallet rotation (identity)
+        # Default pallet rotation (identity, x=y=z=0, w=1 in (x,y,z,w) convention)
         if pallet_rot is None:
             pallet_rot = torch.zeros(self.num_envs, 4, device=pallet_pos.device)
-            pallet_rot[:, 3] = 1.0  # w=1 for identity (x,y,z,w)
+            pallet_rot[:, 3] = 1.0
         else:
             pallet_rot = pallet_rot.contiguous()
         

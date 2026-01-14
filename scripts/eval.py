@@ -1,98 +1,137 @@
 
-import os, argparse
-import numpy as np
+"""
+Canonical evaluation script for the PalletTask + RSL-RL pipeline.
+
+This script mirrors the training setup in `scripts/train.py` but:
+- Loads a trained checkpoint.
+- Runs a limited number of evaluation episodes.
+
+NOTE: This file is not executed in this environment. It is structurally
+correct by design and should be validated on a machine with Isaac Lab.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+
 import torch
-from pallet_rl.algo.utils import load_config
-from pallet_rl.envs.vec_env_setup import make_vec_env
-from pallet_rl.models.encoder2d import Encoder2D
-from pallet_rl.models.unet2d import UNet2D
-from pallet_rl.models.policy_heads import SpatialPolicyHead
 
-class ActorCritic(torch.nn.Module):
-    def __init__(self, cfg, in_ch:int):
-        super().__init__()
-        L, W = cfg["env"]["grid"]
-        base = cfg["model"]["encoder2d"]["base_channels"]
-        self.encoder = Encoder2D(in_channels=in_ch, features=base)
-        self.unet = UNet2D(in_ch=in_ch, base=cfg["model"]["unet2d"]["base_channels"])
-        self.heads = SpatialPolicyHead(self.encoder.out_ch, (L, W),
-                                 n_pick=cfg["env"]["buffer_N"],
-                                 n_yaw=len(cfg["env"]["yaw_orients"]),
-                                 hidden=cfg["model"]["policy_heads"]["hidden"])
-        self.gating_lambda = cfg["mask"]["gating_lambda"]
+from isaaclab.app import AppLauncher
+from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
 
-    def forward_policy(self, obs, mask=None):
-        enc = self.encoder(obs)
-        outputs = self.heads(enc, mask=mask, gating_lambda=self.gating_lambda)
-        return outputs
+from rsl_rl.runners import OnPolicyRunner
+
+from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
+from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Evaluate Palletizer policy (Isaac Lab + RSL-RL)")
+
+    parser.add_argument("--headless", action="store_true", help="Run headless")
+    parser.add_argument("--num_envs", type=int, default=128, help="Number of parallel environments")
+    parser.add_argument("--device", type=str, default="cuda:0", help="Compute device")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to RSL-RL checkpoint (.pt)")
+    parser.add_argument("--max_episodes", type=int, default=10, help="Max evaluation episodes per env")
+    parser.add_argument("--log_dir", type=str, default="runs/eval", help="Eval log directory")
+
+    AppLauncher.add_app_launcher_args(parser)
+    return parser.parse_args()
+
 
 def main():
-    use_isaac = os.environ.get("USE_ISAACLAB", "0") == "1"
-    
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="pallet_rl/configs/base.yaml")
-    parser.add_argument("--checkpoint", type=str, required=True)
-    
-    # Isaac Lab Imports
-    if use_isaac:
-        from omni.isaac.lab.app import AppLauncher
-        AppLauncher.add_app_launcher_args(parser)
-        
-    args = parser.parse_args()
-    
-    simulation_app = None
-    if use_isaac:
-        from omni.isaac.lab.app import AppLauncher
-        app_launcher = AppLauncher(args)
-        simulation_app = app_launcher.app
-    
+    args = parse_args()
+
+    # Launch Isaac Lab app before other imports that touch simulation
+    app_launcher = AppLauncher(args)
+    simulation_app = app_launcher.app
+
     try:
-        cfg = load_config(args.config)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device(args.device)
 
-        vecenv = make_vec_env(cfg)
-        L, W = cfg["env"]["grid"]
-        in_ch = 8 + 5
-        model = ActorCritic(cfg, in_ch=in_ch).to(device)
-        model.load_state_dict(torch.load(args.checkpoint, map_location=device))
-        model.eval()
+        # Environment configuration
+        env_cfg = PalletTaskCfg()
+        env_cfg.scene.num_envs = args.num_envs
+        env_cfg.sim.device = args.device
 
-        obs_np = vecenv.reset()
-        obs = torch.as_tensor(obs_np, device=device)
-        
-        print("Starting evaluation loop...")
-        while True:
-            mask_np = vecenv.get_action_mask()
-            mask = torch.as_tensor(mask_np, device=device)
+        render_mode = None if args.headless else "rgb_array"
+        env = PalletTask(cfg=env_cfg, render_mode=render_mode)
+        env = RslRlVecEnvWrapper(env)
 
+        # Build minimal RSL-RL config for evaluation
+        eval_cfg = {
+            "seed": 42,
+            "runner": {
+                "policy_class_name": "ActorCritic",
+                "algorithm_class_name": "PPO",
+                "num_steps_per_env": 16,
+                "max_iterations": 1,
+                "save_interval": 0,
+                "experiment_name": "palletizer_eval",
+                "run_name": "eval",
+                "resume": True,
+                "load_run": -1,
+                "checkpoint": args.checkpoint,
+            },
+            "policy": {
+                "init_noise_std": 0.0,
+                "actor_hidden_dims": [256, 128],
+                "critic_hidden_dims": [256, 128],
+                "activation": "elu",
+            },
+            "algorithm": {
+                "value_loss_coef": 1.0,
+                "use_clipped_value_loss": True,
+                "clip_param": 0.2,
+                "entropy_coef": 0.0,
+                "num_learning_epochs": 1,
+                "num_mini_batches": 1,
+                "learning_rate": 3e-4,
+                "schedule": "fixed",
+                "gamma": 0.99,
+                "lam": 0.95,
+                "desired_kl": 0.01,
+                "max_grad_norm": 1.0,
+            },
+        }
+
+        # Inject our custom policy class
+        import rsl_rl.modules
+
+        rsl_rl.modules.ActorCritic = PalletizerActorCritic
+
+        runner = OnPolicyRunner(env=env, train_cfg=eval_cfg, log_dir=args.log_dir, device=str(device))
+
+        # Load checkpoint into runner/policy
+        runner.load(args.checkpoint)
+
+        # Simple evaluation loop using deterministic actions
+        obs = runner.env.reset()
+        episode_counts = torch.zeros(args.num_envs, dtype=torch.long, device=device)
+
+        print("Starting evaluation rollouts...")
+
+        while int(episode_counts.min().item()) < args.max_episodes:
             with torch.no_grad():
-                logits_pick, logits_yaw, logits_pos, value = model.forward_policy(obs, mask=mask)
-                
-                # Deterministic (Argmax) or Sample?
-                # Usually eval is deterministic.
-                a_pick = torch.argmax(logits_pick, dim=1)
-                a_yaw = torch.argmax(logits_yaw, dim=1)
-                a_pos = torch.argmax(logits_pos, dim=1)
-                
-                a_x = a_pos // W
-                a_y = a_pos % W
-                
-                # Pass actions to environment
-                actions_np = torch.stack([a_pick, a_yaw, a_x, a_y], dim=1).cpu().numpy()
-                next_obs_np, reward_np, done_np, infos = vecenv.step(actions_np)
-                
-                obs = torch.as_tensor(next_obs_np).to(device)
-                
-            if use_isaac:
-                # Assuming simulation_app handles stepping via vecenv.world.step() inside vecenv.step()
-                # If we want to slow down for visualization?
-                pass
-                
-    except KeyboardInterrupt:
-        print("Evaluation stopped.")
+                actions = runner.alg.actor_critic.act_inference(obs["policy"])
+
+            obs, rewards, dones, infos = runner.env.step(actions)
+
+            # Count completed episodes
+            if "time_outs" in infos:
+                done_flags = dones | infos["time_outs"]
+            else:
+                done_flags = dones
+            episode_counts += done_flags.to(device=device, dtype=torch.long)
+
+        print("Evaluation complete.")
+
     finally:
         if simulation_app is not None:
             simulation_app.close()
 
+
 if __name__ == "__main__":
     main()
+

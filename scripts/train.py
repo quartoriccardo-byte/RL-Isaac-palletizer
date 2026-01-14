@@ -81,48 +81,35 @@ import yaml
 
 def get_rsl_rl_cfg(args) -> dict:
     """
-    Build RSL-RL configuration dictionary.
-    
-    Compatible with OnPolicyRunner expectations.
+    Load and adapt the RSL-RL configuration dictionary.
+
+    The base configuration is stored in `pallet_rl/configs/rsl_rl_config.yaml`.
+    CLI arguments (iterations, resume, checkpoint, experiment_name) override
+    the corresponding fields to keep a single source of truth for defaults.
     """
-    return {
-        "seed": 42,
-        
-        "runner": {
-            "policy_class_name": "ActorCritic",
-            "algorithm_class_name": "PPO",
-            "num_steps_per_env": 24,
-            "max_iterations": args.max_iterations,
-            "save_interval": 100,
-            "experiment_name": args.experiment_name,
-            "run_name": "run",
-            "resume": args.resume,
-            "load_run": -1,
-            "checkpoint": -1 if args.checkpoint is None else args.checkpoint,
-        },
-        
-        "policy": {
-            "init_noise_std": 1.0,
-            "actor_hidden_dims": [256, 256],
-            "critic_hidden_dims": [256, 256],
-            "activation": "elu",
-        },
-        
-        "algorithm": {
-            "value_loss_coef": 1.0,
-            "use_clipped_value_loss": True,
-            "clip_param": 0.2,
-            "entropy_coef": 0.01,
-            "num_learning_epochs": 5,
-            "num_mini_batches": 4,
-            "learning_rate": 3e-4,
-            "schedule": "adaptive",
-            "gamma": 0.99,
-            "lam": 0.95,
-            "desired_kl": 0.01,
-            "max_grad_norm": 1.0,
-        },
-    }
+    cfg_path = os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "pallet_rl",
+        "configs",
+        "rsl_rl_config.yaml",
+    )
+    cfg_path = os.path.abspath(cfg_path)
+
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    # Override a few fields from CLI for convenience
+    runner_cfg = cfg.setdefault("runner", {})
+    runner_cfg["max_iterations"] = args.max_iterations
+    runner_cfg["experiment_name"] = args.experiment_name
+    runner_cfg["resume"] = args.resume
+
+    # RSL-RL encodes checkpoint selection via `load_run`/`checkpoint`.
+    if args.checkpoint is not None:
+        runner_cfg["checkpoint"] = args.checkpoint
+
+    return cfg
 
 
 # =============================================================================

@@ -36,54 +36,21 @@ def test_decode_action_rectangular():
 
 
 def test_action_mean_no_mutation():
-    """Test that action_mean does NOT mutate weights."""
-    from pallet_rl.models.actor_critic import ActorCritic
-    
-    # Create model
-    model = ActorCritic(
-        num_obs=38453,
-        num_critic_obs=38453,
-        num_actions=5
-    )
-    
-    # Store original weight values
-    original_weights = model.actor_head[-1].weight.data.clone()
-    
-    # Access action_mean (this used to destroy weights!)
-    _ = model.action_mean
-    
-    # Verify weights unchanged
-    current_weights = model.actor_head[-1].weight.data
-    assert torch.allclose(original_weights, current_weights), \
-        "action_mean property corrupted weights!"
-    
-    print("✓ action_mean no mutation test passed")
+    """Deprecated: legacy ActorCritic implementation has been removed.
+
+    This test is kept as a placeholder to document the original bug
+    but no longer runs against any live code.
+    """
+    pass
 
 
 def test_mask_shape_contract():
-    """Test that policy_heads enforces mask shape contract."""
-    from pallet_rl.models.policy_heads import SpatialPolicyHead
-    
-    head = SpatialPolicyHead(in_channels=64, num_rotations=4)
-    
-    # Create test input
-    B, C, H, W = 2, 64, 160, 240
-    x = torch.randn(B, C, H, W)
-    
-    # Correct mask shape
-    correct_mask = torch.ones(B, 4 * H * W, dtype=torch.bool)
-    output = head(x, mask=correct_mask)
-    assert output.shape == (B, 4 * H * W), f"Unexpected output shape: {output.shape}"
-    
-    # Wrong mask shape should raise AssertionError
-    wrong_mask = torch.ones(B, H * W)  # Missing rotations dimension
-    try:
-        head(x, mask=wrong_mask)
-        assert False, "Should have raised AssertionError for wrong mask shape"
-    except AssertionError:
-        pass  # Expected
-    
-    print("✓ mask shape contract test passed")
+    """Deprecated: legacy SpatialPolicyHead has been removed.
+
+    Action masking is now implemented directly in the MultiDiscrete policy
+    and env; see PalletizerActorCritic and PalletTask for details.
+    """
+    pass
 
 
 def test_terminated_truncated_types():
