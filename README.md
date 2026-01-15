@@ -38,12 +38,15 @@ python -c "import pallet_rl; print('pallet_rl OK')"
 RSL-RL is listed in `pyproject.toml`, but installation may vary by environment. Choose one:
 
 **Option 1 (recommended, pinned version):**
+
 ```bash
 pip install git+https://github.com/leggedrobotics/rsl_rl.git@<commit-hash>
 ```
+
 Replace `<commit-hash>` with a specific commit hash for reproducibility (e.g., `@abc123def456`).
 
 **Option 2 (editable from local clone):**
+
 ```bash
 git clone https://github.com/leggedrobotics/rsl_rl.git
 cd rsl_rl
@@ -52,6 +55,7 @@ pip install -e .
 
 **Option 3 (Isaac Lab environment):**
 Some Isaac Lab environments may already include `rsl_rl`. Verify with:
+
 ```bash
 python -c "import rsl_rl; print('rsl_rl OK')"
 ```
@@ -74,6 +78,7 @@ python scripts/train.py \
 ```
 
 The script:
+
 - Launches Isaac Lab via `isaaclab.app.AppLauncher` (inside `main()` to avoid import-time side effects).
 - Instantiates `PalletTask` with `PalletTaskCfg` (DirectRLEnv).
 - Wraps it with `RslRlVecEnvWrapper` for RSL‑RL.
@@ -81,6 +86,7 @@ The script:
 - Monkey‑patches `rsl_rl.modules.ActorCritic` to use `PalletizerActorCritic` (MultiDiscrete policy).
 
 **Logs and checkpoints:**
+
 - RSL‑RL writes logs and checkpoints under `--log_dir` and `--experiment_name`.
 - With the default flags, you will see runs in `runs/palletizer/palletizer_ppo/*`
   including TensorBoard `events.*` files and `.pt` checkpoints.
@@ -98,6 +104,7 @@ python scripts/eval.py \
 ```
 
 This script:
+
 - Launches Isaac Lab.
 - Builds the same `PalletTask` + `RslRlVecEnvWrapper` stack.
 - Injects `PalletizerActorCritic` into RSL‑RL.
@@ -107,7 +114,135 @@ This script:
 
 - **AppLauncher ordering**: `isaaclab.app.AppLauncher` must be constructed **before** any other Isaac Lab imports that touch simulation.
 - **Wrapper path**: This repo targets the modern import path `isaaclab.envs.wrappers.rsl_rl.RslRlVecEnvWrapper` (not the legacy `omni.isaac.*` namespaces).
-- **Action space**: RSL‑RL’s PPO is originally continuous; this repo provides a custom `PalletizerActorCritic` that implements a factored MultiDiscrete distribution (per‑dimension `Categorical` with summed log‑prob and entropy).
+- **Action space**: RSL‑RL's PPO is originally continuous; this repo provides a custom `PalletizerActorCritic` that implements a factored MultiDiscrete distribution (per‑dimension `Categorical` with summed log‑prob and entropy).
+
+### DirectRLEnv Lifecycle Compliance
+
+`PalletTask` respects the Isaac Lab `DirectRLEnv` step lifecycle (no custom `step()` override):
+
+```
+DirectRLEnv.step(action)
+  │
+  ├─ _pre_physics_step(action)
+  │
+  ├─ _apply_action(action)         ← Task logic: parses action, sets masks,
+  │                                    writes box pose to sim, handles buffer,
+  │                                    increments box_idx at the END
+  │
+  ├─ Physics stepping              ← cfg.decimation × sim.step() (default: 50)
+  │
+  ├─ _post_physics_step()
+  │
+  ├─ _get_observations()           ← Uses NEW box_idx for next box
+  ├─ _get_rewards()                ← Uses box_idx - 1 for placed box evaluation
+  ├─ _get_dones()                  ← Uses box_idx - 1 for placed box evaluation
+  │
+  └─ Reset handling + episode_length_buf updates
+```
+
+**Key design decision**: `box_idx` is incremented at the end of `_apply_action()`. This ensures:
+
+- Rewards and termination flags evaluate the **placed** box (`box_idx - 1`).
+- Observations show the **next** box to be placed (`box_idx`).
+
+**Physics stepping**: Controlled via `cfg.decimation` (default: 50 physics steps per RL step at `dt=1/60s`).
+
+---
+
+## Complete Command Reference
+
+All commands must be run on a machine with Isaac Lab installed.
+
+### Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/quartoriccardo-byte/RL-Isaac-palletizer.git
+cd RL-Isaac-palletizer
+
+# Install the package (editable mode)
+pip install -e .
+
+# Verify installation
+python -c "import pallet_rl; print('pallet_rl OK')"
+
+# Install RSL-RL (if not already installed)
+pip install git+https://github.com/leggedrobotics/rsl_rl.git
+```
+
+### Training
+
+```bash
+# Full training run (headless, 4096 envs)
+python scripts/train.py \
+  --headless \
+  --num_envs 4096 \
+  --device cuda:0 \
+  --max_iterations 2000 \
+  --log_dir runs/palletizer \
+  --experiment_name palletizer_ppo
+
+# Short smoke test (50 iterations)
+python scripts/train.py \
+  --headless \
+  --num_envs 512 \
+  --device cuda:0 \
+  --max_iterations 50 \
+  --log_dir runs/test_run \
+  --experiment_name palletizer_smoke
+```
+
+### Evaluation
+
+```bash
+# Evaluate a checkpoint
+python scripts/eval.py \
+  --headless \
+  --num_envs 128 \
+  --device cuda:0 \
+  --checkpoint path/to/checkpoint.pt
+
+# With rendering (remove --headless)
+python scripts/eval.py \
+  --num_envs 16 \
+  --device cuda:0 \
+  --checkpoint path/to/checkpoint.pt
+```
+
+### Testing (Non-Isaac)
+
+These tests run without Isaac Lab:
+
+```bash
+# Import sanity tests
+python -m pytest tests/test_imports.py -v
+
+# Static bug tests (utilities, wrappers)
+python -m pytest tests/test_bugs.py -v
+
+# Quaternion helper tests
+python -m pytest tests/test_quaternions.py -v
+
+# Run all non-Isaac tests
+python -m pytest tests/ -v
+```
+
+### Git Workflow
+
+```bash
+# Check repository status
+git status
+git fetch --all --prune
+
+# Update to latest main
+git checkout main
+git pull --ff-only origin main
+
+# After making changes
+git add -A
+git commit -m "Your commit message"
+git push origin main
+```
 
 ## Validation Pipeline (To Run on an Isaac Machine)
 
@@ -162,6 +297,7 @@ EOF
 ```
 
 Expected:
+
 - Reset and one step complete without exceptions.
 - Observation tensors have shape `(num_envs, 38477)` for both `policy` and `critic` keys.
 
@@ -219,6 +355,7 @@ python scripts/train.py \
 ```
 
 Expected artifacts:
+
 - A new directory under `runs/test_run` containing:
   - TensorBoard `events.out.tfevents...` files.
   - RSL‑RL checkpoints (e.g. `model_XXX.pt` or similar, depending on RSL‑RL version).
@@ -238,6 +375,7 @@ python scripts/eval.py \
 ```
 
 Observe:
+
 - No crashes when loading the checkpoint.
 - Stable rollouts (no obvious numerical explosions, NaNs, etc.).
 - If you run with rendering enabled (omit `--headless`), you should see boxes being placed onto the pallet in the viewer.

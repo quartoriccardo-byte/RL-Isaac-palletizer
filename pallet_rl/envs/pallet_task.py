@@ -353,9 +353,11 @@ class PalletTask(DirectRLEnv):
         rewards = rewards - 0.01 * ages
         
         # Success/failure for placement
+        # NOTE: box_idx was incremented at end of _apply_action(), so the placed
+        # box is at box_idx - 1 (clamped to valid range).
         if "boxes" in self.scene.keys():
-            global_idx = torch.arange(n, device=device) * self.cfg.max_boxes + self.box_idx
-            global_idx = global_idx.clamp(0, n * self.cfg.max_boxes - 1)
+            placed_idx = (self.box_idx - 1).clamp(0, self.cfg.max_boxes - 1)
+            global_idx = torch.arange(n, device=device) * self.cfg.max_boxes + placed_idx
             current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
             
             dist = torch.norm(current_pos[:, :2] - self.last_target_pos[:, :2], dim=-1)
@@ -369,8 +371,7 @@ class PalletTask(DirectRLEnv):
             rewards = rewards + 1.0 * success.float()
             
             # Volume bonus for successful placement
-            idx = self.box_idx.clamp(0, self.cfg.max_boxes - 1)
-            dims = self.box_dims[torch.arange(n, device=device), idx]
+            dims = self.box_dims[torch.arange(n, device=device), placed_idx]
             vol = dims[:, 0] * dims[:, 1] * dims[:, 2]
             rewards = rewards + vol * success.float()
         
@@ -391,9 +392,11 @@ class PalletTask(DirectRLEnv):
         truncated = torch.zeros(n, dtype=torch.bool, device=device)
         
         # Terminate if box fell or all boxes placed
+        # NOTE: box_idx was incremented at end of _apply_action(), so the placed
+        # box is at box_idx - 1 (clamped to valid range).
         if "boxes" in self.scene.keys():
-            global_idx = torch.arange(n, device=device) * self.cfg.max_boxes + self.box_idx
-            global_idx = global_idx.clamp(0, n * self.cfg.max_boxes - 1)
+            placed_idx = (self.box_idx - 1).clamp(0, self.cfg.max_boxes - 1)
+            global_idx = torch.arange(n, device=device) * self.cfg.max_boxes + placed_idx
             current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
             
             dist = torch.norm(current_pos[:, :2] - self.last_target_pos[:, :2], dim=-1)
@@ -402,7 +405,7 @@ class PalletTask(DirectRLEnv):
             
             terminated = self.active_place_mask & (fell | unstable)
         
-        # Check if all boxes used
+        # Check if all boxes used (box_idx already incremented, so >= means done)
         terminated = terminated | (self.box_idx >= self.cfg.max_boxes)
         
         # Truncation from time limit handled by base class
@@ -559,46 +562,18 @@ class PalletTask(DirectRLEnv):
         
         # Age all buffer slots
         self.buffer_state[:, :, 4] += 1.0
-    
-    def step(self, action: torch.Tensor):
-        """
-        Execute one environment step.
         
-        Args:
-            action: (N, 5) MultiDiscrete action tensor
-            
-        Returns:
-            obs, reward, terminated, truncated, info
-        """
-        # Apply action
-        self._apply_action(action)
-        
-        # Step physics (settling loop controlled via cfg.decimation)
-        for _ in range(self.cfg.decimation):
-            self.sim.step(render=self._render)
-        
-        # Advance box index
+        # Advance box index AFTER action is applied (so reward/done uses box_idx-1)
         self.box_idx += 1
-        
-        # Get observations
-        obs = self._get_observations()
-        
-        # Get rewards
-        rewards = self._get_rewards()
-        
-        # Get termination signals
-        terminated, truncated = self._get_dones()
-        
-        # Build info dict
-        info = {"time_outs": truncated}
-        
-        # Handle resets
-        reset_mask = terminated | truncated
-        if reset_mask.any():
-            reset_ids = reset_mask.nonzero(as_tuple=False).flatten()
-            self._reset_idx(reset_ids)
-        
-        return obs, rewards, terminated, truncated, info
+    
+    # NOTE: step() is NOT overridden — DirectRLEnv.step() handles the lifecycle:
+    #   1. _pre_physics_step(action)
+    #   2. _apply_action(action)  ← our logic, including box_idx increment at end
+    #   3. Physics stepping (cfg.decimation × sim.step())
+    #   4. _post_physics_step()
+    #   5. _get_observations() / _get_rewards() / _get_dones()
+    #   6. Reset handling and episode_length_buf updates
+
 
     def get_action_mask(self) -> torch.Tensor:
         """
