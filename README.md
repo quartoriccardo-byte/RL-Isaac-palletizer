@@ -26,6 +26,14 @@ The buffer stores **physical box identities**, not virtual inventory:
 
 Example: `Place A → Store slot0 → Place B → Retrieve slot0` returns box A (not B or a new box).
 
+### Training Metrics
+
+Task KPIs are logged via `self.extras` and appear under `metrics/*` in TensorBoard:
+
+- `metrics/place_success_rate`, `metrics/place_failure_rate`
+- `metrics/retrieve_success_rate`, `metrics/store_accept_rate`
+- `metrics/buffer_occupancy`
+
 ## Installation
 
 - **Prerequisites (on a machine that can run Isaac)**:

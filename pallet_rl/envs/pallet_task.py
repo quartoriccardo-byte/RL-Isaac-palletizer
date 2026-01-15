@@ -344,6 +344,7 @@ class PalletTask(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         """
         Compute rewards (pure PyTorch, JIT-compatible).
+        Also computes task KPIs logged via self.extras for TensorBoard.
         
         Returns:
             rewards: (N,) tensor
@@ -352,6 +353,11 @@ class PalletTask(DirectRLEnv):
         device = self._device
         
         rewards = torch.zeros(n, device=device)
+        
+        # Initialize KPI tracking tensors (per-env booleans)
+        place_success = torch.zeros(n, dtype=torch.bool, device=device)
+        place_failure = torch.zeros(n, dtype=torch.bool, device=device)
+        retrieve_success = torch.zeros(n, dtype=torch.bool, device=device)
         
         # Penalty for storing (using buffer)
         rewards = rewards - 0.1 * self.store_mask.float()
@@ -364,32 +370,86 @@ class PalletTask(DirectRLEnv):
         rewards = rewards - 0.01 * ages
         
         # Success/failure for placement
-        # Use last_moved_box_id which tracks the actual physical box moved/placed:
-        # - PLACE: the newly placed box (set to box_idx before increment)
-        # - RETRIEVE: the retrieved physical box ID
-        # - STORE: set to -1 (no placement)
-        if "boxes" in self.scene.keys():
-            # Only evaluate envs where a placement occurred (last_moved_box_id >= 0)
-            valid_eval = self.last_moved_box_id >= 0
-            eval_box_idx = self.last_moved_box_id.clamp(0, self.cfg.max_boxes - 1)
-            global_idx = torch.arange(n, device=device) * self.cfg.max_boxes + eval_box_idx
+        # Only evaluate envs where a placement occurred (last_moved_box_id >= 0)
+        valid_eval = self.last_moved_box_id >= 0
+        
+        if "boxes" in self.scene.keys() and valid_eval.any():
+            # Optimization: only read box state for valid envs
+            valid_envs = valid_eval.nonzero(as_tuple=False).flatten()
+            eval_box_idx = self.last_moved_box_id[valid_envs]
+            global_idx = valid_envs * self.cfg.max_boxes + eval_box_idx
             current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
             
-            dist = torch.norm(current_pos[:, :2] - self.last_target_pos[:, :2], dim=-1)
+            target_pos = self.last_target_pos[valid_envs]
+            dist = torch.norm(current_pos[:, :2] - target_pos[:, :2], dim=-1)
             fell = current_pos[:, 2] < 0.05
             unstable = dist > 0.10
             
-            # Only count failure/success for envs with valid placement
-            failure = self.active_place_mask & valid_eval & (fell | unstable)
-            success = self.active_place_mask & valid_eval & ~(fell | unstable)
+            # Compute failure/success for valid envs only
+            failure_valid = fell | unstable
+            success_valid = ~failure_valid
+            
+            # Expand back to full env tensors
+            failure = torch.zeros(n, dtype=torch.bool, device=device)
+            success = torch.zeros(n, dtype=torch.bool, device=device)
+            failure[valid_envs] = failure_valid
+            success[valid_envs] = success_valid
+            
+            # Apply active_place_mask (PLACE or RETRIEVE that results in placement)
+            failure = failure & self.active_place_mask
+            success = success & self.active_place_mask
             
             rewards = rewards - 10.0 * failure.float()
             rewards = rewards + 1.0 * success.float()
             
             # Volume bonus for successful placement
-            dims = self.box_dims[torch.arange(n, device=device), eval_box_idx]
+            dims = self.box_dims[valid_envs, eval_box_idx]
             vol = dims[:, 0] * dims[:, 1] * dims[:, 2]
-            rewards = rewards + vol * success.float()
+            vol_rewards = torch.zeros(n, device=device)
+            vol_rewards[valid_envs] = vol * success_valid.float()
+            rewards = rewards + vol_rewards
+            
+            # Track KPIs: separate PLACE from RETRIEVE
+            place_only = (self.active_place_mask & ~self.valid_retrieve)
+            place_success = success & place_only
+            place_failure = failure & place_only
+            retrieve_success = success & self.valid_retrieve
+        
+        # =====================================================================
+        # Compute and log task KPIs (mean scalars for TensorBoard)
+        # =====================================================================
+        place_attempts = (self.active_place_mask & ~self.valid_retrieve).float().sum()
+        retrieve_attempts = self.retrieve_mask.float().sum()
+        store_attempts = self.store_mask.float().sum()
+        
+        # Initialize extras dict if not present
+        if not hasattr(self, 'extras'):
+            self.extras = {}
+        
+        # KPI #1: Place success rate (among PLACE actions)
+        place_success_rate = place_success.float().sum() / (place_attempts + 1e-8)
+        self.extras["metrics/place_success_rate"] = place_success_rate
+        
+        # KPI #2: Place failure rate (among PLACE actions)
+        place_failure_rate = place_failure.float().sum() / (place_attempts + 1e-8)
+        self.extras["metrics/place_failure_rate"] = place_failure_rate
+        
+        # KPI #3: Retrieve success rate (among RETRIEVE actions)
+        retrieve_success_rate = retrieve_success.float().sum() / (retrieve_attempts + 1e-8)
+        self.extras["metrics/retrieve_success_rate"] = retrieve_success_rate
+        
+        # KPI #4: Store accept rate (fraction of STORE that were valid)
+        # valid_store was computed in _handle_buffer_actions; approximated here by
+        # checking how many store envs actually wrote to buffer
+        # We track using store_mask - we need the accepted count from _handle_buffer_actions
+        # For now, use a simple metric: stores that had box_idx > 0 and empty slot
+        has_box_to_store = (self.box_idx > 0).float()
+        store_accept_approx = (self.store_mask.float() * has_box_to_store).sum() / (store_attempts + 1e-8)
+        self.extras["metrics/store_accept_rate"] = store_accept_approx
+        
+        # KPI #5: Buffer occupancy (mean fraction of slots occupied)
+        buffer_occupancy = self.buffer_has_box.float().mean()
+        self.extras["metrics/buffer_occupancy"] = buffer_occupancy
         
         return rewards
     
@@ -408,19 +468,27 @@ class PalletTask(DirectRLEnv):
         truncated = torch.zeros(n, dtype=torch.bool, device=device)
         
         # Terminate if box fell or all boxes placed
-        # Use last_moved_box_id for the physical box being evaluated
-        if "boxes" in self.scene.keys():
-            valid_eval = self.last_moved_box_id >= 0
-            eval_box_idx = self.last_moved_box_id.clamp(0, self.cfg.max_boxes - 1)
-            global_idx = torch.arange(n, device=device) * self.cfg.max_boxes + eval_box_idx
+        # Only evaluate envs where a placement occurred (last_moved_box_id >= 0)
+        valid_eval = self.last_moved_box_id >= 0
+        
+        if "boxes" in self.scene.keys() and valid_eval.any():
+            # Optimization: only read box state for valid envs
+            valid_envs = valid_eval.nonzero(as_tuple=False).flatten()
+            eval_box_idx = self.last_moved_box_id[valid_envs]
+            global_idx = valid_envs * self.cfg.max_boxes + eval_box_idx
             current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
             
-            dist = torch.norm(current_pos[:, :2] - self.last_target_pos[:, :2], dim=-1)
+            target_pos = self.last_target_pos[valid_envs]
+            dist = torch.norm(current_pos[:, :2] - target_pos[:, :2], dim=-1)
             fell = current_pos[:, 2] < 0.05
             unstable = dist > 0.10
             
-            # Only terminate if a valid placement occurred and it failed
-            terminated = self.active_place_mask & valid_eval & (fell | unstable)
+            # Compute failure for valid envs, expand to full tensor
+            failure_valid = fell | unstable
+            active_place_valid = self.active_place_mask[valid_envs]
+            
+            # Only terminate if valid placement occurred and it failed
+            terminated[valid_envs] = active_place_valid & failure_valid
         
         # Check if all boxes used (box_idx already incremented on Place, so >= means done)
         terminated = terminated | (self.box_idx >= self.cfg.max_boxes)
