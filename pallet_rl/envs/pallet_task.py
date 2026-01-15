@@ -186,6 +186,7 @@ class PalletTask(DirectRLEnv):
         self.store_mask = torch.zeros(n, dtype=torch.bool, device=device)
         self.retrieve_mask = torch.zeros(n, dtype=torch.bool, device=device)
         self.valid_retrieve = torch.zeros(n, dtype=torch.bool, device=device)
+        self.valid_store = torch.zeros(n, dtype=torch.bool, device=device)  # True stores (box_idx>0 & empty slot)
         
         # Target position for stability check
         self.last_target_pos = torch.zeros(n, 3, device=device)
@@ -448,7 +449,8 @@ class PalletTask(DirectRLEnv):
         place_only = (self.active_place_mask & ~self.valid_retrieve)
         if place_only.any():
             place_envs = place_only.nonzero(as_tuple=False).flatten()
-            self._kpi_countdown[place_envs] = self.cfg.kpi_settle_steps
+            # +1 to account for decrement happening in same frame
+            self._kpi_countdown[place_envs] = self.cfg.kpi_settle_steps + 1
             self._kpi_pending_type[place_envs] = 1  # 1 = place
             self._kpi_pending_box_id[place_envs] = self.last_moved_box_id[place_envs]
             self._kpi_pending_target[place_envs] = self.last_target_pos[place_envs]
@@ -456,7 +458,8 @@ class PalletTask(DirectRLEnv):
         # For valid RETRIEVE: queue the retrieved box for later KPI evaluation
         if self.valid_retrieve.any():
             retr_envs = self.valid_retrieve.nonzero(as_tuple=False).flatten()
-            self._kpi_countdown[retr_envs] = self.cfg.kpi_settle_steps
+            # +1 to account for decrement happening in same frame
+            self._kpi_countdown[retr_envs] = self.cfg.kpi_settle_steps + 1
             self._kpi_pending_type[retr_envs] = 2  # 2 = retrieve
             self._kpi_pending_box_id[retr_envs] = self.last_moved_box_id[retr_envs]
             self._kpi_pending_target[retr_envs] = self.last_target_pos[retr_envs]
@@ -513,10 +516,9 @@ class PalletTask(DirectRLEnv):
         place_failure_rate = self._kpi_place_fail_count / (total_place + 1e-8)
         retrieve_success_rate = self._kpi_retrieve_success_count / (total_retr + 1e-8)
         
-        # Store accept rate (immediate metric - no settling needed)
+        # Store accept rate: use true valid_store (includes empty-slot condition)
         store_attempts = self.store_mask.float().sum()
-        has_box_to_store = (self.box_idx > 0).float()
-        store_accept_approx = (self.store_mask.float() * has_box_to_store).sum() / (store_attempts + 1e-8)
+        store_accept_rate = self.valid_store.float().sum() / (store_attempts + 1e-8)
         
         # Buffer occupancy (immediate metric)
         buffer_occupancy = self.buffer_has_box.float().mean()
@@ -526,7 +528,7 @@ class PalletTask(DirectRLEnv):
         self.extras["metrics/place_success_rate"] = place_success_rate.detach().cpu().item()
         self.extras["metrics/place_failure_rate"] = place_failure_rate.detach().cpu().item()
         self.extras["metrics/retrieve_success_rate"] = retrieve_success_rate.detach().cpu().item()
-        self.extras["metrics/store_accept_rate"] = store_accept_approx.detach().cpu().item()
+        self.extras["metrics/store_accept_rate"] = store_accept_rate.detach().cpu().item()
         self.extras["metrics/buffer_occupancy"] = buffer_occupancy.detach().cpu().item()
         
         return rewards
@@ -602,6 +604,7 @@ class PalletTask(DirectRLEnv):
         self.store_mask[env_ids] = False
         self.retrieve_mask[env_ids] = False
         self.valid_retrieve[env_ids] = False
+        self.valid_store[env_ids] = False
         self.last_target_pos[env_ids] = 0.0
         
         # Reset KPI settling state
@@ -729,6 +732,7 @@ class PalletTask(DirectRLEnv):
         has_box_to_store = self.box_idx > 0
         slot_is_empty = ~self.buffer_has_box[env_idx, slot_idx]
         valid_store = self.store_mask & has_box_to_store & slot_is_empty
+        self.valid_store = valid_store  # Store for KPI logging
         
         if valid_store.any():
             store_envs = valid_store.nonzero(as_tuple=False).flatten()
