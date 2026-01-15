@@ -16,6 +16,16 @@ Reinforcement Learning for robotic palletization using Isaac Lab and RSL-RL.
 
 For a detailed snapshot of the current layout and data flow, see `docs/architecture_as_is.md`.
 
+### Physical Buffer Semantics
+
+The buffer stores **physical box identities**, not virtual inventory:
+
+- **STORE** parks an existing physical box (the last placed) in a holding area and records its ID.
+- **RETRIEVE** moves that same parked physical box back onto the pallet.
+- **PLACE** consumes a fresh box from the episode allocation; only PLACE increments `box_idx`.
+
+Example: `Place A → Store slot0 → Place B → Retrieve slot0` returns box A (not B or a new box).
+
 ## Installation
 
 - **Prerequisites (on a machine that can run Isaac)**:

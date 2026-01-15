@@ -157,13 +157,25 @@ class PalletTask(DirectRLEnv):
         # Preallocated buffer for heightmap generation (avoids per-step clone)
         self._box_dims_for_hmap = torch.zeros(n, self.cfg.max_boxes, 3, device=device)
         
-        # Buffer state: (N, buffer_slots, buffer_features)
+        # Buffer state: (N, buffer_slots, buffer_features) - dims, active flag, age
         self.buffer_state = torch.zeros(
             n, self.cfg.buffer_slots, self.cfg.buffer_features, device=device
         )
         
-        # Current box index per env
+        # Physical buffer tracking: which physical box is parked in each slot
+        # buffer_has_box[env, slot] = True if slot contains a parked physical box
+        self.buffer_has_box = torch.zeros(n, self.cfg.buffer_slots, dtype=torch.bool, device=device)
+        # buffer_box_id[env, slot] = physical box index (0..max_boxes-1) or -1 if empty
+        self.buffer_box_id = torch.full((n, self.cfg.buffer_slots), -1, dtype=torch.long, device=device)
+        
+        # Current box index per env (tracks "next fresh box to use")
         self.box_idx = torch.zeros(n, dtype=torch.long, device=device)
+        
+        # Last moved/placed box ID for reward/done evaluation
+        # After PLACE: set to box_idx-1 (the newly placed box)
+        # After RETRIEVE: set to the retrieved physical box ID
+        # After STORE: set to -1 (no placement occurred)
+        self.last_moved_box_id = torch.full((n,), -1, dtype=torch.long, device=device)
         
         # Masks for reward computation
         self.active_place_mask = torch.zeros(n, dtype=torch.bool, device=device)
@@ -352,25 +364,30 @@ class PalletTask(DirectRLEnv):
         rewards = rewards - 0.01 * ages
         
         # Success/failure for placement
-        # NOTE: box_idx was incremented at end of _apply_action(), so the placed
-        # box is at box_idx - 1 (clamped to valid range).
+        # Use last_moved_box_id which tracks the actual physical box moved/placed:
+        # - PLACE: the newly placed box (set to box_idx before increment)
+        # - RETRIEVE: the retrieved physical box ID
+        # - STORE: set to -1 (no placement)
         if "boxes" in self.scene.keys():
-            placed_idx = (self.box_idx - 1).clamp(0, self.cfg.max_boxes - 1)
-            global_idx = torch.arange(n, device=device) * self.cfg.max_boxes + placed_idx
+            # Only evaluate envs where a placement occurred (last_moved_box_id >= 0)
+            valid_eval = self.last_moved_box_id >= 0
+            eval_box_idx = self.last_moved_box_id.clamp(0, self.cfg.max_boxes - 1)
+            global_idx = torch.arange(n, device=device) * self.cfg.max_boxes + eval_box_idx
             current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
             
             dist = torch.norm(current_pos[:, :2] - self.last_target_pos[:, :2], dim=-1)
             fell = current_pos[:, 2] < 0.05
             unstable = dist > 0.10
             
-            failure = self.active_place_mask & (fell | unstable)
-            success = self.active_place_mask & ~failure
+            # Only count failure/success for envs with valid placement
+            failure = self.active_place_mask & valid_eval & (fell | unstable)
+            success = self.active_place_mask & valid_eval & ~(fell | unstable)
             
             rewards = rewards - 10.0 * failure.float()
             rewards = rewards + 1.0 * success.float()
             
             # Volume bonus for successful placement
-            dims = self.box_dims[torch.arange(n, device=device), placed_idx]
+            dims = self.box_dims[torch.arange(n, device=device), eval_box_idx]
             vol = dims[:, 0] * dims[:, 1] * dims[:, 2]
             rewards = rewards + vol * success.float()
         
@@ -391,18 +408,19 @@ class PalletTask(DirectRLEnv):
         truncated = torch.zeros(n, dtype=torch.bool, device=device)
         
         # Terminate if box fell or all boxes placed
-        # NOTE: box_idx was incremented at end of _apply_action(), so the placed
-        # box is at box_idx - 1 (clamped to valid range).
+        # Use last_moved_box_id for the physical box being evaluated
         if "boxes" in self.scene.keys():
-            placed_idx = (self.box_idx - 1).clamp(0, self.cfg.max_boxes - 1)
-            global_idx = torch.arange(n, device=device) * self.cfg.max_boxes + placed_idx
+            valid_eval = self.last_moved_box_id >= 0
+            eval_box_idx = self.last_moved_box_id.clamp(0, self.cfg.max_boxes - 1)
+            global_idx = torch.arange(n, device=device) * self.cfg.max_boxes + eval_box_idx
             current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
             
             dist = torch.norm(current_pos[:, :2] - self.last_target_pos[:, :2], dim=-1)
             fell = current_pos[:, 2] < 0.05
             unstable = dist > 0.10
             
-            terminated = self.active_place_mask & (fell | unstable)
+            # Only terminate if a valid placement occurred and it failed
+            terminated = self.active_place_mask & valid_eval & (fell | unstable)
         
         # Check if all boxes used (box_idx already incremented on Place, so >= means done)
         terminated = terminated | (self.box_idx >= self.cfg.max_boxes)
@@ -430,7 +448,10 @@ class PalletTask(DirectRLEnv):
         
         # Reset state tensors (tensor-sliced assignment)
         self.buffer_state[env_ids] = 0.0
+        self.buffer_has_box[env_ids] = False
+        self.buffer_box_id[env_ids] = -1
         self.box_idx[env_ids] = 0
+        self.last_moved_box_id[env_ids] = -1
         self.active_place_mask[env_ids] = False
         self.store_mask[env_ids] = False
         self.retrieve_mask[env_ids] = False
@@ -526,50 +547,136 @@ class PalletTask(DirectRLEnv):
         self._handle_buffer_actions(action)
     
     def _handle_buffer_actions(self, action: torch.Tensor):
-        """Handle store and retrieve buffer operations."""
+        """
+        Handle store and retrieve buffer operations with physical box tracking.
+        
+        Physical buffer semantics:
+        - STORE parks an existing physical box in a holding area and records its ID
+        - RETRIEVE moves that same parked physical box back onto the pallet
+        - The buffer does NOT create new boxes
+        
+        Example scenario:
+          Place box A (box_idx=0) -> Store slot0 -> Place box B (box_idx=1)
+          -> Retrieve slot0 should return box A (physical ID 0), NOT box B
+        """
         device = self._device
         n = self.num_envs
         env_idx = torch.arange(n, device=device)
         
         slot_idx = action[:, 1].long()
+        op_type = action[:, 0]
         
-        # Store: save current box dims to buffer
+        # Reset last_moved_box_id; will be set appropriately below
+        self.last_moved_box_id[:] = -1
+        
+        # =======================================================================
+        # STORE: Park the last-placed physical box in a buffer slot
+        # =======================================================================
+        # For STORE, we park the box at index (box_idx - 1) which is the most
+        # recently placed box. If box_idx == 0, there's no box to store (invalid).
         if self.store_mask.any():
             store_envs = self.store_mask.nonzero(as_tuple=False).flatten()
             store_slots = slot_idx[store_envs]
-            dims = self.box_dims[store_envs, self.box_idx[store_envs]]
             
+            # The physical box being stored is the last placed: box_idx - 1
+            # If box_idx == 0, clamp to 0 but this is conceptually invalid (no box placed yet)
+            stored_physical_id = (self.box_idx[store_envs] - 1).clamp(0, self.cfg.max_boxes - 1)
+            dims = self.box_dims[store_envs, stored_physical_id]
+            
+            # Update buffer_state (dims, active flag, age)
             self.buffer_state[store_envs, store_slots, :3] = dims
-            self.buffer_state[store_envs, store_slots, 3] = 1.0  # ID = active
+            self.buffer_state[store_envs, store_slots, 3] = 1.0  # Active flag
             self.buffer_state[store_envs, store_slots, 4] = 0.0  # Reset age
+            
+            # Track physical box identity in slot
+            # If slot was already occupied, the old box is overwritten (simple deterministic behavior)
+            self.buffer_has_box[store_envs, store_slots] = True
+            self.buffer_box_id[store_envs, store_slots] = stored_physical_id
+            
+            # Move the stored box off-map (to holding area)
+            if "boxes" in self.scene.keys():
+                global_store_idx = store_envs * self.cfg.max_boxes + stored_physical_id
+                holding_pos = self._inactive_box_pos.expand(len(store_envs), 3)
+                holding_quat = torch.zeros(len(store_envs), 4, device=device)
+                holding_quat[:, 0] = 1.0  # Identity quaternion
+                self.scene["boxes"].write_root_pose_to_sim(
+                    holding_pos, holding_quat, indices=global_store_idx
+                )
+            
+            # STORE does not count as a placement; last_moved_box_id stays -1 for these envs
         
-        # Retrieve: get box dims from buffer
-        has_data = self.buffer_state[env_idx, slot_idx, 3] > 0.5
-        self.valid_retrieve = self.retrieve_mask & has_data
+        # =======================================================================
+        # RETRIEVE: Move a parked physical box back onto the pallet
+        # =======================================================================
+        has_box_in_slot = self.buffer_has_box[env_idx, slot_idx]
+        self.valid_retrieve = self.retrieve_mask & has_box_in_slot
         
         if self.valid_retrieve.any():
             retr_envs = self.valid_retrieve.nonzero(as_tuple=False).flatten()
             retr_slots = slot_idx[retr_envs]
             
-            # Copy dims from buffer to current box
-            self.box_dims[retr_envs, self.box_idx[retr_envs]] = \
-                self.buffer_state[retr_envs, retr_slots, :3]
+            # Get the physical box ID from the buffer slot
+            retrieved_physical_id = self.buffer_box_id[retr_envs, retr_slots]
+            
+            # Move THAT physical box to the target position
+            # Note: target position was already computed in _apply_action
+            if "boxes" in self.scene.keys():
+                global_retr_idx = retr_envs * self.cfg.max_boxes + retrieved_physical_id
+                
+                # Build target pose for retrieved boxes
+                step = 0.05
+                grid_x = action[retr_envs, 2]
+                grid_y = action[retr_envs, 3]
+                rot_idx = action[retr_envs, 4]
+                
+                target_x = grid_x.float() * step - 0.4 + step / 2
+                target_y = grid_y.float() * step - 0.6 + step / 2
+                target_z = torch.full((len(retr_envs),), 1.5, device=device)
+                target_pos = torch.stack([target_x, target_y, target_z], dim=-1)
+                
+                quat = torch.zeros(len(retr_envs), 4, device=device)
+                quat[:, 0] = 1.0
+                rot_mask = (rot_idx == 1)
+                quat[rot_mask, 0] = 0.7071068
+                quat[rot_mask, 3] = 0.7071068
+                
+                self.scene["boxes"].write_root_pose_to_sim(
+                    target_pos, quat, indices=global_retr_idx
+                )
+                
+                vel = torch.zeros(len(retr_envs), 6, device=device)
+                self.scene["boxes"].write_root_velocity_to_sim(vel, indices=global_retr_idx)
             
             # Clear buffer slot
+            self.buffer_has_box[retr_envs, retr_slots] = False
+            self.buffer_box_id[retr_envs, retr_slots] = -1
             self.buffer_state[retr_envs, retr_slots] = 0.0
             
-            # This counts as a placement too
+            # Record last_moved_box_id for reward/done evaluation
+            self.last_moved_box_id[retr_envs] = retrieved_physical_id
+            
+            # RETRIEVE counts as a placement
             self.active_place_mask = self.active_place_mask | self.valid_retrieve
         
         # Age all buffer slots
         self.buffer_state[:, :, 4] += 1.0
         
-        # Advance box index ONLY on Place action (op_type == 0).
-        # - Place (op=0): consumes a new box -> increment box_idx
-        # - Store (op=1): defers current box to buffer, does NOT consume -> no increment
-        # - Retrieve (op=2): retrieves from buffer and places, does NOT consume new box -> no increment
-        # This ensures box_idx tracks "next fresh box to use", not "total actions taken".
-        place_mask = (action[:, 0] == 0)  # Only op_type == 0 (Place)
+        # =======================================================================
+        # PLACE: Advance box_idx and record last_moved_box_id
+        # =======================================================================
+        # PLACE (op=0): consumes a new box -> increment box_idx
+        # STORE (op=1): parks existing box, does NOT consume -> no increment
+        # RETRIEVE (op=2): moves parked box, does NOT consume new box -> no increment
+        place_mask = (op_type == 0)
+        
+        # For PLACE, last_moved_box_id = box_idx (the box being placed)
+        # Note: we set this BEFORE incrementing box_idx
+        self.last_moved_box_id = torch.where(
+            place_mask,
+            self.box_idx,  # Current box_idx is the placed box
+            self.last_moved_box_id
+        )
+        
         self.box_idx += place_mask.long()
     
     # NOTE: step() is NOT overridden — DirectRLEnv.step() handles the lifecycle:
