@@ -28,11 +28,13 @@ Example: `Place A → Store slot0 → Place B → Retrieve slot0` returns box A 
 
 ### Training Metrics
 
-Task KPIs are logged via `self.extras` and appear under `metrics/*` in TensorBoard:
+Task KPIs are emitted via `self.extras` and forwarded by `RslRlVecEnvWrapper` to TensorBoard under `metrics/*`:
 
 - `metrics/place_success_rate`, `metrics/place_failure_rate`
 - `metrics/retrieve_success_rate`, `metrics/store_accept_rate`
 - `metrics/buffer_occupancy`
+
+KPI success checks use a settling window (`cfg.kpi_settle_steps`) to allow physics to stabilize before evaluation. Values are converted to CPU floats at the logging boundary.
 
 ## Installation
 

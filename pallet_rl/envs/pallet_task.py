@@ -72,6 +72,10 @@ class PalletTaskCfg(DirectRLEnvCfg):
     buffer_slots: int = 10
     buffer_features: int = 5  # [L, W, H, ID, Age]
     
+    # KPI settling window (number of env steps to wait before evaluating KPIs)
+    # This allows physics to settle before measuring place/retrieve success
+    kpi_settle_steps: int = 3
+    
     # Robot state dimension
     robot_state_dim: int = 24  # 6 pos + 6 vel + gripper etc.
     
@@ -188,6 +192,28 @@ class PalletTask(DirectRLEnv):
         
         # Off-map position for inactive boxes (far away to ensure they never pollute heightmap)
         self._inactive_box_pos = torch.tensor([1e6, 1e6, -1e6], device=device)
+        
+        # =====================================================================
+        # KPI Settling Window State
+        # =====================================================================
+        # Pending countdown before evaluating KPIs (allows physics settling)
+        self._kpi_countdown = torch.zeros(n, dtype=torch.long, device=device)
+        # Type of pending action: 0=none, 1=place, 2=retrieve
+        self._kpi_pending_type = torch.zeros(n, dtype=torch.long, device=device)
+        # Physical box ID to evaluate when countdown reaches 0
+        self._kpi_pending_box_id = torch.full((n,), -1, dtype=torch.long, device=device)
+        # Target position saved at action time for KPI evaluation
+        self._kpi_pending_target = torch.zeros(n, 3, device=device)
+        
+        # Running KPI accumulators (for settled evaluations)
+        self._kpi_place_success_count = torch.zeros(1, device=device)
+        self._kpi_place_fail_count = torch.zeros(1, device=device)
+        self._kpi_retrieve_success_count = torch.zeros(1, device=device)
+        self._kpi_retrieve_fail_count = torch.zeros(1, device=device)
+        self._kpi_eval_count = torch.zeros(1, device=device)  # Total KPI evals
+        
+        # Initialize extras dict for logging
+        self.extras = {}
     
     def _setup_scene(self):
         """
@@ -416,40 +442,92 @@ class PalletTask(DirectRLEnv):
             retrieve_success = success & self.valid_retrieve
         
         # =====================================================================
-        # Compute and log task KPIs (mean scalars for TensorBoard)
+        # Queue KPI evaluations with settling window
         # =====================================================================
-        place_attempts = (self.active_place_mask & ~self.valid_retrieve).float().sum()
-        retrieve_attempts = self.retrieve_mask.float().sum()
+        # For PLACE: queue the placed box for later KPI evaluation
+        place_only = (self.active_place_mask & ~self.valid_retrieve)
+        if place_only.any():
+            place_envs = place_only.nonzero(as_tuple=False).flatten()
+            self._kpi_countdown[place_envs] = self.cfg.kpi_settle_steps
+            self._kpi_pending_type[place_envs] = 1  # 1 = place
+            self._kpi_pending_box_id[place_envs] = self.last_moved_box_id[place_envs]
+            self._kpi_pending_target[place_envs] = self.last_target_pos[place_envs]
+        
+        # For valid RETRIEVE: queue the retrieved box for later KPI evaluation
+        if self.valid_retrieve.any():
+            retr_envs = self.valid_retrieve.nonzero(as_tuple=False).flatten()
+            self._kpi_countdown[retr_envs] = self.cfg.kpi_settle_steps
+            self._kpi_pending_type[retr_envs] = 2  # 2 = retrieve
+            self._kpi_pending_box_id[retr_envs] = self.last_moved_box_id[retr_envs]
+            self._kpi_pending_target[retr_envs] = self.last_target_pos[retr_envs]
+        
+        # =====================================================================
+        # Evaluate settled KPIs (countdown reached 0)
+        # =====================================================================
+        # Decrement countdown for envs with pending evaluations
+        pending = self._kpi_countdown > 0
+        self._kpi_countdown[pending] -= 1
+        
+        # Find envs that just reached 0 (ready for evaluation)
+        ready_mask = (self._kpi_countdown == 0) & (self._kpi_pending_type > 0)
+        
+        if "boxes" in self.scene.keys() and ready_mask.any():
+            ready_envs = ready_mask.nonzero(as_tuple=False).flatten()
+            eval_box_ids = self._kpi_pending_box_id[ready_envs]
+            eval_targets = self._kpi_pending_target[ready_envs]
+            eval_types = self._kpi_pending_type[ready_envs]
+            
+            # Get settled box positions
+            global_idx = ready_envs * self.cfg.max_boxes + eval_box_ids
+            settled_pos = self.scene["boxes"].data.root_pos_w[global_idx]
+            
+            # Evaluate success criteria
+            dist = torch.norm(settled_pos[:, :2] - eval_targets[:, :2], dim=-1)
+            fell = settled_pos[:, 2] < 0.05
+            unstable = dist > 0.10
+            success = ~(fell | unstable)
+            
+            # Update running accumulators
+            place_mask = (eval_types == 1)
+            retr_mask = (eval_types == 2)
+            
+            self._kpi_place_success_count += (success & place_mask).float().sum()
+            self._kpi_place_fail_count += (~success & place_mask).float().sum()
+            self._kpi_retrieve_success_count += (success & retr_mask).float().sum()
+            self._kpi_retrieve_fail_count += (~success & retr_mask).float().sum()
+            self._kpi_eval_count += len(ready_envs)
+            
+            # Clear pending state
+            self._kpi_pending_type[ready_envs] = 0
+            self._kpi_pending_box_id[ready_envs] = -1
+        
+        # =====================================================================
+        # Compute and log task KPIs (CPU scalars for TensorBoard)
+        # =====================================================================
+        # Use settled accumulators for accurate KPIs
+        total_place = self._kpi_place_success_count + self._kpi_place_fail_count
+        total_retr = self._kpi_retrieve_success_count + self._kpi_retrieve_fail_count
+        
+        # Compute rates (avoid div by zero)
+        place_success_rate = self._kpi_place_success_count / (total_place + 1e-8)
+        place_failure_rate = self._kpi_place_fail_count / (total_place + 1e-8)
+        retrieve_success_rate = self._kpi_retrieve_success_count / (total_retr + 1e-8)
+        
+        # Store accept rate (immediate metric - no settling needed)
         store_attempts = self.store_mask.float().sum()
-        
-        # Initialize extras dict if not present
-        if not hasattr(self, 'extras'):
-            self.extras = {}
-        
-        # KPI #1: Place success rate (among PLACE actions)
-        place_success_rate = place_success.float().sum() / (place_attempts + 1e-8)
-        self.extras["metrics/place_success_rate"] = place_success_rate
-        
-        # KPI #2: Place failure rate (among PLACE actions)
-        place_failure_rate = place_failure.float().sum() / (place_attempts + 1e-8)
-        self.extras["metrics/place_failure_rate"] = place_failure_rate
-        
-        # KPI #3: Retrieve success rate (among RETRIEVE actions)
-        retrieve_success_rate = retrieve_success.float().sum() / (retrieve_attempts + 1e-8)
-        self.extras["metrics/retrieve_success_rate"] = retrieve_success_rate
-        
-        # KPI #4: Store accept rate (fraction of STORE that were valid)
-        # valid_store was computed in _handle_buffer_actions; approximated here by
-        # checking how many store envs actually wrote to buffer
-        # We track using store_mask - we need the accepted count from _handle_buffer_actions
-        # For now, use a simple metric: stores that had box_idx > 0 and empty slot
         has_box_to_store = (self.box_idx > 0).float()
         store_accept_approx = (self.store_mask.float() * has_box_to_store).sum() / (store_attempts + 1e-8)
-        self.extras["metrics/store_accept_rate"] = store_accept_approx
         
-        # KPI #5: Buffer occupancy (mean fraction of slots occupied)
+        # Buffer occupancy (immediate metric)
         buffer_occupancy = self.buffer_has_box.float().mean()
-        self.extras["metrics/buffer_occupancy"] = buffer_occupancy
+        
+        # Log to extras with CPU conversion at the boundary
+        # KPIs are emitted via self.extras and forwarded by RslRlVecEnvWrapper
+        self.extras["metrics/place_success_rate"] = place_success_rate.detach().cpu().item()
+        self.extras["metrics/place_failure_rate"] = place_failure_rate.detach().cpu().item()
+        self.extras["metrics/retrieve_success_rate"] = retrieve_success_rate.detach().cpu().item()
+        self.extras["metrics/store_accept_rate"] = store_accept_approx.detach().cpu().item()
+        self.extras["metrics/buffer_occupancy"] = buffer_occupancy.detach().cpu().item()
         
         return rewards
     
@@ -525,6 +603,12 @@ class PalletTask(DirectRLEnv):
         self.retrieve_mask[env_ids] = False
         self.valid_retrieve[env_ids] = False
         self.last_target_pos[env_ids] = 0.0
+        
+        # Reset KPI settling state
+        self._kpi_countdown[env_ids] = 0
+        self._kpi_pending_type[env_ids] = 0
+        self._kpi_pending_box_id[env_ids] = -1
+        self._kpi_pending_target[env_ids] = 0.0
         
         # Randomize box dimensions for new episode
         base_dims = torch.tensor([0.4, 0.3, 0.2], device=device)
