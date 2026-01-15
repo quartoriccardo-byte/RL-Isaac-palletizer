@@ -283,11 +283,10 @@ class PalletTask(DirectRLEnv):
         pallet_pos = torch.zeros(n, 3, device=device)
         
         # 2. Generate heightmap (GPU-only via Warp)
-        # Only boxes up to the current index are considered "active" for
-        # rasterization. Inactive boxes are moved off-map and have zero dims
-        # to guarantee they cannot pollute the heightmap.
+        # Only boxes that have been placed (indices 0..box_idx-1) are "active" for
+        # rasterization. Use strict < to exclude the current/next box.
         box_indices = torch.arange(self.cfg.max_boxes, device=device).view(1, -1)
-        active_mask = box_indices <= self.box_idx.view(-1, 1)  # (N, max_boxes)
+        active_mask = box_indices < self.box_idx.view(-1, 1)  # (N, max_boxes)
         
         # Update preallocated buffer: copy active dims, zero inactive
         self._box_dims_for_hmap.copy_(self.box_dims)
@@ -405,11 +404,13 @@ class PalletTask(DirectRLEnv):
             
             terminated = self.active_place_mask & (fell | unstable)
         
-        # Check if all boxes used (box_idx already incremented, so >= means done)
+        # Check if all boxes used (box_idx already incremented on Place, so >= means done)
         terminated = terminated | (self.box_idx >= self.cfg.max_boxes)
         
-        # Truncation from time limit handled by base class
-        truncated = self.episode_length_buf >= self.max_episode_length
+        # Truncation from time limit is handled by DirectRLEnv base class.
+        # We intentionally return all-False here; the base class ORs in the
+        # timeout truncation after calling _get_dones().
+        # truncated stays all-False
         
         return terminated, truncated
     
@@ -563,8 +564,13 @@ class PalletTask(DirectRLEnv):
         # Age all buffer slots
         self.buffer_state[:, :, 4] += 1.0
         
-        # Advance box index AFTER action is applied (so reward/done uses box_idx-1)
-        self.box_idx += 1
+        # Advance box index ONLY on Place action (op_type == 0).
+        # - Place (op=0): consumes a new box -> increment box_idx
+        # - Store (op=1): defers current box to buffer, does NOT consume -> no increment
+        # - Retrieve (op=2): retrieves from buffer and places, does NOT consume new box -> no increment
+        # This ensures box_idx tracks "next fresh box to use", not "total actions taken".
+        place_mask = (action[:, 0] == 0)  # Only op_type == 0 (Place)
+        self.box_idx += place_mask.long()
     
     # NOTE: step() is NOT overridden — DirectRLEnv.step() handles the lifecycle:
     #   1. _pre_physics_step(action)

@@ -6,22 +6,22 @@ Reinforcement Learning for robotic palletization using Isaac Lab and RSL-RL.
 
 **Chosen Pipeline:** Isaac Lab (DirectRLEnv) + RSL-RL PPO + MultiDiscrete Actions + Warp heightmaps
 
-| Component | Implementation |
-|:----------|:---------------|
-| Environment | `pallet_rl.envs.pallet_task.PalletTask` (Isaac Lab `DirectRLEnv`) |
-| Policy | `pallet_rl.models.rsl_rl_wrapper.PalletizerActorCritic` (MultiDiscrete) |
-| Algorithm | RSL-RL `OnPolicyRunner` with PPO |
-| Observations | Heightmap (Warp GPU kernel) + buffer + box dims + proprio |
-| Actions | MultiDiscrete: [Operation(3), Slot(10), X(16), Y(24), Rotation(2)] |
+| Component     | Implementation                                                       |
+| ------------- | -------------------------------------------------------------------- |
+| Environment   | `pallet_rl.envs.pallet_task.PalletTask` (Isaac Lab `DirectRLEnv`)    |
+| Policy        | `pallet_rl.models.rsl_rl_wrapper.PalletizerActorCritic` (MultiDiscrete) |
+| Algorithm     | RSL-RL `OnPolicyRunner` with PPO                                     |
+| Observations  | Heightmap (Warp GPU kernel) + buffer + box dims + proprio           |
+| Actions       | MultiDiscrete: [Operation(3), Slot(10), X(16), Y(24), Rotation(2)]  |
 
 For a detailed snapshot of the current layout and data flow, see `docs/architecture_as_is.md`.
 
 ## Installation
 
 - **Prerequisites (on a machine that can run Isaac)**:
-  - NVIDIA Isaac Sim / Isaac Lab 4.x (with Python bindings).
-  - CUDA‑capable GPU with recent drivers.
-  - Python 3.10+.
+  - **Isaac Sim 4.x**: Python 3.10+, Isaac Lab 4.x compatible version.
+  - **Isaac Sim 5.x**: Python 3.11, Isaac Lab 5.x compatible version.
+  - CUDA‑capable GPU with recent drivers (tested with RTX 30xx/40xx).
 
 - **Install the package** (inside your Isaac Lab Python environment):
 
@@ -120,14 +120,14 @@ This script:
 
 `PalletTask` respects the Isaac Lab `DirectRLEnv` step lifecycle (no custom `step()` override):
 
-```
+```text
 DirectRLEnv.step(action)
   │
   ├─ _pre_physics_step(action)
   │
   ├─ _apply_action(action)         ← Task logic: parses action, sets masks,
   │                                    writes box pose to sim, handles buffer,
-  │                                    increments box_idx at the END
+  │                                    increments box_idx ONLY on Place (op=0)
   │
   ├─ Physics stepping              ← cfg.decimation × sim.step() (default: 50)
   │
