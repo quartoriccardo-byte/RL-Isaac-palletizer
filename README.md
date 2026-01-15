@@ -113,6 +113,7 @@ This script:
 ## Isaac Lab / RSL-RL Constraints
 
 - **AppLauncher ordering**: `isaaclab.app.AppLauncher` must be constructed **before** any other Isaac Lab imports that touch simulation.
+- **Launcher CLI args**: `train.py` and `eval.py` define a subset of AppLauncher CLI args locally (headless, livestream, video, etc.) to avoid importing Isaac modules at parse time. Add additional launcher flags to `parse_args()` if needed.
 - **Wrapper path**: This repo targets the modern import path `isaaclab.envs.wrappers.rsl_rl.RslRlVecEnvWrapper` (not the legacy `omni.isaac.*` namespaces).
 - **Action space**: RSL‑RL's PPO is originally continuous; this repo provides a custom `PalletizerActorCritic` that implements a factored MultiDiscrete distribution (per‑dimension `Categorical` with summed log‑prob and entropy).
 

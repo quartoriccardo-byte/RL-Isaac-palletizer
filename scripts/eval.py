@@ -19,15 +19,24 @@ import os
 def parse_args():
     parser = argparse.ArgumentParser(description="Evaluate Palletizer policy (Isaac Lab + RSL-RL)")
 
+    # Simulation
     parser.add_argument("--headless", action="store_true", help="Run headless")
     parser.add_argument("--num_envs", type=int, default=128, help="Number of parallel environments")
     parser.add_argument("--device", type=str, default="cuda:0", help="Compute device")
+    
+    # Evaluation
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to RSL-RL checkpoint (.pt)")
     parser.add_argument("--max_episodes", type=int, default=10, help="Max evaluation episodes per env")
     parser.add_argument("--log_dir", type=str, default="runs/eval", help="Eval log directory")
 
-    from isaaclab.app import AppLauncher
-    AppLauncher.add_app_launcher_args(parser)
+    # Isaac Lab launcher args (defined locally to avoid importing AppLauncher before main())
+    # These match the most common AppLauncher CLI args for compatibility.
+    parser.add_argument("--livestream", type=int, default=0, help="Livestream mode (0=off, 1=native, 2=webrtc)")
+    parser.add_argument("--enable_cameras", action="store_true", help="Enable camera sensors")
+    parser.add_argument("--video", action="store_true", help="Record video")
+    parser.add_argument("--video_length", type=int, default=200, help="Video length in steps")
+    parser.add_argument("--video_interval", type=int, default=2000, help="Video recording interval")
+
     return parser.parse_args()
 
 
