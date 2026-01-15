@@ -505,19 +505,17 @@ class PalletTask(DirectRLEnv):
         target_z = torch.full((n,), 1.5, device=device)  # Drop height
         
         # Operation masks
+        # PLACE (0) and RETRIEVE (2) both result in a box being on the pallet after physics
+        # but ONLY PLACE should move box_idx here; RETRIEVE moves its physical box in _handle_buffer_actions
         self.active_place_mask = (op_type == 0) | (op_type == 2)
         self.store_mask = (op_type == 1)
         self.retrieve_mask = (op_type == 2)
         
+        # Mask for PLACE-only envs (for writing box_idx pose)
+        place_only_mask = (op_type == 0)
+        
         # Build target position tensor
         target_pos = torch.stack([target_x, target_y, target_z], dim=-1)
-        holding_pos = torch.tensor([100.0, 100.0, 100.0], device=device)
-        
-        final_pos = torch.where(
-            self.active_place_mask.unsqueeze(-1),
-            target_pos,
-            holding_pos.expand(n, 3)
-        )
         
         # Rotation quaternion
         quat = torch.zeros(n, 4, device=device)
@@ -526,21 +524,22 @@ class PalletTask(DirectRLEnv):
         quat[rot_mask, 0] = 0.7071068  # 90° Z rotation
         quat[rot_mask, 3] = 0.7071068
         
-        # Save target for stability check
+        # Save target for stability check (used for all placement types including retrieve)
         self.last_target_pos[:, 0] = target_x
         self.last_target_pos[:, 1] = target_y
         self.last_target_pos[:, 2] = 0.0
         
-        # Apply to simulation (if boxes in scene)
-        if "boxes" in self.scene.keys():
-            env_idx = torch.arange(n, device=device)
-            global_idx = env_idx * self.cfg.max_boxes + self.box_idx
+        # Apply to simulation: ONLY move box_idx for PLACE actions
+        # STORE and RETRIEVE handle their own box movements in _handle_buffer_actions
+        if "boxes" in self.scene.keys() and place_only_mask.any():
+            place_envs = place_only_mask.nonzero(as_tuple=False).flatten()
+            global_idx = place_envs * self.cfg.max_boxes + self.box_idx[place_envs]
             
             self.scene["boxes"].write_root_pose_to_sim(
-                final_pos, quat, indices=global_idx
+                target_pos[place_envs], quat[place_envs], indices=global_idx
             )
             
-            vel = torch.zeros(n, 6, device=device)
+            vel = torch.zeros(len(place_envs), 6, device=device)
             self.scene["boxes"].write_root_velocity_to_sim(vel, indices=global_idx)
         
         # Buffer logic for store/retrieve
@@ -572,14 +571,18 @@ class PalletTask(DirectRLEnv):
         # =======================================================================
         # STORE: Park the last-placed physical box in a buffer slot
         # =======================================================================
-        # For STORE, we park the box at index (box_idx - 1) which is the most
-        # recently placed box. If box_idx == 0, there's no box to store (invalid).
-        if self.store_mask.any():
-            store_envs = self.store_mask.nonzero(as_tuple=False).flatten()
+        # Validation:
+        # - box_idx must be > 0 (there must be a placed box to store)
+        # - slot must not be occupied (Option A: reject store into occupied slot)
+        has_box_to_store = self.box_idx > 0
+        slot_is_empty = ~self.buffer_has_box[env_idx, slot_idx]
+        valid_store = self.store_mask & has_box_to_store & slot_is_empty
+        
+        if valid_store.any():
+            store_envs = valid_store.nonzero(as_tuple=False).flatten()
             store_slots = slot_idx[store_envs]
             
             # The physical box being stored is the last placed: box_idx - 1
-            # If box_idx == 0, clamp to 0 but this is conceptually invalid (no box placed yet)
             stored_physical_id = (self.box_idx[store_envs] - 1).clamp(0, self.cfg.max_boxes - 1)
             dims = self.box_dims[store_envs, stored_physical_id]
             
@@ -589,7 +592,6 @@ class PalletTask(DirectRLEnv):
             self.buffer_state[store_envs, store_slots, 4] = 0.0  # Reset age
             
             # Track physical box identity in slot
-            # If slot was already occupied, the old box is overwritten (simple deterministic behavior)
             self.buffer_has_box[store_envs, store_slots] = True
             self.buffer_box_id[store_envs, store_slots] = stored_physical_id
             
