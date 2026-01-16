@@ -24,14 +24,14 @@ class PalletizerActorCritic(ActorCritic):
     CNN-based Actor-Critic for palletizing with MultiDiscrete actions.
     
     Architecture:
-        Observation (38477-dim) → Split → [Visual Encoder, Vector Encoder] → Fusion → [Actor, Critic]
+        Observation (38489-dim) → Split → [Visual Encoder, Vector Encoder] → Fusion → [Actor, Critic]
     
     Visual Encoder (CNN):
         Input: (N, 1, 160, 240) heightmap
         Output: (N, 256) latent
     
     Vector Encoder (MLP):
-        Input: (N, 53) buffer + box dims
+        Input: (N, 89) buffer + box dims + payload/mass + proprio
         Output: (N, 64) latent
     
     Fusion:
@@ -68,10 +68,13 @@ class PalletizerActorCritic(ActorCritic):
         self.total_logits = sum(self.action_dims)  # 55
         
         # Observation structure
+        # Updated for new constraints:
+        # - Buffer features increased from 5 to 6 (added mass)
+        # - Added payload_norm and current_box_mass_norm
         self.image_shape = (160, 240)
         self.image_dim = 160 * 240  # 38400
-        self.vector_dim = 77  # Buffer (50) + Box dims (3) + Proprio (24)
-        # Proprio is now integrated into the vector encoder (Option A: safer, less breaking)
+        # Buffer (60) + Box dims (3) + payload_norm (1) + mass_norm (1) + Proprio (24) = 89
+        self.vector_dim = 89  # was 77
         
         # ---------------------------------------------------------------------
         # Visual Encoder (CNN)
@@ -144,7 +147,7 @@ class PalletizerActorCritic(ActorCritic):
         Process observation into fused feature vector.
         
         Args:
-            obs: Flattened observation (N, 38477)
+            obs: Flattened observation (N, 38489)
             
         Returns:
             fusion: Feature vector (N, 320)

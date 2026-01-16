@@ -78,16 +78,16 @@ def test_rsl_rl_wrapper_entropy():
     """Test that PalletizerActorCritic has entropy method for RSL-RL PPO."""
     from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
     
-    # Create model with minimal params
+    # Create model with minimal params (updated for new obs dim)
     model = PalletizerActorCritic(
-        num_actor_obs=38477,
-        num_critic_obs=38477,
+        num_actor_obs=38489,
+        num_critic_obs=38489,
         num_actions=55
     )
     
     # Create dummy observation
     batch_size = 4
-    obs = torch.randn(batch_size, 38477)
+    obs = torch.randn(batch_size, 38489)
     
     # Call act to populate distributions
     actions = model.act(obs)
