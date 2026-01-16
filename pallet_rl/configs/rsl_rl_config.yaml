@@ -95,11 +95,15 @@ algorithm:
 env:
   num_envs: 4096
   
-  # Observation structure
-  obs_dim: 38477
+  # Observation structure (updated for constraints)
+  obs_dim: 38491
   # - Heightmap: 160 * 240 = 38400
-  # - Buffer: 10 * 5 = 50
+  # - Buffer: 10 * 6 = 60 (added mass feature)
   # - Box dims: 3
+  # - Payload norm: 1
+  # - Mass norm: 1
+  # - Max payload norm: 1 (for domain randomization)
+  # - Max stack height norm: 1 (for domain randomization)
   # - Proprio: 24
   
   # Action space (MultiDiscrete)
@@ -109,3 +113,4 @@ env:
   # - Grid X: 16
   # - Grid Y: 24
   # - Rotation: 2
+

@@ -2,48 +2,151 @@
 
 Reinforcement Learning for robotic palletization using Isaac Lab and RSL-RL.
 
+## Task Objective
+
+The agent must **load ALL possible boxes onto the pallet** while respecting hard physical constraints:
+
+- **Maximum Stack Height**: Placements that would exceed `max_stack_height` are masked as invalid actions
+- **Maximum Payload**: Episode terminates if prospective on-pallet mass exceeds `max_payload_kg`
+- **Physical Stability**: Boxes must not fall or drift excessively after placement
+
+The **buffer** is a **temporary staging area** only—it allows the agent to defer placement decisions strategically, but all boxes must ultimately be placed on the pallet to maximize reward.
+
+---
+
 ## Architecture
 
-**Chosen Pipeline:** Isaac Lab (DirectRLEnv) + RSL-RL PPO + MultiDiscrete Actions + Warp heightmaps
+**Pipeline:** Isaac Lab (DirectRLEnv) + RSL-RL PPO + MultiDiscrete Actions + Warp heightmaps
 
 | Component     | Implementation                                                       |
 | ------------- | -------------------------------------------------------------------- |
 | Environment   | `pallet_rl.envs.pallet_task.PalletTask` (Isaac Lab `DirectRLEnv`)    |
 | Policy        | `pallet_rl.models.rsl_rl_wrapper.PalletizerActorCritic` (MultiDiscrete) |
 | Algorithm     | RSL-RL `OnPolicyRunner` with PPO                                     |
-| Observations  | Heightmap (Warp GPU kernel) + buffer + box dims + proprio           |
+| Observations  | Heightmap (Warp GPU kernel) + buffer + box dims + mass/payload + constraints |
 | Actions       | MultiDiscrete: [Operation(3), Slot(10), X(16), Y(24), Rotation(2)]  |
 
-For a detailed snapshot of the current layout and data flow, see `docs/architecture_as_is.md`.
+### Observation Space (38491-dim)
 
-### Physical Buffer Semantics
+| Component | Size | Description |
+|-----------|------|-------------|
+| Heightmap | 38400 | Normalized heights (160×240 grid, Warp GPU kernel) |
+| Buffer State | 60 | 10 slots × 6 features [L, W, H, ID, Age, Mass] |
+| Box Dimensions | 3 | Current box L, W, H in meters |
+| Payload Norm | 1 | `payload_kg / max_payload_kg` |
+| Box Mass Norm | 1 | `current_box_mass / max_box_mass` |
+| Max Payload Norm | 1 | Normalized constraint (for future domain randomization) |
+| Max Stack Height Norm | 1 | Normalized constraint (for future domain randomization) |
+| Proprioception | 24 | Robot state (placeholder) |
+
+---
+
+## Constraints & Rewards
+
+### Hard Constraints
+
+| Constraint | Mechanism | Effect |
+|------------|-----------|--------|
+| **Max Stack Height** | Action masking via `get_action_mask()` | Invalid grid cells masked; attempting blocked → `reward_invalid_height` |
+| **Max Payload** | Infeasibility termination | Episode ends if prospective total mass exceeds limit |
+
+### Stability Evaluation
+
+After each PLACE or RETRIEVE, a **settling window** (`settle_steps = 10` physics steps) runs before evaluation:
+
+1. **Physical Collapse Detection**: If any box z < 0.05m → `reward_fall = -25.0` (most severe)
+2. **Drift Evaluation**: Compute XY drift and rotation drift from target pose
+   - If drift exceeds thresholds → `reward_drift = -3.0`
+   - Otherwise → `reward_stable = +1.0`
+
+Drift thresholds:
+
+- `drift_xy_threshold = 0.035m` (3.5cm)
+- `drift_rot_threshold = 7.0°`
+
+### Reward Hierarchy
+
+Rewards are tuned to ensure correct learning priority:
+
+| Event | Reward | Rationale |
+|-------|--------|-----------|
+| Physical collapse (box falls) | **-25.0** | Most severe—safety-critical |
+| Infeasible termination | **-4.0** | Moderate—not directly agent's fault |
+| Unstable placement (drift) | **-3.0** | Mild—recoverable quality issue |
+| Invalid height action | **-2.0** | Small—should be masked anyway |
+| Stable successful placement | **+1.0** | Positive reinforcement |
+
+> **Note**: Infeasible termination has a moderate penalty because it depends on box generation, not agent action quality. It should not dominate PPO gradients.
+
+---
+
+## Physical Buffer Semantics
 
 The buffer stores **physical box identities**, not virtual inventory:
 
-- **STORE** parks an existing physical box (the last placed) in a holding area and records its ID.
-- **RETRIEVE** moves that same parked physical box back onto the pallet.
-- **PLACE** consumes a fresh box from the episode allocation; only PLACE increments `box_idx`.
+- **STORE** parks the last-placed physical box in a holding area, records its ID and mass
+- **RETRIEVE** moves that same parked physical box back onto the pallet
+- **PLACE** consumes a fresh box from the episode allocation; only PLACE increments `box_idx`
 
 Example: `Place A → Store slot0 → Place B → Retrieve slot0` returns box A (not B or a new box).
 
-### Training Metrics
+When storing/retrieving:
 
-Task KPIs are emitted via `self.extras` and forwarded by `RslRlVecEnvWrapper` to TensorBoard under `metrics/*`:
+- Mass is tracked in `buffer_state[:, :, 5]`
+- STORE removes mass from `payload_kg`
+- RETRIEVE adds mass back to `payload_kg`
 
-- `metrics/place_success_rate`, `metrics/place_failure_rate`
-- `metrics/retrieve_success_rate`, `metrics/store_accept_rate`
-- `metrics/buffer_occupancy`
+---
 
-KPI success checks use a settling window (`cfg.kpi_settle_steps`) to allow physics to stabilize before evaluation. Values are converted to CPU floats at the logging boundary.
+## Termination Conditions
+
+Episodes terminate when:
+
+1. **Physical Collapse**: Any actively placed box falls (z < 0.05m during settling)
+2. **Infeasible Mass**: `payload_kg + buffer_mass + remaining_mass > max_payload_kg`
+3. **All Boxes Placed**: `box_idx >= max_boxes` (successful completion)
+4. **Time Limit**: Episode length exceeded (handled by DirectRLEnv)
+
+---
+
+## Training Metrics
+
+Task KPIs are emitted via `self.extras` and logged to TensorBoard under `metrics/*`:
+
+| Metric | Description |
+|--------|-------------|
+| `place_success_rate` | Fraction of successful placements |
+| `place_failure_rate` | Fraction of failed placements |
+| `retrieve_success_rate` | Fraction of successful retrieves |
+| `store_accept_rate` | Fraction of valid store attempts |
+| `buffer_occupancy` | Average buffer slot utilization |
+| `drift_rate` | Fraction of placements with excessive drift |
+| `collapse_rate` | Fraction of placements that resulted in collapse |
+| `infeasible_rate` | Rate of infeasibility terminations |
+| `avg_drift_xy` | Average XY drift in meters |
+| `avg_drift_deg` | Average rotation drift in degrees |
+| `payload_utilization` | `payload_kg.mean() / max_payload_kg` |
+
+---
+
+## Current Assumptions
+
+- **Pallet is fixed**: No tipping or sliding
+- **Box COM approximated**: Rigid body center used for stability
+- **No pallet tipping check**: Assumes symmetric loading or robust pallet
+- **Constraint values constant**: Currently fixed; observation includes normalized values for future domain randomization support
+
+---
 
 ## Installation
 
-- **Prerequisites (on a machine that can run Isaac)**:
-  - **Isaac Sim 4.x**: Python 3.10+, Isaac Lab 4.x compatible version.
-  - **Isaac Sim 5.x**: Python 3.11, Isaac Lab 5.x compatible version.
-  - CUDA‑capable GPU with recent drivers (tested with RTX 30xx/40xx).
+**Prerequisites** (on a machine that can run Isaac):
 
-- **Install the package** (inside your Isaac Lab Python environment):
+- **Isaac Sim 4.x**: Python 3.10+, Isaac Lab 4.x compatible version
+- **Isaac Sim 5.x**: Python 3.11, Isaac Lab 5.x compatible version
+- CUDA-capable GPU with recent drivers (tested with RTX 30xx/40xx)
+
+**Install the package** (inside your Isaac Lab Python environment):
 
 ```bash
 cd RL-Isaac-palletizer   # repo root
@@ -53,41 +156,25 @@ pip install -e .
 python -c "import pallet_rl; print('pallet_rl OK')"
 ```
 
-- **Install RSL-RL** (required dependency):
-
-RSL-RL is listed in `pyproject.toml`, but installation may vary by environment. Choose one:
-
-**Option 1 (recommended, pinned version):**
+**Install RSL-RL** (required dependency):
 
 ```bash
-pip install git+https://github.com/leggedrobotics/rsl_rl.git@<commit-hash>
-```
+# Option 1: From GitHub
+pip install git+https://github.com/leggedrobotics/rsl_rl.git
 
-Replace `<commit-hash>` with a specific commit hash for reproducibility (e.g., `@abc123def456`).
-
-**Option 2 (editable from local clone):**
-
-```bash
+# Option 2: Editable from local clone
 git clone https://github.com/leggedrobotics/rsl_rl.git
-cd rsl_rl
-pip install -e .
+cd rsl_rl && pip install -e .
 ```
 
-**Option 3 (Isaac Lab environment):**
-Some Isaac Lab environments may already include `rsl_rl`. Verify with:
+---
+
+## Training
+
+All commands must be run on a machine with Isaac Lab installed.
 
 ```bash
-python -c "import rsl_rl; print('rsl_rl OK')"
-```
-
-If import fails, use Option 1 or 2 above. The scripts will show a clear error message if `rsl_rl` is missing.
-
-## Training (Canonical)
-
-All commands in this section must be run on a machine that can launch Isaac Lab. Do **not** run them on this repository’s editing machine if Isaac is unavailable.
-
-```bash
-# Example: headless training with 4096 envs on GPU 0
+# Full training run (headless, 4096 envs)
 python scripts/train.py \
   --headless \
   --num_envs 4096 \
@@ -99,21 +186,14 @@ python scripts/train.py \
 
 The script:
 
-- Launches Isaac Lab via `isaaclab.app.AppLauncher` (inside `main()` to avoid import-time side effects).
-- Instantiates `PalletTask` with `PalletTaskCfg` (DirectRLEnv).
-- Wraps it with `RslRlVecEnvWrapper` for RSL‑RL.
-- Loads RSL‑RL hyper‑parameters from `pallet_rl/configs/rsl_rl_config.yaml` (then applies CLI overrides).
-- Monkey‑patches `rsl_rl.modules.ActorCritic` to use `PalletizerActorCritic` (MultiDiscrete policy).
+- Launches Isaac Lab via `isaaclab.app.AppLauncher`
+- Instantiates `PalletTask` with `PalletTaskCfg` (DirectRLEnv)
+- Wraps it with `RslRlVecEnvWrapper` for RSL-RL
+- Uses `PalletizerActorCritic` for MultiDiscrete action distribution
 
-**Logs and checkpoints:**
+---
 
-- RSL‑RL writes logs and checkpoints under `--log_dir` and `--experiment_name`.
-- With the default flags, you will see runs in `runs/palletizer/palletizer_ppo/*`
-  including TensorBoard `events.*` files and `.pt` checkpoints.
-
-## Evaluation (Canonical)
-
-After training, evaluate a checkpoint using the same env and policy:
+## Evaluation
 
 ```bash
 python scripts/eval.py \
@@ -123,330 +203,82 @@ python scripts/eval.py \
   --checkpoint path/to/checkpoint.pt
 ```
 
-This script:
+---
 
-- Launches Isaac Lab.
-- Builds the same `PalletTask` + `RslRlVecEnvWrapper` stack.
-- Injects `PalletizerActorCritic` into RSL‑RL.
-- Loads the checkpoint and runs rollouts using `act_inference` (deterministic argmax actions).
+## Testing
 
-## Isaac Lab / RSL-RL Constraints
+```bash
+# Constraint logic tests (no Isaac required)
+python tests/test_constraints.py
 
-- **AppLauncher ordering**: `isaaclab.app.AppLauncher` must be constructed **before** any other Isaac Lab imports that touch simulation.
-- **Launcher CLI args**: `train.py` and `eval.py` define a subset of AppLauncher CLI args locally (headless, livestream, video, etc.) to avoid importing Isaac modules at parse time. Add additional launcher flags to `parse_args()` if needed.
-- **Wrapper path**: This repo targets the modern import path `isaaclab.envs.wrappers.rsl_rl.RslRlVecEnvWrapper` (not the legacy `omni.isaac.*` namespaces).
-- **Action space**: RSL‑RL's PPO is originally continuous; this repo provides a custom `PalletizerActorCritic` that implements a factored MultiDiscrete distribution (per‑dimension `Categorical` with summed log‑prob and entropy).
+# Run all tests
+python -m pytest tests/ -v
+```
 
-### DirectRLEnv Lifecycle Compliance
+---
 
-`PalletTask` respects the Isaac Lab `DirectRLEnv` step lifecycle (no custom `step()` override):
+## Configuration Summary
+
+Key parameters in `PalletTaskCfg`:
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_stack_height` | 1.8m | Maximum allowed stack height |
+| `max_payload_kg` | 500.0 | Maximum on-pallet mass |
+| `base_box_mass_kg` | 5.0 | Base mass per box |
+| `box_mass_variance` | 2.0 | ± variance for randomization |
+| `settle_steps` | 10 | Physics steps for settling window |
+| `drift_xy_threshold` | 0.035m | Max allowed XY drift |
+| `drift_rot_threshold` | 7.0° | Max allowed rotation drift |
+| `reward_fall` | -25.0 | Physical collapse penalty |
+| `reward_infeasible` | -4.0 | Infeasibility termination penalty |
+| `reward_drift` | -3.0 | Drift penalty |
+| `reward_invalid_height` | -2.0 | Height violation penalty |
+| `reward_stable` | +1.0 | Stable placement bonus |
+
+---
+
+## Project Structure
+
+```text
+pallet_rl/
+├── envs/
+│   └── pallet_task.py        # Isaac Lab DirectRLEnv palletizing task
+├── models/
+│   └── rsl_rl_wrapper.py     # PalletizerActorCritic (MultiDiscrete)
+├── utils/
+│   ├── heightmap_rasterizer.py  # Warp-based GPU heightmap kernel
+│   └── quaternions.py           # Isaac↔Warp quaternion conversions
+├── configs/
+│   └── rsl_rl_config.yaml    # RSL-RL PPO config
+scripts/
+├── train.py                  # Training entrypoint
+└── eval.py                   # Evaluation entrypoint
+tests/
+├── test_constraints.py       # Constraint logic tests
+├── test_bugs.py              # Utility function tests
+└── test_quaternions.py       # Quaternion helper tests
+```
+
+---
+
+## DirectRLEnv Lifecycle
+
+`PalletTask` respects the Isaac Lab `DirectRLEnv` step lifecycle:
 
 ```text
 DirectRLEnv.step(action)
   │
   ├─ _pre_physics_step(action)
-  │
-  ├─ _apply_action(action)         ← Task logic: parses action, sets masks,
-  │                                    writes box pose to sim, handles buffer,
-  │                                    increments box_idx ONLY on Place (op=0)
-  │
-  ├─ Physics stepping              ← cfg.decimation × sim.step() (default: 50)
-  │
+  ├─ _apply_action(action)         ← Height validation, box placement, buffer logic
+  │                                    Payload updates, settling window armed
+  ├─ Physics stepping              ← cfg.decimation × sim.step()
   ├─ _post_physics_step()
-  │
-  ├─ _get_observations()           ← Uses NEW box_idx for next box
-  ├─ _get_rewards()                ← Uses box_idx - 1 for placed box evaluation
-  ├─ _get_dones()                  ← Uses box_idx - 1 for placed box evaluation
-  │
-  └─ Reset handling + episode_length_buf updates
+  ├─ _get_observations()           ← Heightmap, buffer, mass/payload, constraints
+  ├─ _get_rewards()                ← Settling evaluation, KPI logging
+  ├─ _get_dones()                  ← Termination checks (collapse, infeasible)
+  └─ Reset handling
 ```
 
-**Key design decision**: `box_idx` is incremented at the end of `_apply_action()`. This ensures:
-
-- Rewards and termination flags evaluate the **placed** box (`box_idx - 1`).
-- Observations show the **next** box to be placed (`box_idx`).
-
-**Physics stepping**: Controlled via `cfg.decimation` (default: 50 physics steps per RL step at `dt=1/60s`).
-
----
-
-## Complete Command Reference
-
-All commands must be run on a machine with Isaac Lab installed.
-
-### Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/quartoriccardo-byte/RL-Isaac-palletizer.git
-cd RL-Isaac-palletizer
-
-# Install the package (editable mode)
-pip install -e .
-
-# Verify installation
-python -c "import pallet_rl; print('pallet_rl OK')"
-
-# Install RSL-RL (if not already installed)
-pip install git+https://github.com/leggedrobotics/rsl_rl.git
-```
-
-### Training
-
-```bash
-# Full training run (headless, 4096 envs)
-python scripts/train.py \
-  --headless \
-  --num_envs 4096 \
-  --device cuda:0 \
-  --max_iterations 2000 \
-  --log_dir runs/palletizer \
-  --experiment_name palletizer_ppo
-
-# Short smoke test (50 iterations)
-python scripts/train.py \
-  --headless \
-  --num_envs 512 \
-  --device cuda:0 \
-  --max_iterations 50 \
-  --log_dir runs/test_run \
-  --experiment_name palletizer_smoke
-```
-
-### Evaluation
-
-```bash
-# Evaluate a checkpoint
-python scripts/eval.py \
-  --headless \
-  --num_envs 128 \
-  --device cuda:0 \
-  --checkpoint path/to/checkpoint.pt
-
-# With rendering (remove --headless)
-python scripts/eval.py \
-  --num_envs 16 \
-  --device cuda:0 \
-  --checkpoint path/to/checkpoint.pt
-```
-
-### Testing (Non-Isaac)
-
-These tests run without Isaac Lab:
-
-```bash
-# Import sanity tests
-python -m pytest tests/test_imports.py -v
-
-# Static bug tests (utilities, wrappers)
-python -m pytest tests/test_bugs.py -v
-
-# Quaternion helper tests
-python -m pytest tests/test_quaternions.py -v
-
-# Run all non-Isaac tests
-python -m pytest tests/ -v
-```
-
-### Git Workflow
-
-```bash
-# Check repository status
-git status
-git fetch --all --prune
-
-# Update to latest main
-git checkout main
-git pull --ff-only origin main
-
-# After making changes
-git add -A
-git commit -m "Your commit message"
-git push origin main
-```
-
-## Validation Pipeline (To Run on an Isaac Machine)
-
-This section describes a complete **validation pipeline** you should run on a machine with Isaac Lab installed. It is **not** executed here.
-
-### 1. Import & Config Sanity
-
-- **Check installation and imports**:
-
-```bash
-pip install -e .
-python -c "import pallet_rl; print('pallet_rl OK')"
-python -m pytest tests/test_imports.py
-python -m pytest tests/test_quaternions.py
-```
-
-- **Static config inspection**:
-  - Open `pallet_rl/configs/rsl_rl_config.yaml` and check that:
-    - `env.obs_dim == 38477`.
-    - `env.action_dims == [3, 10, 16, 24, 2]`.
-    - `runner.policy_class_name == ActorCritic` and `algorithm_class_name == PPO`.
-
-### 2. Environment Smoke Test (No Training)
-
-On an Isaac machine:
-
-```bash
-python - << 'EOF'
-from isaaclab.app import AppLauncher
-from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
-
-class Args: headless=True
-app = AppLauncher(Args()).app
-
-cfg = PalletTaskCfg()
-cfg.scene.num_envs = 8
-env = PalletTask(cfg=cfg, render_mode=None)
-
-obs = env.reset()
-print("Reset OK, obs keys:", obs.keys())
-
-import torch
-from gymnasium.spaces import MultiDiscrete
-
-assert isinstance(env.action_space, MultiDiscrete)
-actions = torch.zeros(env.num_envs, len(env.cfg.action_dims), dtype=torch.long, device=cfg.sim.device)
-obs, rew, terminated, truncated, info = env.step(actions)
-print("Step OK, reward shape:", rew.shape)
-
-app.close()
-EOF
-```
-
-Expected:
-
-- Reset and one step complete without exceptions.
-- Observation tensors have shape `(num_envs, 38477)` for both `policy` and `critic` keys.
-
-### 3. Quaternion & Heightmap Unit Checks
-
-Run the quaternion helper tests:
-
-```bash
-python -m pytest tests/test_quaternions.py
-```
-
-On an Isaac+CUDA machine, you can add a small script to sanity‑check Warp rasterization orientation (optional but recommended):
-
-```bash
-python - << 'EOF'
-import torch
-from pallet_rl.utils.heightmap_rasterizer import WarpHeightmapGenerator
-from pallet_rl.utils.quaternions import wxyz_to_xyzw
-
-num_envs, max_boxes = 1, 1
-gen = WarpHeightmapGenerator(
-    device="cuda:0",
-    num_envs=num_envs,
-    max_boxes=max_boxes,
-    grid_res=0.05,
-    map_size=(16, 16),
-    pallet_dims=(1.0, 1.0),
-)
-
-box_pos = torch.tensor([[0.0, 0.0, 0.5]], device="cuda:0")
-box_dims = torch.tensor([[0.4, 0.4, 1.0]], device="cuda:0")
-q_wxyz = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device="cuda:0")
-box_rot = wxyz_to_xyzw(q_wxyz)
-pallet_pos = torch.zeros(1, 3, device="cuda:0")
-
-hm = gen.forward(box_pos, box_rot, box_dims, pallet_pos)
-print("Heightmap range:", hm.min().item(), hm.max().item())
-EOF
-```
-
-You should observe a non‑zero region in the heightmap directly under the box footprint.
-
-### 4. Short Training Run
-
-Run a short PPO training session to verify the full pipeline:
-
-```bash
-python scripts/train.py \
-  --headless \
-  --num_envs 512 \
-  --device cuda:0 \
-  --max_iterations 50 \
-  --log_dir runs/test_run \
-  --experiment_name palletizer_smoke
-```
-
-Expected artifacts:
-
-- A new directory under `runs/test_run` containing:
-  - TensorBoard `events.out.tfevents...` files.
-  - RSL‑RL checkpoints (e.g. `model_XXX.pt` or similar, depending on RSL‑RL version).
-- Console logs showing PPO iterations, approximate rewards, and KL metrics.
-
-### 5. Evaluation Procedure
-
-Use one of the saved checkpoints:
-
-```bash
-CKPT=path/to/checkpoint.pt  # replace with an actual file
-python scripts/eval.py \
-  --headless \
-  --num_envs 128 \
-  --device cuda:0 \
-  --checkpoint "$CKPT"
-```
-
-Observe:
-
-- No crashes when loading the checkpoint.
-- Stable rollouts (no obvious numerical explosions, NaNs, etc.).
-- If you run with rendering enabled (omit `--headless`), you should see boxes being placed onto the pallet in the viewer.
-
-### 6. Troubleshooting Checklist
-
-- **ImportError / ModuleNotFoundError**:
-  - Confirm the correct Python interpreter (Isaac Lab) is used.
-  - Re‑run `pip install -e .` and `python tests/test_imports.py`.
-- **Warp / CUDA errors**:
-  - Ensure `warp-lang` is installed with GPU support.
-  - Check that your `CUDA_VISIBLE_DEVICES` and Isaac Lab GPU settings are correct.
-- **Quaternion orientation issues (boxes appear rotated incorrectly)**:
-  - Verify that `wxyz_to_xyzw` is used at every Isaac→Warp boundary.
-  - Re‑run `tests/test_quaternions.py` and the heightmap sanity script.
-- **NaNs in training**:
-  - Check PPO hyper‑parameters in `pallet_rl/configs/rsl_rl_config.yaml`.
-  - Try reducing `learning_rate`, `num_steps_per_env`, or `entropy_coef`.
-  - Ensure there are no manual `.nan_to_num` or silent clamping operations hiding numerical problems.
-
-## Project Structure (Current)
-
-```text
-pallet_rl/
-├── envs/
-│   ├── pallet_task.py        # Isaac Lab DirectRLEnv palletizing task
-│   └── heightmap_channels.py # Legacy CPU channel computation (not in hot path)
-├── models/
-│   └── rsl_rl_wrapper.py     # PalletizerActorCritic (MultiDiscrete)
-├── algo/
-│   └── utils.py              # decode_action, load_config (legacy helper)
-├── utils/
-│   ├── heightmap_rasterizer.py  # Warp-based GPU heightmap kernel
-│   └── quaternions.py           # Isaac↔Warp quaternion conversions
-├── configs/
-│   ├── rsl_rl_config.yaml    # Canonical RSL-RL PPO config
-│   └── base.yaml             # Legacy config (U-Net + masks), kept for reference
-legacy/
-├── gen_mask_dataset.py       # Archived mask dataset script (U-Net pipeline)
-└── profile_sim.py            # Archived profiling placeholder
-scripts/
-├── train.py                  # Canonical training entrypoint (Isaac Lab + RSL-RL)
-├── eval.py                   # Canonical evaluation entrypoint
-├── gen_mask_dataset.py       # Thin shim into legacy/gen_mask_dataset.py
-└── profile_sim.py            # Thin shim into legacy/profile_sim.py
-tests/
-├── test_imports.py           # Package import sanity
-├── test_bugs.py              # Static tests for utility functions & wrappers
-└── test_quaternions.py       # Quaternion helper tests
-```
-
-The only **supported** RL pipeline going forward is:
-`PalletTask` (DirectRLEnv) → `RslRlVecEnvWrapper` → `PalletizerActorCritic` → `OnPolicyRunner`.
+The only **supported** RL pipeline is:
+`PalletTask` (DirectRLEnv) → `RslRlVecEnvWrapper` → `PalletizerActorCritic` → `OnPolicyRunner`

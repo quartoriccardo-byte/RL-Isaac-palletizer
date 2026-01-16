@@ -230,12 +230,13 @@ def test_observation_dimension():
     vis_dim = map_shape[0] * map_shape[1]  # 38400
     buf_dim = buffer_slots * buffer_features  # 60
     box_dim = 3
-    extra_dim = 2  # payload_norm + current_box_mass_norm
+    mass_dim = 2  # payload_norm + current_box_mass_norm
+    constraint_dim = 2  # max_payload_norm + max_stack_height_norm
     
-    expected_obs_dim = vis_dim + buf_dim + box_dim + extra_dim + robot_state_dim
-    # 38400 + 60 + 3 + 2 + 24 = 38489
+    expected_obs_dim = vis_dim + buf_dim + box_dim + mass_dim + constraint_dim + robot_state_dim
+    # 38400 + 60 + 3 + 2 + 2 + 24 = 38491
     
-    assert expected_obs_dim == 38489, f"Expected 38489, got {expected_obs_dim}"
+    assert expected_obs_dim == 38491, f"Expected 38491, got {expected_obs_dim}"
     
     print("✓ Observation dimension test passed")
 

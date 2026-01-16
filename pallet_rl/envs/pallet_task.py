@@ -94,28 +94,35 @@ class PalletTaskCfg(DirectRLEnvCfg):
     # =========================================================================
     # Settling / Stability Configuration
     # =========================================================================
-    settle_steps: int = 5  # physics steps to wait after placement for settling
-    drift_xy_threshold: float = 0.05  # meters - max allowed XY drift
-    drift_rot_threshold: float = 15.0  # degrees - max allowed rotation drift
+    settle_steps: int = 10  # physics steps to wait after placement for settling (increased from 5)
+    drift_xy_threshold: float = 0.035  # meters - max allowed XY drift (tightened from 0.05)
+    drift_rot_threshold: float = 7.0  # degrees - max allowed rotation drift (tightened from 15)
     
     # =========================================================================
     # Reward Configuration for Constraints
     # =========================================================================
-    reward_invalid_height: float = -0.5  # penalty for attempting action exceeding height
-    reward_infeasible: float = -20.0  # penalty for infeasible payload termination
-    reward_fall: float = -15.0  # penalty when box falls during settling
-    reward_drift: float = -2.0  # penalty when box drifts but doesn't fall
+    # Reward hierarchy (most negative to positive):
+    # 1. Physical collapse (box falls)     -> reward_fall = -25.0
+    # 2. Infeasible episode termination    -> reward_infeasible = -4.0
+    # 3. Unstable placement (drift)        -> reward_drift = -3.0
+    # 4. Invalid action (height violation) -> reward_invalid_height = -2.0
+    # 5. Stable successful placement       -> reward_stable = +1.0
+    reward_invalid_height: float = -2.0  # penalty for attempting action exceeding height (increased from -0.5)
+    reward_infeasible: float = -4.0  # moderate penalty for infeasible payload termination (reduced from -20)
+    reward_fall: float = -25.0  # most severe penalty when box falls (increased from -15)
+    reward_drift: float = -3.0  # penalty when box drifts but doesn't fall (increased from -2)
     reward_stable: float = 1.0  # bonus for stable placement
     
     # Observation dimension (computed)
     @property
     def num_observations(self) -> int:
-        # Heightmap (flattened) + Buffer + Box dims + Payload/Mass + Proprio
+        # Heightmap (flattened) + Buffer + Box dims + Payload/Mass + Constraint norms + Proprio
         vis_dim = self.map_shape[0] * self.map_shape[1]  # 38400
-        buf_dim = self.buffer_slots * self.buffer_features  # 60 (was 50)
+        buf_dim = self.buffer_slots * self.buffer_features  # 60
         box_dim = 3
-        extra_dim = 2  # payload_norm + current_box_mass_norm
-        return vis_dim + buf_dim + box_dim + extra_dim + self.robot_state_dim  # 38489
+        mass_dim = 2  # payload_norm + current_box_mass_norm
+        constraint_dim = 2  # max_payload_norm + max_stack_height_norm (for future domain randomization)
+        return vis_dim + buf_dim + box_dim + mass_dim + constraint_dim + self.robot_state_dim  # 38491
     
     # Action space (MultiDiscrete dimensions)
     action_dims: tuple[int, ...] = (3, 10, 16, 24, 2)  # Op, Slot, X, Y, Rot
@@ -432,7 +439,7 @@ class PalletTask(DirectRLEnv):
         env_idx = torch.arange(n, device=device)
         current_dims = self.box_dims[env_idx, idx]  # (N, 3)
         
-        # 6. Payload and mass observations (NEW)
+        # 6. Payload and mass observations
         # Normalize payload: current on-pallet mass / max allowed
         payload_norm = (self.payload_kg / self.cfg.max_payload_kg).unsqueeze(-1)  # (N, 1)
         # Normalize current box mass
@@ -440,17 +447,24 @@ class PalletTask(DirectRLEnv):
         current_box_mass = self.box_mass_kg[env_idx, idx]  # (N,)
         current_mass_norm = (current_box_mass / max_box_mass).unsqueeze(-1)  # (N, 1)
         
-        # 7. Proprioception (placeholder - would come from robot)
+        # 7. Constraint observations (for future domain randomization)
+        # These are currently constant but visible to policy for future DR support
+        max_payload_norm = torch.full((n, 1), self.cfg.max_payload_kg / 1000.0, device=device)  # Normalize to ~0.5
+        max_stack_height_norm = torch.full((n, 1), self.cfg.max_stack_height / 3.0, device=device)  # Normalize to ~0.6
+        
+        # 8. Proprioception (placeholder - would come from robot)
         proprio = torch.zeros(n, self.cfg.robot_state_dim, device=device)
         
-        # 8. Concatenate all observations
+        # 9. Concatenate all observations
         obs = torch.cat([
-            heightmap_flat,     # (N, 38400)
-            buffer_flat,        # (N, 60)
-            current_dims,       # (N, 3)
-            payload_norm,       # (N, 1)
-            current_mass_norm,  # (N, 1)
-            proprio,            # (N, 24)
+            heightmap_flat,        # (N, 38400)
+            buffer_flat,           # (N, 60)
+            current_dims,          # (N, 3)
+            payload_norm,          # (N, 1)
+            current_mass_norm,     # (N, 1)
+            max_payload_norm,      # (N, 1) - for future domain randomization
+            max_stack_height_norm, # (N, 1) - for future domain randomization
+            proprio,               # (N, 24)
         ], dim=-1)
         
         # Shape/device assertion (fast, only runs in debug or once per step)

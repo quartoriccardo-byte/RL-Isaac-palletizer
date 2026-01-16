@@ -24,14 +24,14 @@ class PalletizerActorCritic(ActorCritic):
     CNN-based Actor-Critic for palletizing with MultiDiscrete actions.
     
     Architecture:
-        Observation (38489-dim) → Split → [Visual Encoder, Vector Encoder] → Fusion → [Actor, Critic]
+        Observation (38491-dim) → Split → [Visual Encoder, Vector Encoder] → Fusion → [Actor, Critic]
     
     Visual Encoder (CNN):
         Input: (N, 1, 160, 240) heightmap
         Output: (N, 256) latent
     
     Vector Encoder (MLP):
-        Input: (N, 89) buffer + box dims + payload/mass + proprio
+        Input: (N, 91) buffer + box dims + payload/mass + constraints + proprio
         Output: (N, 64) latent
     
     Fusion:
@@ -71,10 +71,11 @@ class PalletizerActorCritic(ActorCritic):
         # Updated for new constraints:
         # - Buffer features increased from 5 to 6 (added mass)
         # - Added payload_norm and current_box_mass_norm
+        # - Added max_payload_norm and max_stack_height_norm (for future domain randomization)
         self.image_shape = (160, 240)
         self.image_dim = 160 * 240  # 38400
-        # Buffer (60) + Box dims (3) + payload_norm (1) + mass_norm (1) + Proprio (24) = 89
-        self.vector_dim = 89  # was 77
+        # Buffer (60) + Box dims (3) + payload_norm (1) + mass_norm (1) + max_payload_norm (1) + max_stack_height_norm (1) + Proprio (24) = 91
+        self.vector_dim = 91  # was 89
         
         # ---------------------------------------------------------------------
         # Visual Encoder (CNN)
@@ -147,7 +148,7 @@ class PalletizerActorCritic(ActorCritic):
         Process observation into fused feature vector.
         
         Args:
-            obs: Flattened observation (N, 38489)
+            obs: Flattened observation (N, 38491)
             
         Returns:
             fusion: Feature vector (N, 320)

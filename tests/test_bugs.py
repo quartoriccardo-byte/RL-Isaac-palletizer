@@ -80,14 +80,14 @@ def test_rsl_rl_wrapper_entropy():
     
     # Create model with minimal params (updated for new obs dim)
     model = PalletizerActorCritic(
-        num_actor_obs=38489,
-        num_critic_obs=38489,
+        num_actor_obs=38491,
+        num_critic_obs=38491,
         num_actions=55
     )
     
     # Create dummy observation
     batch_size = 4
-    obs = torch.randn(batch_size, 38489)
+    obs = torch.randn(batch_size, 38491)
     
     # Call act to populate distributions
     actions = model.act(obs)
