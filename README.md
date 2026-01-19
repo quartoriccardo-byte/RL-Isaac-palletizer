@@ -150,21 +150,15 @@ Task KPIs are emitted via `self.extras` and logged to TensorBoard under `metrics
 
 ```bash
 cd RL-Isaac-palletizer   # repo root
+
+# Base install (without RSL-RL training dependencies)
 pip install -e .
+
+# Training install (includes RSL-RL from GitHub)
+pip install -e ".[train]"
 
 # Quick import check
 python -c "import pallet_rl; print('pallet_rl OK')"
-```
-
-**Install RSL-RL** (required dependency):
-
-```bash
-# Option 1: From GitHub
-pip install git+https://github.com/leggedrobotics/rsl_rl.git
-
-# Option 2: Editable from local clone
-git clone https://github.com/leggedrobotics/rsl_rl.git
-cd rsl_rl && pip install -e .
 ```
 
 ---
