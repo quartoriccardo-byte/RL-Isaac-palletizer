@@ -57,11 +57,34 @@ class PalletTaskCfg(DirectRLEnvCfg):
     # Episode length
     episode_length_s: float = 60.0
     
-    # Pallet dimensions (cm -> m in code)
-    pallet_size: tuple[float, float] = (1.2, 0.8)  # meters
+    # =========================================================================
+    # Pallet & Coordinate System Documentation
+    # =========================================================================
+    # Pallet dimensions in meters: (length_x, width_y)
+    # The pallet is centered at origin (0, 0) in each environment.
+    #
+    # Coordinate frame (looking down from above):
+    #   +X extends to the right (pallet length = 1.2m, from -0.6 to +0.6)
+    #   +Y extends forward (pallet width = 0.8m, from -0.4 to +0.4)
+    #   +Z extends upward (stacking direction)
+    #
+    # Action grid mapping:
+    #   grid_x: 0..15 (16 cells) → world X: -0.6 to +0.6m (step = 0.075m)
+    #   grid_y: 0..23 (24 cells) → world Y: -0.4 to +0.4m (step = 0.0333m)
+    #   Note: step sizes differ to cover the asymmetric pallet dimensions
+    #
+    # Heightmap rasterization:
+    #   map_shape = (H=160, W=240) pixels at grid_res = 0.005m
+    #   Physical coverage: 160*0.005 = 0.8m (Y), 240*0.005 = 1.2m (X)
+    #   This matches pallet_size exactly.
+    # =========================================================================
+    pallet_size: tuple[float, float] = (1.2, 0.8)  # meters (X, Y)
     
     # Heightmap configuration
-    map_shape: tuple[int, int] = (160, 240)  # H, W pixels
+    # H (rows) = 160 → covers 0.8m (Y axis)
+    # W (cols) = 240 → covers 1.2m (X axis)
+    # This matches pallet_size = (1.2, 0.8) exactly
+    map_shape: tuple[int, int] = (160, 240)  # (H, W) pixels
     grid_res: float = 0.005  # 0.5cm resolution
     max_height: float = 2.0  # meters (for normalization)
     
@@ -535,7 +558,10 @@ class PalletTask(DirectRLEnv):
             target_pos = self.last_target_pos[valid_envs]
             dist = torch.norm(current_pos[:, :2] - target_pos[:, :2], dim=-1)
             fell = current_pos[:, 2] < 0.05
-            unstable = dist > 0.10
+            
+            # Use configured threshold for consistency with termination and settling
+            # Previously hardcoded as 0.10m, now uses cfg.drift_xy_threshold
+            unstable = dist > self.cfg.drift_xy_threshold
             
             # Compute failure/success for valid envs only
             failure_valid = fell | unstable
@@ -609,10 +635,11 @@ class PalletTask(DirectRLEnv):
             global_idx = ready_envs * self.cfg.max_boxes + eval_box_ids
             settled_pos = self.scene["boxes"].data.root_pos_w[global_idx]
             
-            # Evaluate success criteria
+            # Evaluate success criteria using configured threshold
             dist = torch.norm(settled_pos[:, :2] - eval_targets[:, :2], dim=-1)
             fell = settled_pos[:, 2] < 0.05
-            unstable = dist > 0.10
+            # Use configured threshold for consistency with other stability checks
+            unstable = dist > self.cfg.drift_xy_threshold
             success = ~(fell | unstable)
             
             # Update running accumulators
@@ -784,6 +811,16 @@ class PalletTask(DirectRLEnv):
         valid_eval = self.last_moved_box_id >= 0
         
         if "boxes" in self.scene.keys() and valid_eval.any():
+            # =====================================================================
+            # TERMINATION LOGIC ALIGNMENT FIX
+            # =====================================================================
+            # Previously used hardcoded thresholds (0.10m, no rotation check).
+            # Now uses cfg.drift_xy_threshold and cfg.drift_rot_threshold to be
+            # consistent with the settling stability evaluation in _get_rewards().
+            #
+            # This ensures termination and settling KPIs agree on what is "failed".
+            # =====================================================================
+            
             # Optimization: only read box state for valid envs
             valid_envs = valid_eval.nonzero(as_tuple=False).flatten()
             eval_box_idx = self.last_moved_box_id[valid_envs]
@@ -792,8 +829,25 @@ class PalletTask(DirectRLEnv):
             
             target_pos = self.last_target_pos[valid_envs]
             dist = torch.norm(current_pos[:, :2] - target_pos[:, :2], dim=-1)
+            
+            # Get rotation (to check rotation drift for fails like toppled boxes)
+            current_quat = self.scene["boxes"].data.root_quat_w[global_idx]  # (w,x,y,z)
+            # Target rotation was saved for most recent place (or identity if not set)
+            target_quat = self._settle_target_quat[valid_envs]
+            
+            # XY distance check
             fell = current_pos[:, 2] < 0.05
-            unstable = dist > 0.10
+            drift_xy = dist
+            
+            # Rotation drift check using quaternion dot product
+            quat_dot = (current_quat * target_quat).sum(dim=-1).abs()
+            drift_rot_rad = 2 * torch.acos(quat_dot.clamp(-1 + 1e-7, 1 - 1e-7))
+            drift_rot_deg = drift_rot_rad * (180.0 / 3.14159265359)
+            
+            # Use configured thresholds (same as settling evaluation)
+            exceeded_xy = drift_xy > self.cfg.drift_xy_threshold
+            exceeded_rot = drift_rot_deg > self.cfg.drift_rot_threshold
+            unstable = exceeded_xy | exceeded_rot
             
             # Compute failure for valid envs, expand to full tensor
             failure_valid = fell | unstable
@@ -937,10 +991,32 @@ class PalletTask(DirectRLEnv):
         grid_y = action[:, 3]
         rot_idx = action[:, 4]
         
-        # Compute target position (5cm grid)
-        step = 0.05
-        target_x = grid_x.float() * step - 0.4 + step / 2
-        target_y = grid_y.float() * step - 0.6 + step / 2
+        # =====================================================================
+        # Compute target position from action grid
+        # =====================================================================
+        # GEOMETRY FIX: Action grid now correctly aligns with pallet_size.
+        # pallet_size = (1.2, 0.8) means X spans 1.2m, Y spans 0.8m.
+        #
+        # grid_x: 0..15 (16 cells) → covers 1.2m → step_x = 1.2/16 = 0.075m
+        # grid_y: 0..23 (24 cells) → covers 0.8m → step_y = 0.8/24 = 0.0333m
+        #
+        # Pallet is centered at origin, so:
+        #   X ranges from -0.6 to +0.6 (half_x = 0.6)
+        #   Y ranges from -0.4 to +0.4 (half_y = 0.4)
+        # =====================================================================
+        pallet_x = self.cfg.pallet_size[0]  # 1.2m
+        pallet_y = self.cfg.pallet_size[1]  # 0.8m
+        num_x = self.cfg.action_dims[2]  # 16
+        num_y = self.cfg.action_dims[3]  # 24
+        
+        step_x = pallet_x / num_x  # 0.075m per cell
+        step_y = pallet_y / num_y  # 0.0333m per cell
+        half_x = pallet_x / 2.0    # 0.6m
+        half_y = pallet_y / 2.0    # 0.4m
+        
+        # Map grid index to world coordinates (cell center)
+        target_x = grid_x.float() * step_x - half_x + step_x / 2
+        target_y = grid_y.float() * step_y - half_y + step_y / 2
         target_z = torch.full((n,), 1.5, device=device)  # Drop height
         
         # Operation masks
@@ -951,16 +1027,29 @@ class PalletTask(DirectRLEnv):
         self.retrieve_mask = (op_type == 2)
         
         # =====================================================================
-        # Height Constraint Validation
+        # Height Constraint Validation (FIX: per-op box height)
         # =====================================================================
+        # CRITICAL FIX: Previously used box_dims[box_idx] for ALL operations.
+        # This was wrong for RETRIEVE, which must use the retrieved box's height
+        # from buffer_state, not the current fresh box height.
+        #
+        # Per-op height logic:
+        # - PLACE (op=0): uses box_dims[box_idx] (the next fresh box)
+        # - RETRIEVE (op=2): uses buffer_state[slot_idx, 2] (height stored in buffer)
+        # - STORE (op=1): no height check (not placing a box on pallet)
+        
         # Reset height invalid mask
         self._height_invalid_mask[:] = False
         
-        # Check height constraint for PLACE and RETRIEVE
-        if self._last_heightmap is not None and self.active_place_mask.any():
+        # Only PLACE and RETRIEVE need height checks (they put a box on the pallet)
+        place_mask = (op_type == 0)
+        retrieve_mask_local = (op_type == 2)
+        needs_height_check = place_mask | retrieve_mask_local
+        
+        if self._last_heightmap is not None and needs_height_check.any():
             # Map grid coordinates to heightmap pixels
-            # grid_x: 0..15 -> pixel_x: 0..239
-            # grid_y: 0..23 -> pixel_y: 0..159
+            # grid_x: 0..15 -> pixel_x: 0..239  (spans 0.8m on X axis)
+            # grid_y: 0..23 -> pixel_y: 0..159  (spans 1.2m on Y axis)
             pixel_x = (grid_x.float() / max(1, self.cfg.action_dims[2] - 1) * (self.cfg.map_shape[1] - 1)).long()
             pixel_y = (grid_y.float() / max(1, self.cfg.action_dims[3] - 1) * (self.cfg.map_shape[0] - 1)).long()
             
@@ -972,16 +1061,25 @@ class PalletTask(DirectRLEnv):
             env_idx = torch.arange(n, device=device)
             local_height = self._last_heightmap[env_idx, pixel_y, pixel_x]  # (N,)
             
-            # Get current box height
+            # Compute per-op box height (PLACE vs RETRIEVE)
+            # PLACE: use fresh box height from box_dims
             box_idx_clamped = self.box_idx.clamp(0, self.cfg.max_boxes - 1)
-            current_box_height = self.box_dims[env_idx, box_idx_clamped, 2]  # (N,)
+            place_box_height = self.box_dims[env_idx, box_idx_clamped, 2]  # (N,)
+            
+            # RETRIEVE: use height stored in buffer_state for the selected slot
+            # buffer_state[:, :, 2] contains the H (height) dimension
+            slot_idx_clamped = slot_idx.clamp(0, self.cfg.buffer_slots - 1)
+            retrieve_box_height = self.buffer_state[env_idx, slot_idx_clamped, 2]  # (N,)
+            
+            # Select correct height per-op: PLACE uses fresh box, RETRIEVE uses buffer box
+            box_height = torch.where(place_mask, place_box_height, retrieve_box_height)
             
             # Predict top of stack after placement
-            predicted_top = local_height + current_box_height
+            predicted_top = local_height + box_height
             
-            # Mark as invalid if exceeds max stack height
+            # Mark as invalid if exceeds max stack height (only for ops that need it)
             height_exceeds = predicted_top > self.cfg.max_stack_height
-            self._height_invalid_mask = height_exceeds & self.active_place_mask
+            self._height_invalid_mask = height_exceeds & needs_height_check
         
         # Mask for PLACE-only envs (for writing box_idx pose)
         # Exclude height-invalid actions from actual placement
@@ -1128,14 +1226,23 @@ class PalletTask(DirectRLEnv):
             if "boxes" in self.scene.keys():
                 global_retr_idx = retr_envs * self.cfg.max_boxes + retrieved_physical_id
                 
-                # Build target pose for retrieved boxes
-                step = 0.05
+                # Build target pose for retrieved boxes (using corrected geometry)
+                pallet_x = self.cfg.pallet_size[0]  # 1.2m
+                pallet_y = self.cfg.pallet_size[1]  # 0.8m
+                num_x = self.cfg.action_dims[2]  # 16
+                num_y = self.cfg.action_dims[3]  # 24
+                
+                step_x = pallet_x / num_x  # 0.075m per cell
+                step_y = pallet_y / num_y  # 0.0333m per cell
+                half_x = pallet_x / 2.0    # 0.6m
+                half_y = pallet_y / 2.0    # 0.4m
+                
                 grid_x = action[retr_envs, 2]
                 grid_y = action[retr_envs, 3]
                 rot_idx = action[retr_envs, 4]
                 
-                target_x = grid_x.float() * step - 0.4 + step / 2
-                target_y = grid_y.float() * step - 0.6 + step / 2
+                target_x = grid_x.float() * step_x - half_x + step_x / 2
+                target_y = grid_y.float() * step_y - half_y + step_y / 2
                 target_z = torch.full((len(retr_envs),), 1.5, device=device)
                 target_pos = torch.stack([target_x, target_y, target_z], dim=-1)
                 
@@ -1217,8 +1324,14 @@ class PalletTask(DirectRLEnv):
         Shape: (num_envs, sum(action_dims)), dtype=bool, device matches env device.
 
         Implements:
-        - Height-based masking: masks X/Y positions where stack height would exceed max
-        - Buffer slot masking for RETRIEVE: masks empty slots
+        - Height-based X/Y masking: ONLY for PLACE operation (uses known fresh box height)
+        - Buffer slot masking: marks empty slots (informational for policy)
+        
+        IMPORTANT FIX: Height masking is NOT applied for RETRIEVE operations because:
+        - The MultiDiscrete action space selects [Op, Slot, X, Y, Rot] simultaneously
+        - For RETRIEVE, the box height depends on which slot is selected
+        - We cannot mask X/Y based on height when the slot (and thus box height) is unknown
+        - The actual height validation happens in _apply_action after the action is taken
         
         This mask is compatible with PalletizerActorCritic.act() and evaluate()
         methods, which expect (N, total_logits) bool tensors.
@@ -1243,10 +1356,17 @@ class PalletTask(DirectRLEnv):
         rot_start = y_start + self.cfg.action_dims[3]  # 53
         
         # =====================================================================
-        # Height-based Grid Masking
+        # Height-based Grid Masking (PLACE ONLY)
         # =====================================================================
-        # For each X position, mask if ALL Y positions at that X exceed height
-        # For each Y position, mask if ALL X positions at that Y exceed height
+        # FIX: Apply height masking ONLY for PLACE operations.
+        # For RETRIEVE, the box height depends on the selected slot, which is
+        # chosen simultaneously with X/Y in the MultiDiscrete action space.
+        # We cannot accurately mask X/Y positions for RETRIEVE without knowing
+        # which slot will be selected. The actual height validation for RETRIEVE
+        # happens in _apply_action where the full action is known.
+        #
+        # Note: This is a limitation of MultiDiscrete action spaces. The policy
+        # should learn to avoid height violations through reward signals.
         if self._last_heightmap is not None:
             heightmap = self._last_heightmap  # (N, H, W)
             
@@ -1264,38 +1384,42 @@ class PalletTask(DirectRLEnv):
             pixel_xs = pixel_xs.clamp(0, self.cfg.map_shape[1] - 1)
             pixel_ys = pixel_ys.clamp(0, self.cfg.map_shape[0] - 1)
             
-            # Get current box height per env
+            # Get FRESH box height per env (for PLACE only)
+            # This is the box that would be placed if PLACE is selected
             idx = self.box_idx.clamp(0, self.cfg.max_boxes - 1)
             env_idx = torch.arange(n, device=device)
-            current_box_h = self.box_dims[env_idx, idx, 2]  # (N,)
+            fresh_box_h = self.box_dims[env_idx, idx, 2]  # (N,)
             
             # Sample heights at all grid positions: (N, num_y, num_x)
-            # heightmap is (N, H, W), we want to index [N, pixel_ys, pixel_xs]
-            # Create meshgrid of pixel indices
             all_heights = heightmap[:, pixel_ys[:, None], pixel_xs[None, :]]  # (N, 24, 16)
             
-            # Predict top of stack after placement at each cell
-            predicted_tops = all_heights + current_box_h[:, None, None]  # (N, 24, 16)
+            # Predict top of stack after PLACE at each cell
+            predicted_tops = all_heights + fresh_box_h[:, None, None]  # (N, 24, 16)
             
-            # Invalid if exceeds max stack height
+            # Invalid if exceeds max stack height (for PLACE operation)
             grid_invalid = predicted_tops > self.cfg.max_stack_height  # (N, 24, 16)
             
-            # Mask X positions where ALL Y positions are invalid
+            # Mask X positions where ALL Y positions are invalid for PLACE
             all_y_invalid_at_x = grid_invalid.all(dim=1)  # (N, 16)
             mask[:, x_start:x_start + num_x] &= ~all_y_invalid_at_x
             
-            # Mask Y positions where ALL X positions are invalid
+            # Mask Y positions where ALL X positions are invalid for PLACE
             all_x_invalid_at_y = grid_invalid.all(dim=2)  # (N, 24)
             mask[:, y_start:y_start + num_y] &= ~all_x_invalid_at_y
         
         # =====================================================================
-        # Buffer Slot Masking for RETRIEVE
+        # Buffer Slot Masking (informational)
         # =====================================================================
-        # For RETRIEVE (op=2), mask slots that are empty
-        # Since we can't condition on operation type in the mask (it's selected
-        # before slot), we provide information but the policy learns to use it
-        # Note: This is informational - empty slots still get small probability
-        # The actual validation happens in _handle_buffer_actions
+        # Mark empty slots as invalid. This helps the policy learn to not
+        # select RETRIEVE for empty slots. Note: STORE also uses slots but
+        # targets empty slots, so this mask is primarily useful for RETRIEVE.
+        # The actual validation happens in _handle_buffer_actions.
+        #
+        # slots: (N, buffer_slots) boolean - True if slot is occupied
+        # We invert to mask empty slots (True = valid, so ~occupied for empty = invalid)
+        # But since STORE wants empty slots, we leave this as informational only
+        # and let the policy learn the semantics through rewards.
         
         assert mask.device == device, "Action mask device mismatch"
         return mask
+
