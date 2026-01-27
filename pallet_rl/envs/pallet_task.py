@@ -26,7 +26,7 @@ from isaaclab.sim.spawners import shapes as shape_spawners
 import gymnasium as gym
 
 from pallet_rl.utils.heightmap_rasterizer import WarpHeightmapGenerator
-from pallet_rl.utils.quaternions import wxyz_to_xyzw
+from pallet_rl.utils.quaternions import wxyz_to_xyzw, quat_angle_deg
 
 
 # =============================================================================
@@ -249,6 +249,9 @@ class PalletTask(DirectRLEnv):
         
         # Target position for stability check
         self.last_target_pos = torch.zeros(n, 3, device=device)
+        # Target quaternion for rotation stability check (w,x,y,z format)
+        self.last_target_quat = torch.zeros(n, 4, device=device)
+        self.last_target_quat[:, 0] = 1.0  # Initialize to identity
         
         # Off-map position for inactive boxes (far away to ensure they never pollute heightmap)
         self._inactive_box_pos = torch.tensor([1e6, 1e6, -1e6], device=device)
@@ -264,6 +267,9 @@ class PalletTask(DirectRLEnv):
         self._kpi_pending_box_id = torch.full((n,), -1, dtype=torch.long, device=device)
         # Target position saved at action time for KPI evaluation
         self._kpi_pending_target = torch.zeros(n, 3, device=device)
+        # Target quaternion saved at action time for KPI rotation evaluation
+        self._kpi_pending_target_quat = torch.zeros(n, 4, device=device)
+        self._kpi_pending_target_quat[:, 0] = 1.0  # Initialize to identity
         
         # Running KPI accumulators (for settled evaluations)
         self._kpi_place_success_count = torch.zeros(1, device=device)
@@ -317,6 +323,7 @@ class PalletTask(DirectRLEnv):
         self._kpi_total_drift_deg = torch.zeros(1, device=device)
         self._kpi_total_payload = torch.zeros(1, device=device)
         self._kpi_settle_eval_count = torch.zeros(1, device=device)
+        self._kpi_unstable_rot_count = torch.zeros(1, device=device)  # Rotation-only unstable
         
         # Initialize extras dict for logging
         self.extras = {}
@@ -554,14 +561,27 @@ class PalletTask(DirectRLEnv):
             eval_box_idx = self.last_moved_box_id[valid_envs]
             global_idx = valid_envs * self.cfg.max_boxes + eval_box_idx
             current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
+            current_quat = self.scene["boxes"].data.root_quat_w[global_idx]  # (w,x,y,z)
             
             target_pos = self.last_target_pos[valid_envs]
+            target_quat = self.last_target_quat[valid_envs]
+            
+            # XY distance
             dist = torch.norm(current_pos[:, :2] - target_pos[:, :2], dim=-1)
             fell = current_pos[:, 2] < 0.05
             
-            # Use configured threshold for consistency with termination and settling
-            # Previously hardcoded as 0.10m, now uses cfg.drift_xy_threshold
-            unstable = dist > self.cfg.drift_xy_threshold
+            # Use configured thresholds for consistency with termination and settling
+            # XY drift check
+            unstable_xy = dist > self.cfg.drift_xy_threshold
+            # Rotation drift check using numerically-stable quaternion angular distance
+            rot_error_deg = quat_angle_deg(current_quat, target_quat)
+            unstable_rot = rot_error_deg > self.cfg.drift_rot_threshold
+            # Combined unstable: either XY or rotation exceeded threshold
+            unstable = unstable_xy | unstable_rot
+            
+            # Track rotation-only unstable for KPI (not XY, only rotation)
+            rot_only_unstable = unstable_rot & ~unstable_xy & ~fell
+            self._kpi_unstable_rot_count += rot_only_unstable.float().sum()
             
             # Compute failure/success for valid envs only
             failure_valid = fell | unstable
@@ -605,6 +625,7 @@ class PalletTask(DirectRLEnv):
             self._kpi_pending_type[place_envs] = 1  # 1 = place
             self._kpi_pending_box_id[place_envs] = self.last_moved_box_id[place_envs]
             self._kpi_pending_target[place_envs] = self.last_target_pos[place_envs]
+            self._kpi_pending_target_quat[place_envs] = self.last_target_quat[place_envs]
         
         # For valid RETRIEVE: queue the retrieved box for later KPI evaluation
         if self.valid_retrieve.any():
@@ -614,6 +635,7 @@ class PalletTask(DirectRLEnv):
             self._kpi_pending_type[retr_envs] = 2  # 2 = retrieve
             self._kpi_pending_box_id[retr_envs] = self.last_moved_box_id[retr_envs]
             self._kpi_pending_target[retr_envs] = self.last_target_pos[retr_envs]
+            self._kpi_pending_target_quat[retr_envs] = self.last_target_quat[retr_envs]
         
         # =====================================================================
         # Evaluate settled KPIs (countdown reached 0)
@@ -629,17 +651,24 @@ class PalletTask(DirectRLEnv):
             ready_envs = ready_mask.nonzero(as_tuple=False).flatten()
             eval_box_ids = self._kpi_pending_box_id[ready_envs]
             eval_targets = self._kpi_pending_target[ready_envs]
+            eval_target_quats = self._kpi_pending_target_quat[ready_envs]
             eval_types = self._kpi_pending_type[ready_envs]
             
-            # Get settled box positions
+            # Get settled box positions and orientations
             global_idx = ready_envs * self.cfg.max_boxes + eval_box_ids
             settled_pos = self.scene["boxes"].data.root_pos_w[global_idx]
+            settled_quat = self.scene["boxes"].data.root_quat_w[global_idx]  # (w,x,y,z)
             
-            # Evaluate success criteria using configured threshold
+            # Evaluate success criteria using configured thresholds
             dist = torch.norm(settled_pos[:, :2] - eval_targets[:, :2], dim=-1)
             fell = settled_pos[:, 2] < 0.05
-            # Use configured threshold for consistency with other stability checks
-            unstable = dist > self.cfg.drift_xy_threshold
+            # XY drift check
+            unstable_xy = dist > self.cfg.drift_xy_threshold
+            # Rotation drift check
+            rot_error_deg = quat_angle_deg(settled_quat, eval_target_quats)
+            unstable_rot = rot_error_deg > self.cfg.drift_rot_threshold
+            # Combined unstable
+            unstable = unstable_xy | unstable_rot
             success = ~(fell | unstable)
             
             # Update running accumulators
@@ -784,6 +813,9 @@ class PalletTask(DirectRLEnv):
         self.extras["metrics/avg_drift_xy"] = avg_drift_xy.detach().cpu().item()
         self.extras["metrics/avg_drift_deg"] = avg_drift_deg.detach().cpu().item()
         self.extras["metrics/payload_utilization"] = payload_utilization.detach().cpu().item()
+        # Rotation-only unstable rate (immediate evaluation)
+        unstable_rot_rate = self._kpi_unstable_rot_count / (self._kpi_eval_count + 1e-8)
+        self.extras["metrics/unstable_rot_rate"] = unstable_rot_rate.detach().cpu().item()
         
         return rewards
     
@@ -1099,6 +1131,8 @@ class PalletTask(DirectRLEnv):
         self.last_target_pos[:, 0] = target_x
         self.last_target_pos[:, 1] = target_y
         self.last_target_pos[:, 2] = 0.0
+        # Save target quaternion for rotation drift evaluation
+        self.last_target_quat.copy_(quat)
         
         # Apply to simulation: ONLY move box_idx for PLACE actions
         # STORE and RETRIEVE handle their own box movements in _handle_buffer_actions

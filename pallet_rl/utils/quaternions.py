@@ -73,5 +73,30 @@ def is_unit_quaternion(q: torch.Tensor, atol: float = 1e-4) -> torch.Tensor:
     return torch.isclose(norm, torch.ones_like(norm), atol=atol)
 
 
-__all__: Tuple[str, ...] = ("wxyz_to_xyzw", "xyzw_to_wxyz", "is_unit_quaternion")
+def quat_angle_deg(q1: torch.Tensor, q2: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the angular distance (in degrees) between two quaternions.
+    
+    Uses the formula: angle = 2 * acos(|q1 · q2|)
+    The absolute value handles the quaternion double-cover (q == -q).
+    
+    Args:
+        q1: Tensor [..., 4] first quaternion (any convention, must match q2).
+        q2: Tensor [..., 4] second quaternion (same convention as q1).
+    
+    Returns:
+        Tensor [...] angular distance in degrees.
+    """
+    _assert_quat_last_dim(q1)
+    _assert_quat_last_dim(q2)
+    # Dot product, take abs to handle sign ambiguity
+    dot = (q1 * q2).sum(dim=-1).abs()
+    # Clamp for numerical stability before acos
+    dot_clamped = dot.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    angle_rad = 2.0 * torch.acos(dot_clamped)
+    angle_deg = angle_rad * (180.0 / 3.14159265358979323846)
+    return angle_deg
+
+
+__all__: Tuple[str, ...] = ("wxyz_to_xyzw", "xyzw_to_wxyz", "is_unit_quaternion", "quat_angle_deg")
 
