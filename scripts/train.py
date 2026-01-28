@@ -82,7 +82,13 @@ def main():
 
     # Isaac Lab imports
     from isaaclab.envs import DirectRLEnvCfg
-    from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
+    try:
+        # Older IsaacLab layout
+        from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
+    except ModuleNotFoundError:
+        # Newer layout (IsaacLab split package)
+        from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
+
 
     # Project imports
     from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
