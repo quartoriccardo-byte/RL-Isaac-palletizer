@@ -13,9 +13,18 @@ from __future__ import annotations
 import torch
 import warp as wp
 
-# Initialize Warp if not already done
-if not wp.is_initialized():
+# -----------------------------------------------------------------------------
+# Warp Initialization (Version-Safe Pattern)
+# -----------------------------------------------------------------------------
+# NOTE: wp.is_initialized() does NOT exist in Warp 1.11.x and newer versions.
+# wp.init() is idempotent - calling it multiple times is safe and has no effect
+# if Warp is already initialized. This pattern ensures compatibility across
+# all Warp versions without raising AttributeError.
+try:
     wp.init()
+except Exception:
+    # Warp may raise if already initialized in some edge cases; safe to ignore.
+    pass
 
 
 # =============================================================================
