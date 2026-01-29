@@ -34,7 +34,60 @@ from pallet_rl.utils.quaternions import wxyz_to_xyzw, quat_angle_deg
 
 
 # =============================================================================
-# Configuration
+# Scene Configuration (Isaac Lab 5.0+ / Isaac Sim 5.0)
+# =============================================================================
+# IsaacLab 5.0 API update: Assets must be registered through InteractiveSceneCfg
+# fields. The scene.add() method has been removed. Assets are automatically
+# loaded when InteractiveScene(cfg) is created.
+
+# Default max_boxes for scene configuration (matches PalletTaskCfg.max_boxes)
+_DEFAULT_MAX_BOXES = 50
+_DEFAULT_PALLET_SIZE = (1.2, 0.8)
+
+
+@configclass
+class PalletSceneCfg(InteractiveSceneCfg):
+    """Scene configuration for the palletizing environment.
+    
+    Defines all assets that will be spawned in each environment:
+    - Pallet: Static rigid body at the origin
+    - Boxes: Collection of rigid bodies for stacking
+    """
+    
+    # Pallet as a simple box at the origin of each env
+    pallet: RigidObjectCfg = RigidObjectCfg(
+        prim_path="{ENV_REGEX_NS}/Pallet",
+        spawn=CuboidCfg(size=(_DEFAULT_PALLET_SIZE[0], _DEFAULT_PALLET_SIZE[1], 0.15)),
+        init_state=RigidObjectCfg.InitialStateCfg(
+            pos=(0.0, 0.0, 0.075),
+            rot=(1.0, 0.0, 0.0, 0.0),  # (w,x,y,z) for Isaac scene
+            lin_vel=(0.0, 0.0, 0.0),
+            ang_vel=(0.0, 0.0, 0.0),
+        ),
+    )
+    
+    # Box collection: each box has a unique name and prim_path
+    # IsaacLab 5.0 API: RigidObjectCollectionCfg uses `rigid_objects` dict
+    boxes: RigidObjectCollectionCfg = RigidObjectCollectionCfg(
+        rigid_objects={
+            f"box_{i}": RigidObjectCfg(
+                prim_path=f"{{ENV_REGEX_NS}}/Boxes/box_{i}",
+                # Size will be overridden at reset based on `box_dims`
+                spawn=CuboidCfg(size=(0.4, 0.3, 0.2)),
+                init_state=RigidObjectCfg.InitialStateCfg(
+                    pos=(0.0, 0.0, 1.5),
+                    rot=(1.0, 0.0, 0.0, 0.0),
+                    lin_vel=(0.0, 0.0, 0.0),
+                    ang_vel=(0.0, 0.0, 0.0),
+                ),
+            )
+            for i in range(_DEFAULT_MAX_BOXES)
+        },
+    )
+
+
+# =============================================================================
+# Task Configuration
 # =============================================================================
 
 @configclass
@@ -48,8 +101,8 @@ class PalletTaskCfg(DirectRLEnvCfg):
         device="cuda:0"
     )
     
-    # Scene (will be populated with robot + pallet + boxes)
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(
+    # Scene configuration (IsaacLab 5.0: assets defined in PalletSceneCfg)
+    scene: PalletSceneCfg = PalletSceneCfg(
         num_envs=4096,
         env_spacing=3.0
     )
@@ -339,20 +392,15 @@ class PalletTask(DirectRLEnv):
     
     def _setup_scene(self):
         """
-        Configure scene objects using Isaac Lab declarative API.
+        Configure stage-level scene objects (Isaac Lab 5.0 API).
 
-        Scene contains:
-        - Ground plane (static)
-        - Pallet volume (static box)
-        - Boxes collection (rigid objects)
+        IsaacLab 5.0 API update: Assets (pallet, boxes) are now defined in
+        PalletSceneCfg and automatically loaded when InteractiveScene(cfg)
+        is created. The scene.add() method has been removed.
 
-        Notes:
-        - We keep this implementation minimal and declarative to avoid
-          over-constraining asset paths. A production setup would replace
-          the primitive pallet with a USD asset and tune physical materials.
-        - Downstream code expects a `boxes` view available as
-          `self.scene["boxes"]` exposing `data.root_pos_w` and
-          `data.root_quat_w` tensors.
+        This method only handles stage-level setup like the ground plane.
+        Downstream code expects `self.scene["boxes"]` and `self.scene["pallet"]`
+        which are automatically available from the scene config.
         """
         # Ground plane (simple infinite plane primitive)
         # IsaacLab API update: ground plane spawner moved to from_files module
@@ -362,43 +410,6 @@ class PalletTask(DirectRLEnv):
             translation=(0.0, 0.0, 0.0),
             orientation=(1.0, 0.0, 0.0, 0.0),
         )
-
-        # Pallet as a simple box at the origin of each env.
-        # IsaacLab API update: use CuboidCfg for spawn instead of deprecated SpawnCfg
-        pallet_cfg = RigidObjectCfg(
-            prim_path="{ENV_REGEX_NS}/Pallet",
-            spawn=CuboidCfg(size=(self.cfg.pallet_size[0], self.cfg.pallet_size[1], 0.15)),
-            init_state=RigidObjectCfg.InitialStateCfg(
-                pos=(0.0, 0.0, 0.075),
-                rot=(1.0, 0.0, 0.0, 0.0),  # (w,x,y,z) for Isaac scene
-                lin_vel=(0.0, 0.0, 0.0),
-                ang_vel=(0.0, 0.0, 0.0),
-            ),
-        )
-
-        # IsaacLab API update (2024+): RigidObjectCollectionCfg now requires a
-        # `rigid_objects` dictionary instead of `base_cfg` + `count_per_env`.
-        # Each key in the dictionary is a unique identifier for the rigid object.
-        boxes_cfg = RigidObjectCollectionCfg(
-            rigid_objects={
-                f"box_{i}": RigidObjectCfg(
-                    prim_path=f"{{ENV_REGEX_NS}}/Boxes/box_{i}",
-                    # Size will be overridden at reset based on `box_dims`.
-                    spawn=CuboidCfg(size=(0.4, 0.3, 0.2)),
-                    init_state=RigidObjectCfg.InitialStateCfg(
-                        pos=(0.0, 0.0, 1.5),
-                        rot=(1.0, 0.0, 0.0, 0.0),
-                        lin_vel=(0.0, 0.0, 0.0),
-                        ang_vel=(0.0, 0.0, 0.0),
-                    ),
-                )
-                for i in range(self.cfg.max_boxes)
-            },
-        )
-
-        # Register rigid objects with the interactive scene
-        self.scene.add(pallet_cfg, "pallet")
-        self.scene.add(boxes_cfg, "boxes")
     
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """
