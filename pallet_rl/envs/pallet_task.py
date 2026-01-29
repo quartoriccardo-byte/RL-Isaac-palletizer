@@ -22,6 +22,8 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.assets import RigidObjectCfg, RigidObjectCollectionCfg
 from isaaclab.sim.spawners import shapes as shape_spawners
+# IsaacLab API update: use CuboidCfg for spawning box primitives
+from isaaclab.sim.spawners.shapes import CuboidCfg
 # IsaacLab API update: ground plane spawner moved to from_files module
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
@@ -362,54 +364,30 @@ class PalletTask(DirectRLEnv):
         )
 
         # Pallet as a simple box at the origin of each env.
+        # IsaacLab API update: use CuboidCfg for spawn instead of deprecated SpawnCfg
         pallet_cfg = RigidObjectCfg(
             prim_path="{ENV_REGEX_NS}/Pallet",
-            spawn=RigidObjectCfg.SpawnCfg(
-                func=shape_spawners.spawn_box,
-                extents=(self.cfg.pallet_size[0], self.cfg.pallet_size[1], 0.15),
-            ),
+            spawn=CuboidCfg(size=(self.cfg.pallet_size[0], self.cfg.pallet_size[1], 0.15)),
             init_state=RigidObjectCfg.InitialStateCfg(
                 pos=(0.0, 0.0, 0.075),
                 rot=(1.0, 0.0, 0.0, 0.0),  # (w,x,y,z) for Isaac scene
                 lin_vel=(0.0, 0.0, 0.0),
                 ang_vel=(0.0, 0.0, 0.0),
             ),
-            rigid_props=RigidObjectCfg.RigidPropsCfg(
-                disable_gravity=False,
-                linear_damping=0.0,
-                angular_damping=0.0,
-            ),
-            collision_props=RigidObjectCfg.CollisionPropsCfg(
-                collision_enabled=True,
-                contact_offset=0.02,
-                rest_offset=0.0,
-            ),
         )
 
+        # IsaacLab API update: use CuboidCfg for spawn instead of deprecated SpawnCfg
         boxes_cfg = RigidObjectCollectionCfg(
             prim_path="{ENV_REGEX_NS}/Boxes",
             base_cfg=RigidObjectCfg(
                 prim_path="{ENV_REGEX_NS}/Boxes/box",
-                spawn=RigidObjectCfg.SpawnCfg(
-                    func=shape_spawners.spawn_box,
-                    # Extents will be overridden at reset based on `box_dims`.
-                    extents=(0.4, 0.3, 0.2),
-                ),
+                # Size will be overridden at reset based on `box_dims`.
+                spawn=CuboidCfg(size=(0.4, 0.3, 0.2)),
                 init_state=RigidObjectCfg.InitialStateCfg(
                     pos=(0.0, 0.0, 1.5),
                     rot=(1.0, 0.0, 0.0, 0.0),
                     lin_vel=(0.0, 0.0, 0.0),
                     ang_vel=(0.0, 0.0, 0.0),
-                ),
-                rigid_props=RigidObjectCfg.RigidPropsCfg(
-                    disable_gravity=False,
-                    linear_damping=0.0,
-                    angular_damping=0.0,
-                ),
-                collision_props=RigidObjectCfg.CollisionPropsCfg(
-                    collision_enabled=True,
-                    contact_offset=0.01,
-                    rest_offset=0.0,
                 ),
             ),
             count_per_env=self.cfg.max_boxes,
