@@ -26,6 +26,8 @@ from isaaclab.sim.spawners import shapes as shape_spawners
 from isaaclab.sim.spawners.shapes import CuboidCfg
 # IsaacLab API update: ground plane spawner moved to from_files module
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+# IsaacLab 5.0: prim utilities for creating container prims before spawning
+from isaaclab.sim import prim_utils
 
 import gymnasium as gym
 
@@ -104,7 +106,8 @@ class PalletTaskCfg(DirectRLEnvCfg):
     # Scene configuration (IsaacLab 5.0: assets defined in PalletSceneCfg)
     scene: PalletSceneCfg = PalletSceneCfg(
         num_envs=4096,
-        env_spacing=3.0
+        env_spacing=3.0,
+        replicate_physics=True,  # Required for env_0 to be source for cloning
     )
     
     # Decimation (physics steps per RL step)
@@ -398,7 +401,10 @@ class PalletTask(DirectRLEnv):
         PalletSceneCfg and automatically loaded when InteractiveScene(cfg)
         is created. The scene.add() method has been removed.
 
-        This method only handles stage-level setup like the ground plane.
+        This method handles:
+        1. Ground plane spawning
+        2. Container prim creation for Boxes/Pallet (required by RigidObjectCollection)
+
         Downstream code expects `self.scene["boxes"]` and `self.scene["pallet"]`
         which are automatically available from the scene config.
         """
@@ -410,6 +416,13 @@ class PalletTask(DirectRLEnv):
             translation=(0.0, 0.0, 0.0),
             orientation=(1.0, 0.0, 0.0, 0.0),
         )
+
+        # IsaacLab 5.0: Create container Xform prims for rigid object collections.
+        # RigidObjectCollection expects parent prims to exist before spawning.
+        # We create them under the source env path (env_0) which is then cloned.
+        source_env_path = self.scene.env_prim_paths[0]
+        prim_utils.create_prim(f"{source_env_path}/Boxes", "Xform")
+        prim_utils.create_prim(f"{source_env_path}/Pallet", "Xform")
     
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """
