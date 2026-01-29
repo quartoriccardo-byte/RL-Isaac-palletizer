@@ -376,20 +376,24 @@ class PalletTask(DirectRLEnv):
             ),
         )
 
-        # IsaacLab API update: use CuboidCfg for spawn; prim_path removed from RigidObjectCollectionCfg
+        # IsaacLab API update (2024+): RigidObjectCollectionCfg now requires a
+        # `rigid_objects` dictionary instead of `base_cfg` + `count_per_env`.
+        # Each key in the dictionary is a unique identifier for the rigid object.
         boxes_cfg = RigidObjectCollectionCfg(
-            base_cfg=RigidObjectCfg(
-                prim_path="{ENV_REGEX_NS}/Boxes/box",
-                # Size will be overridden at reset based on `box_dims`.
-                spawn=CuboidCfg(size=(0.4, 0.3, 0.2)),
-                init_state=RigidObjectCfg.InitialStateCfg(
-                    pos=(0.0, 0.0, 1.5),
-                    rot=(1.0, 0.0, 0.0, 0.0),
-                    lin_vel=(0.0, 0.0, 0.0),
-                    ang_vel=(0.0, 0.0, 0.0),
-                ),
-            ),
-            count_per_env=self.cfg.max_boxes,
+            rigid_objects={
+                f"box_{i}": RigidObjectCfg(
+                    prim_path=f"{{ENV_REGEX_NS}}/Boxes/box_{i}",
+                    # Size will be overridden at reset based on `box_dims`.
+                    spawn=CuboidCfg(size=(0.4, 0.3, 0.2)),
+                    init_state=RigidObjectCfg.InitialStateCfg(
+                        pos=(0.0, 0.0, 1.5),
+                        rot=(1.0, 0.0, 0.0, 0.0),
+                        lin_vel=(0.0, 0.0, 0.0),
+                        ang_vel=(0.0, 0.0, 0.0),
+                    ),
+                )
+                for i in range(self.cfg.max_boxes)
+            },
         )
 
         # Register rigid objects with the interactive scene
