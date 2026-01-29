@@ -27,7 +27,7 @@ from isaaclab.sim.spawners.shapes import CuboidCfg
 # IsaacLab API update: ground plane spawner moved to from_files module
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 # IsaacLab 5.0: prim utilities for creating container prims before spawning
-from isaaclab.sim import prim_utils
+from isaacsim.core.utils import prims as prim_utils
 
 import gymnasium as gym
 
