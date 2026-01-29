@@ -22,6 +22,8 @@ from isaaclab.sim import SimulationCfg
 from isaaclab.utils import configclass
 from isaaclab.assets import RigidObjectCfg, RigidObjectCollectionCfg
 from isaaclab.sim.spawners import shapes as shape_spawners
+# IsaacLab API update: ground plane spawner moved to from_files module
+from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 
 import gymnasium as gym
 
@@ -351,7 +353,8 @@ class PalletTask(DirectRLEnv):
           `data.root_quat_w` tensors.
         """
         # Ground plane (simple infinite plane primitive)
-        shape_spawners.spawn_ground_plane(self.scene)
+        # IsaacLab API update: ground plane spawner moved to from_files module
+        spawn_ground_plane("/World/groundPlane", GroundPlaneCfg(), self.scene)
 
         # Pallet as a simple box at the origin of each env.
         pallet_cfg = RigidObjectCfg(
