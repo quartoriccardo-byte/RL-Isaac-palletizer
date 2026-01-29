@@ -56,6 +56,11 @@ class PalletTaskCfg(DirectRLEnvCfg):
     
     # Episode length
     episode_length_s: float = 60.0
+
+    # NOTE: Required by IsaacLab DirectRLEnvCfg.validate() in newer versions.
+    # Dummy gym spaces are defined here; real spaces are set at runtime in PalletTask.__init__.
+    action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(1,))
+    observation_space = gym.spaces.Dict({})
     
     # =========================================================================
     # Pallet & Coordinate System Documentation
