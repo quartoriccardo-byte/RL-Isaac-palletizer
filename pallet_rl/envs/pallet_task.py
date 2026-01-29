@@ -354,7 +354,12 @@ class PalletTask(DirectRLEnv):
         """
         # Ground plane (simple infinite plane primitive)
         # IsaacLab API update: ground plane spawner moved to from_files module
-        spawn_ground_plane("/World/groundPlane", GroundPlaneCfg(), self.scene)
+        spawn_ground_plane(
+            "/World/groundPlane",
+            GroundPlaneCfg(),
+            translation=(0.0, 0.0, 0.0),
+            orientation=(1.0, 0.0, 0.0, 0.0),
+        )
 
         # Pallet as a simple box at the origin of each env.
         pallet_cfg = RigidObjectCfg(
