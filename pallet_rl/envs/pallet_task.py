@@ -376,9 +376,8 @@ class PalletTask(DirectRLEnv):
             ),
         )
 
-        # IsaacLab API update: use CuboidCfg for spawn instead of deprecated SpawnCfg
+        # IsaacLab API update: use CuboidCfg for spawn; prim_path removed from RigidObjectCollectionCfg
         boxes_cfg = RigidObjectCollectionCfg(
-            prim_path="{ENV_REGEX_NS}/Boxes",
             base_cfg=RigidObjectCfg(
                 prim_path="{ENV_REGEX_NS}/Boxes/box",
                 # Size will be overridden at reset based on `box_dims`.
