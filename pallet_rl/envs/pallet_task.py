@@ -1057,6 +1057,32 @@ class PalletTask(DirectRLEnv):
             # pose shape: (num_envs, num_objects, 7)
             self.scene["boxes"].write_object_pose_to_sim(inactive_pose, env_ids=env_ids)
     
+    def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        """
+        Called by DirectRLEnv.step() before physics stepping.
+        
+        IsaacLab DirectRLEnv requires this method to process actions
+        before the physics simulation advances.
+        
+        Args:
+            actions: Raw actions from the policy (N, num_actions) or (N,)
+        """
+        # Move actions to device
+        actions = actions.to(self._device)
+        
+        # For MultiDiscrete: cast to long (discrete indices)
+        # RSL-RL may pass float actions; our _apply_action expects integers
+        if actions.dtype in (torch.float32, torch.float16, torch.bfloat16):
+            actions = actions.long()
+        
+        # Ensure shape is (num_envs, 5) for MultiDiscrete
+        if actions.dim() == 1:
+            # Single action dimension - reshape
+            actions = actions.view(self.num_envs, -1)
+        
+        # Delegate to existing action application logic
+        self._apply_action(actions)
+    
     def _apply_action(self, action: torch.Tensor):
         """
         Apply MultiDiscrete action.
