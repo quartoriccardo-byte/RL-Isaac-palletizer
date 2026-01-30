@@ -142,13 +142,32 @@ def main():
         
         # =======================================================================
         # REQUIRED: obs_groups for RSL-RL OnPolicyRunner
-        # Maps algorithm observation sets to env observation dict keys.
-        # The env's _get_observations() returns {"policy": ..., "critic": ...}
+        # Different rsl_rl versions expect obs_groups at different locations:
+        # - Some expect it nested under runner_cfg["obs_groups"]
+        # - Some expect it at top-level cfg["obs_groups"]
+        # We ensure it exists at BOTH locations for maximum compatibility.
         # =======================================================================
-        runner_cfg.setdefault("obs_groups", {
+        default_obs_groups = {
             "policy": ["policy"],
             "critic": ["critic"],
-        })
+        }
+        # Check both locations for existing obs_groups
+        obs_groups = runner_cfg.get("obs_groups") or cfg.get("obs_groups") or default_obs_groups
+        # Set at BOTH locations
+        runner_cfg["obs_groups"] = obs_groups
+        cfg["obs_groups"] = obs_groups
+        
+        # =======================================================================
+        # Mirror key runner fields to top-level for rsl_rl versions that expect flat config
+        # =======================================================================
+        mirror_keys = [
+            "max_iterations", "num_steps_per_env", "save_interval",
+            "experiment_name", "run_name", "resume", "checkpoint", "load_run",
+            "policy_class_name", "algorithm_class_name", "class_name",
+        ]
+        for k in mirror_keys:
+            if k in runner_cfg:
+                cfg.setdefault(k, runner_cfg[k])
 
         return cfg
 
@@ -197,6 +216,11 @@ def main():
     # -------------------------------------------------------------------------
     print("Initializing RSL-RL runner...")
     rsl_cfg = get_rsl_rl_cfg(args)
+    
+    # DEBUG: Verify obs_groups is present at required locations
+    print(f"[DEBUG] rsl_cfg top-level keys: {list(rsl_cfg.keys())}")
+    print(f"[DEBUG] top obs_groups: {rsl_cfg.get('obs_groups')}")
+    print(f"[DEBUG] runner obs_groups: {rsl_cfg.get('runner', {}).get('obs_groups')}")
     
     runner = OnPolicyRunner(
         env=env,
