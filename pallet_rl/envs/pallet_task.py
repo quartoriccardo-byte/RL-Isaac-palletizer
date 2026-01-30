@@ -132,8 +132,9 @@ class PalletTaskCfg(DirectRLEnvCfg):
     episode_length_s: float = 60.0
 
     # NOTE: Required by IsaacLab DirectRLEnvCfg.validate() in newer versions.
-    # Dummy gym spaces are defined here; real spaces are set at runtime in PalletTask.__init__.
-    action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(1,))
+    # Action space: continuous Box(5,) for rsl_rl compatibility
+    # 5 dimensions: [op, slot, x, y, rot] all in [-1, 1]
+    action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
     observation_space = gym.spaces.Dict({})
     
     # =========================================================================
@@ -273,6 +274,16 @@ class PalletTask(DirectRLEnv):
             "Xform"
         )
         
+        # =====================================================================
+        # CRITICAL: Set cfg.action_space BEFORE super().__init__()
+        # =====================================================================
+        # IsaacLab/RSL-RL captures action_space during DirectRLEnv.__init__().
+        # If we set self.action_space after super(), RSL-RL sees the dummy
+        # shape (1,) instead of the real shape (5,), causing broadcast errors.
+        cfg.action_space = gym.spaces.Box(
+            low=-1.0, high=1.0, shape=(5,), dtype=np.float32
+        )
+        
         # Call parent
         super().__init__(cfg, render_mode, **kwargs)
         
@@ -289,12 +300,7 @@ class PalletTask(DirectRLEnv):
         # State tensors (all GPU-resident)
         self._init_state_tensors()
         
-        # Action space: continuous Box for rsl_rl compatibility
-        # 5 dimensions: [op, slot, x, y, rot] all in [-1, 1]
-        # Decoding to discrete/continuous sub-actions happens in _apply_action
-        self.action_space = gym.spaces.Box(
-            low=-1.0, high=1.0, shape=(5,), dtype=np.float32
-        )
+        # Action space: use cfg.action_space (set before super().__init__)\n        # This ensures self.action_space matches cfg.action_space exactly\n        self.action_space = cfg.action_space
         
         # Observation space
         obs_dim = getattr(self.cfg, "num_observations", None)
