@@ -1236,26 +1236,29 @@ class PalletTask(DirectRLEnv):
             pose_reshaped = pose.unsqueeze(1)  # (num_place, 1, 7)
             vel_reshaped = vel.unsqueeze(1)    # (num_place, 1, 6)
             
-            # For each placing env, set the state of its specific box
-            # This requires iterating or using advanced indexing
-            # Simpler approach: use set_world_poses with global indices
-            global_idx = place_envs * self.cfg.max_boxes + box_ids
-            
-            # Get data buffer and write directly
-            boxes_data = self.scene["boxes"].data
-            pos = boxes_data.object_pos_w                 # (num_envs, num_boxes, 3)  (tipico)
-            num_boxes = pos.shape[1]
+            # global flat index (env, box)
+            flat_idx = place_envs * self.cfg.max_boxes + box_ids
 
-            global_idx = global_idx.to(torch.long)
-            env_ids = global_idx // num_boxes
-            box_ids = global_idx %  num_boxes
-            pos[env_ids, box_ids, :] = target_pos[place_envs]
-            boxes_data.object_quat_w.view(-1, 4)[global_idx] = quat[place_envs]
-            boxes_data.object_lin_vel_w.view(-1, 3)[global_idx] = 0.0
-            boxes_data.object_ang_vel_w.view(-1, 3)[global_idx] = 0.0
-            
-            # Write to sim
+            boxes_data = self.scene["boxes"].data
+
+            pos  = boxes_data.object_pos_w       # (E, B, 3)
+            quat_w = boxes_data.object_quat_w    # (E, B, 4)
+            lin  = boxes_data.object_lin_vel_w   # (E, B, 3)
+            ang  = boxes_data.object_ang_vel_w   # (E, B, 3)
+
+            B = pos.shape[1]
+
+            flat_idx = flat_idx.to(torch.long)
+            env_ids = flat_idx // B
+            box_ids2 = flat_idx %  B
+
+            pos[env_ids, box_ids2, :] = target_pos[place_envs]
+            quat_w[env_ids, box_ids2, :] = quat[place_envs]
+            lin[env_ids, box_ids2, :] = 0.0
+            ang[env_ids, box_ids2, :] = 0.0
+
             self.scene["boxes"].write_data_to_sim()
+
             
             # =====================================================================
             # Payload Update for PLACE
