@@ -465,7 +465,7 @@ class PalletTask(DirectRLEnv):
             dict: {"policy": (N, obs_dim), "critic": (N, obs_dim)}
         """
         n = self.num_envs
-        device = self._device
+        device = torch.device(self._device)
         
         # 1. Get box poses from scene (GPU tensors)
         if "boxes" in self.scene.keys():
