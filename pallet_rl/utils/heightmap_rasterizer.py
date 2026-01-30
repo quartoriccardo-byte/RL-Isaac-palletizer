@@ -81,7 +81,8 @@ def rasterize_heightmap_kernel(
     p_world = pallet_pos + p_offset_world
     
     # Find maximum height at this pixel
-    max_height = 0.0
+    # Warp: declare as dynamic variable to allow mutation inside dynamic loop
+    max_height = float(0.0)
     base_idx = env_id * max_boxes
     
     for i in range(max_boxes):
