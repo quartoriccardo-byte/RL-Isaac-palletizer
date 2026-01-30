@@ -106,6 +106,8 @@ def main():
         CLI arguments (iterations, resume, checkpoint, experiment_name) override
         the corresponding fields to keep a single source of truth for defaults.
         """
+        # Path: scripts/../pallet_rl/configs/rsl_rl_config.yaml
+        # Note: scripts/ is inside pallet_rl/ package root
         cfg_path = os.path.join(
             os.path.dirname(__file__),
             "..",
@@ -114,6 +116,16 @@ def main():
             "rsl_rl_config.yaml",
         )
         cfg_path = os.path.abspath(cfg_path)
+        
+        # Fallback: try sibling directory structure if primary path doesn't exist
+        if not os.path.exists(cfg_path):
+            cfg_path = os.path.join(
+                os.path.dirname(__file__),
+                "..",
+                "configs",
+                "rsl_rl_config.yaml",
+            )
+            cfg_path = os.path.abspath(cfg_path)
 
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = yaml.safe_load(f)
@@ -127,6 +139,16 @@ def main():
         # RSL-RL encodes checkpoint selection via `load_run`/`checkpoint`.
         if args.checkpoint is not None:
             runner_cfg["checkpoint"] = args.checkpoint
+        
+        # =======================================================================
+        # REQUIRED: obs_groups for RSL-RL OnPolicyRunner
+        # Maps algorithm observation sets to env observation dict keys.
+        # The env's _get_observations() returns {"policy": ..., "critic": ...}
+        # =======================================================================
+        runner_cfg.setdefault("obs_groups", {
+            "policy": ["policy"],
+            "critic": ["critic"],
+        })
 
         return cfg
 
