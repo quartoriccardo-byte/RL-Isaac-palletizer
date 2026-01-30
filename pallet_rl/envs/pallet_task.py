@@ -293,12 +293,18 @@ class PalletTask(DirectRLEnv):
         self.action_space = gym.spaces.MultiDiscrete(list(self.cfg.action_dims))
         
         # Observation space
-        obs_dim = self.cfg.num_observations
+        obs_dim = getattr(self.cfg, "num_observations", None)
+        if obs_dim is None:
+            # fallback: infer from a dummy observation (safe after _init_state_tensors)
+            obs_dim = int(self._get_observations()["policy"].shape[-1])
+
         self.observation_space = gym.spaces.Box(
-            low=-float('inf'), high=float('inf'),
-            shape=(obs_dim,), dtype=np.float32,
+            low=-float("inf"),
+            high=float("inf"),
+            shape=(int(obs_dim),),
+            dtype=np.float32,
         )
-    
+
     def _init_state_tensors(self):
         """Initialize all state tensors on GPU."""
         device = self._device
