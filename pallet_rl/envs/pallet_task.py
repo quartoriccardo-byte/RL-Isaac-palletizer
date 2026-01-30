@@ -550,8 +550,12 @@ class PalletTask(DirectRLEnv):
         ], dim=-1)
         
         # Shape/device assertion (fast, only runs in debug or once per step)
-        assert obs.shape == (n, self.cfg.num_observations), \
-            f"Obs shape {obs.shape} != expected ({n}, {self.cfg.num_observations})"
+        # IsaacLab 5.x: num_observations can be None; set on first call
+        if self.cfg.num_observations is None:
+            self.cfg.num_observations = int(obs.shape[-1])
+        expected_obs_dim = int(self.cfg.num_observations)
+        assert obs.shape == (n, expected_obs_dim), \
+            f"Obs shape {obs.shape} != expected ({n}, {expected_obs_dim})"
         assert obs.device == device, \
             f"Obs device {obs.device} != expected {device}"
         
