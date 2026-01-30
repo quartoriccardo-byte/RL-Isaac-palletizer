@@ -1042,20 +1042,20 @@ class PalletTask(DirectRLEnv):
         # Move all boxes off-map initially (they'll be placed when actions are taken)
         # This ensures inactive boxes never pollute the heightmap
         if "boxes" in self.scene.keys():
-            n_total = len(env_ids) * self.cfg.max_boxes
-            inactive_pos = self._inactive_box_pos.expand(n_total, 3)
-            inactive_quat = torch.zeros(n_total, 4, device=device)
-            inactive_quat[:, 0] = 1.0  # Identity quaternion (w,x,y,z)
+            num_reset = len(env_ids)
+            max_b = self.cfg.max_boxes
             
-            # Compute global indices for all boxes in reset envs (vectorized, GPU-safe)
-            env_ids_long = env_ids.long()
-            base = env_ids_long * self.cfg.max_boxes  # (num_reset_envs,)
-            offsets = torch.arange(self.cfg.max_boxes, device=device)  # (max_boxes,)
-            global_indices = (base[:, None] + offsets[None, :]).reshape(-1)  # (num_reset_envs * max_boxes,)
+            # Build pose tensor: (num_reset_envs, max_boxes, 7) = pos(3) + quat(4)
+            inactive_pos = self._inactive_box_pos.unsqueeze(0).unsqueeze(0).expand(num_reset, max_b, 3)
+            inactive_quat = torch.zeros(num_reset, max_b, 4, device=device)
+            inactive_quat[..., 0] = 1.0  # Identity quaternion (w,x,y,z)
             
-            self.scene["boxes"].write_root_pose_to_sim(
-                inactive_pos, inactive_quat, indices=global_indices
-            )
+            # Concatenate to pose: (num_reset_envs, max_boxes, 7)
+            inactive_pose = torch.cat([inactive_pos, inactive_quat], dim=-1)
+            
+            # RigidObjectCollection API: write_object_pose_to_sim(pose, env_ids)
+            # pose shape: (num_envs, num_objects, 7)
+            self.scene["boxes"].write_object_pose_to_sim(inactive_pose, env_ids=env_ids)
     
     def _apply_action(self, action: torch.Tensor):
         """
