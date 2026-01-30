@@ -144,6 +144,14 @@ class PalletizerActorCritic(ActorCritic):
         self.distributions: list = []
         
         # =====================================================================
+        # Entropy tensor storage (RSL-RL compatibility)
+        # =====================================================================
+        # RSL-RL PPO expects policy.entropy to be a sliceable Tensor, not a
+        # callable method. We store the computed entropy here and expose it
+        # via a @property for subscripting (e.g. policy.entropy[:batch_size]).
+        self._entropy: torch.Tensor = torch.zeros(1)
+        
+        # =====================================================================
         # RSL-RL ActorCritic normalization interface compatibility
         # =====================================================================
         # Since we skip the parent ActorCritic.__init__() (calling nn.Module.__init__
@@ -297,6 +305,10 @@ class PalletizerActorCritic(ActorCritic):
             start = end
         
         actions = torch.stack(action_list, dim=-1)
+        
+        # Compute and store entropy tensor (RSL-RL expects this as attribute)
+        self._entropy = self._compute_entropy()
+        
         return actions
     
     def get_actions_log_prob(self, actions: torch.Tensor) -> torch.Tensor:
@@ -376,16 +388,17 @@ class PalletizerActorCritic(ActorCritic):
             self.distributions.append(dist)
             start = end
         
+        # Compute and store entropy tensor (RSL-RL expects this as attribute)
+        self._entropy = self._compute_entropy()
+        
         return value
     
-    def entropy(self) -> torch.Tensor:
+    def _compute_entropy(self) -> torch.Tensor:
         """
-        Compute entropy of action distributions.
-        
-        Used by RSL-RL PPO for entropy regularization.
+        Compute entropy of action distributions (internal helper).
         
         Returns:
-            entropy: Sum of entropies (N,)
+            entropy: Sum of entropies across action dims (N,)
         """
         assert len(self.distributions) > 0, \
             "distributions not set. Call act() or evaluate() first."
@@ -399,6 +412,20 @@ class PalletizerActorCritic(ActorCritic):
             entropy = entropy + dist.entropy()
         
         return entropy
+    
+    @property
+    def entropy(self) -> torch.Tensor:
+        """
+        Entropy tensor (RSL-RL PPO interface).
+        
+        RSL-RL expects policy.entropy to be a Tensor attribute that can be
+        sliced (e.g. policy.entropy[:batch_size]). This property returns
+        the precomputed entropy stored by act() or evaluate().
+        
+        Returns:
+            entropy: Sum of entropies (N,)
+        """
+        return self._entropy
     
     @property
     def action_mean(self) -> torch.Tensor:
