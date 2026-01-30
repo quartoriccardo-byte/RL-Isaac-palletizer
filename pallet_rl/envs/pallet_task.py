@@ -289,8 +289,12 @@ class PalletTask(DirectRLEnv):
         # State tensors (all GPU-resident)
         self._init_state_tensors()
         
-        # Action space (gymnasium MultiDiscrete)
-        self.action_space = gym.spaces.MultiDiscrete(list(self.cfg.action_dims))
+        # Action space: continuous Box for rsl_rl compatibility
+        # 5 dimensions: [op, slot, x, y, rot] all in [-1, 1]
+        # Decoding to discrete/continuous sub-actions happens in _apply_action
+        self.action_space = gym.spaces.Box(
+            low=-1.0, high=1.0, shape=(5,), dtype=np.float32
+        )
         
         # Observation space
         obs_dim = getattr(self.cfg, "num_observations", None)
@@ -351,7 +355,7 @@ class PalletTask(DirectRLEnv):
         
         # Action buffer for Isaac Lab API compatibility
         # _pre_physics_step stores actions here, _apply_action reads them
-        self._actions = torch.zeros(n, 5, dtype=torch.long, device=device)
+        self._actions = torch.zeros(n, 5, dtype=torch.float32, device=device)
         
         # Off-map position for inactive boxes (far away to ensure they never pollute heightmap)
         self._inactive_box_pos = torch.tensor([1e6, 1e6, -1e6], device=device)
@@ -1087,29 +1091,25 @@ class PalletTask(DirectRLEnv):
         The framework then calls _apply_action() (no args) to apply them.
         
         Args:
-            actions: Raw actions from the policy (N, num_actions) or (N,)
+            actions: Continuous actions from policy (N, 5) in [-1, 1]
         """
-        # Move actions to device
+        # Ensure on device and clamp to valid range
         actions = actions.to(self._device)
-        
-        # For MultiDiscrete: cast to long (discrete indices)
-        # RSL-RL may pass float actions; our _apply_action expects integers
-        if actions.dtype in (torch.float32, torch.float16, torch.bfloat16):
-            actions = actions.long()
-        
-        # Ensure shape is (num_envs, 5) for MultiDiscrete
-        if actions.dim() == 1:
-            actions = actions.view(self.num_envs, -1)
-        
-        # Store in buffer - _apply_action() will read from here
-        self._actions = actions
+        self._actions = torch.clamp(actions, -1.0, 1.0)
     
     def _apply_action(self) -> None:
         """
-        Apply MultiDiscrete action from self._actions buffer.
+        Apply continuous action by decoding to discrete/continuous sub-actions.
         
         Isaac Lab API: Called by DirectRLEnv.step() after _pre_physics_step().
         Reads actions from self._actions (set by _pre_physics_step).
+        
+        Action decoding from continuous [-1, 1] to original intent:
+        - a[0] -> op_type: discrete {0,1,2} (PLACE, STORE, RETRIEVE)
+        - a[1] -> slot_idx: discrete {0..9}
+        - a[2] -> target_x: continuous [-0.6, +0.6] meters
+        - a[3] -> target_y: continuous [-0.4, +0.4] meters
+        - a[4] -> rot_idx: discrete {0,1} (0° or 90°)
         
         Includes:
         - Height constraint validation
@@ -1118,14 +1118,36 @@ class PalletTask(DirectRLEnv):
         """
         n = self.num_envs
         device = self._device
-        action = self._actions  # Read from buffer
+        action = self._actions  # (N, 5) continuous in [-1, 1]
+        
+        # =====================================================================
+        # Decode continuous actions to discrete/continuous sub-actions
+        # =====================================================================
+        # Helper to map [-1,1] -> {0..K-1}
+        def to_discrete(a: torch.Tensor, k: int) -> torch.Tensor:
+            # Map [-1,1] to [0,1] then scale to [0,K)
+            return torch.floor(((a + 1.0) * 0.5) * k).long().clamp(0, k - 1)
         
         # Parse action components
-        op_type = action[:, 0]
-        slot_idx = action[:, 1]
-        grid_x = action[:, 2]
-        grid_y = action[:, 3]
-        rot_idx = action[:, 4]
+        # Discrete: op_type (3 values), slot_idx (10 values), rot_idx (2 values)
+        op_type = to_discrete(action[:, 0], self.cfg.action_dims[0])  # 3 ops
+        slot_idx = to_discrete(action[:, 1], self.cfg.action_dims[1])  # 10 slots
+        rot_idx = to_discrete(action[:, 4], self.cfg.action_dims[4])  # 2 rotations
+        
+        # Continuous: x, y positions mapped to workspace bounds
+        # x: [-1,1] -> [-half_x, +half_x] where half_x = pallet_size[0]/2
+        # y: [-1,1] -> [-half_y, +half_y] where half_y = pallet_size[1]/2
+        half_x = self.cfg.pallet_size[0] / 2.0  # 0.6m
+        half_y = self.cfg.pallet_size[1] / 2.0  # 0.4m
+        target_x = action[:, 2] * half_x  # [-0.6, +0.6]
+        target_y = action[:, 3] * half_y  # [-0.4, +0.4]
+        
+        # For backward compatibility with grid-based code, compute grid indices
+        # grid_x: 0..15, grid_y: 0..23
+        num_x = self.cfg.action_dims[2]  # 16
+        num_y = self.cfg.action_dims[3]  # 24
+        grid_x = to_discrete(action[:, 2], num_x)
+        grid_y = to_discrete(action[:, 3], num_y)
         
         # =====================================================================
         # Compute target position from action grid
