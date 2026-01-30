@@ -158,6 +158,25 @@ def main():
         cfg["obs_groups"] = obs_groups
         
         # =======================================================================
+        # REQUIRED: class_name inside policy and algorithm sections
+        # rsl_rl OnPolicyRunner expects:
+        #   - cfg["policy"]["class_name"] (e.g., "ActorCritic")
+        #   - cfg["algorithm"]["class_name"] (e.g., "PPO")
+        # Our YAML stores these under runner as policy_class_name / algorithm_class_name.
+        # Inject them into policy/algorithm sections for compatibility.
+        # =======================================================================
+        policy_cfg = cfg.setdefault("policy", {})
+        algo_cfg = cfg.setdefault("algorithm", {})
+        
+        # Get class names from runner section (fallback to defaults)
+        policy_class = runner_cfg.get("policy_class_name", "ActorCritic")
+        algo_class = runner_cfg.get("algorithm_class_name", "PPO")
+        
+        # Inject class_name into policy and algorithm sections
+        policy_cfg.setdefault("class_name", policy_class)
+        algo_cfg.setdefault("class_name", algo_class)
+        
+        # =======================================================================
         # Mirror key runner fields to top-level for rsl_rl versions that expect flat config
         # =======================================================================
         mirror_keys = [
@@ -221,6 +240,8 @@ def main():
     print(f"[DEBUG] rsl_cfg top-level keys: {list(rsl_cfg.keys())}")
     print(f"[DEBUG] top obs_groups: {rsl_cfg.get('obs_groups')}")
     print(f"[DEBUG] runner obs_groups: {rsl_cfg.get('runner', {}).get('obs_groups')}")
+    print(f"[DEBUG] policy.class_name: {rsl_cfg.get('policy', {}).get('class_name')}")
+    print(f"[DEBUG] algorithm.class_name: {rsl_cfg.get('algorithm', {}).get('class_name')}")
     
     runner = OnPolicyRunner(
         env=env,
