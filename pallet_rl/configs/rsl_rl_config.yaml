@@ -26,6 +26,12 @@ runner:
   resume: false
   load_run: -1
   checkpoint: -1
+  
+  # Observation groups mapping (required by RSL-RL OnPolicyRunner)
+  # Maps algorithm obs sets to env observation dict keys returned by _get_observations()
+  obs_groups:
+    policy: ["policy"]
+    critic: ["critic"]
 
 policy:
   # Custom policy class will be injected via monkey-patch
