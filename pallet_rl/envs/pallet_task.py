@@ -24,6 +24,8 @@ from isaaclab.assets import RigidObjectCfg, RigidObjectCollectionCfg
 from isaaclab.sim.spawners import shapes as shape_spawners
 # IsaacLab API update: use CuboidCfg for spawning box primitives
 from isaaclab.sim.spawners.shapes import CuboidCfg
+# Schema configs required to spawn rigid bodies with RigidBodyAPI
+from isaaclab.sim.schemas import RigidBodyPropertiesCfg, CollisionPropertiesCfg, MassPropertiesCfg
 # IsaacLab API update: ground plane spawner moved to from_files module
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 # IsaacLab 5.0: prim utilities for creating container prims before spawning
@@ -56,10 +58,16 @@ class PalletSceneCfg(InteractiveSceneCfg):
     - Boxes: Collection of rigid bodies for stacking
     """
     
-    # Pallet as a simple box at the origin of each env
+    # Pallet as a kinematic rigid body at the origin of each env
+    # NOTE: CuboidCfg requires rigid_props/collision_props/mass_props for RigidBodyAPI
     pallet: RigidObjectCfg = RigidObjectCfg(
         prim_path="{ENV_REGEX_NS}/Pallet",
-        spawn=CuboidCfg(size=(_DEFAULT_PALLET_SIZE[0], _DEFAULT_PALLET_SIZE[1], 0.15)),
+        spawn=CuboidCfg(
+            size=(_DEFAULT_PALLET_SIZE[0], _DEFAULT_PALLET_SIZE[1], 0.15),
+            rigid_props=RigidBodyPropertiesCfg(kinematic_enabled=True),
+            collision_props=CollisionPropertiesCfg(),
+            mass_props=MassPropertiesCfg(mass=25.0),
+        ),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=(0.0, 0.0, 0.075),
             rot=(1.0, 0.0, 0.0, 0.0),  # (w,x,y,z) for Isaac scene
@@ -75,7 +83,12 @@ class PalletSceneCfg(InteractiveSceneCfg):
             f"box_{i}": RigidObjectCfg(
                 prim_path=f"{{ENV_REGEX_NS}}/Boxes/box_{i}",
                 # Size will be overridden at reset based on `box_dims`
-                spawn=CuboidCfg(size=(0.4, 0.3, 0.2)),
+                spawn=CuboidCfg(
+                    size=(0.4, 0.3, 0.2),
+                    rigid_props=RigidBodyPropertiesCfg(),  # Dynamic rigid body
+                    collision_props=CollisionPropertiesCfg(),
+                    mass_props=MassPropertiesCfg(density=250.0),
+                ),
                 init_state=RigidObjectCfg.InitialStateCfg(
                     pos=(0.0, 0.0, 1.5),
                     rot=(1.0, 0.0, 0.0, 0.0),
