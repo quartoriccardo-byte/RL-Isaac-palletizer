@@ -433,12 +433,9 @@ class PalletTask(DirectRLEnv):
         # We create them under the source env path (env_0) which is then cloned.
         source_env_path = self.scene.env_prim_paths[0]
         boxes_path = f"{source_env_path}/Boxes"
-        pallet_path = f"{source_env_path}/Pallet"
 
         if not prim_utils.is_prim_path_valid(boxes_path):
             prim_utils.create_prim(boxes_path, "Xform")
-        if not prim_utils.is_prim_path_valid(pallet_path):
-            prim_utils.create_prim(pallet_path, "Xform")
     
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """
