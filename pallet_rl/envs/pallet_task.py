@@ -248,6 +248,14 @@ class PalletTask(DirectRLEnv):
         # Pre-init setup
         self._device = cfg.sim.device
         
+        # IsaacLab 4.x+ fix: Create container prims BEFORE scene construction.
+        # Spawners using regex-based prim_path (e.g. {ENV_REGEX_NS}/Boxes/box)
+        # require the parent prim to exist in env_0 before InteractiveScene initializes.
+        prim_utils.create_prim(
+            f"{cfg.scene.env_ns}/env_0/Boxes",
+            "Xform"
+        )
+        
         # Call parent
         super().__init__(cfg, render_mode, **kwargs)
         
