@@ -349,6 +349,10 @@ class PalletTask(DirectRLEnv):
         self.last_target_quat = torch.zeros(n, 4, device=device)
         self.last_target_quat[:, 0] = 1.0  # Initialize to identity
         
+        # Action buffer for Isaac Lab API compatibility
+        # _pre_physics_step stores actions here, _apply_action reads them
+        self._actions = torch.zeros(n, 5, dtype=torch.long, device=device)
+        
         # Off-map position for inactive boxes (far away to ensure they never pollute heightmap)
         self._inactive_box_pos = torch.tensor([1e6, 1e6, -1e6], device=device)
         
@@ -1061,8 +1065,8 @@ class PalletTask(DirectRLEnv):
         """
         Called by DirectRLEnv.step() before physics stepping.
         
-        IsaacLab DirectRLEnv requires this method to process actions
-        before the physics simulation advances.
+        Isaac Lab API: This method receives actions and stores them in a buffer.
+        The framework then calls _apply_action() (no args) to apply them.
         
         Args:
             actions: Raw actions from the policy (N, num_actions) or (N,)
@@ -1077,26 +1081,26 @@ class PalletTask(DirectRLEnv):
         
         # Ensure shape is (num_envs, 5) for MultiDiscrete
         if actions.dim() == 1:
-            # Single action dimension - reshape
             actions = actions.view(self.num_envs, -1)
         
-        # Delegate to existing action application logic
-        self._apply_action(actions)
+        # Store in buffer - _apply_action() will read from here
+        self._actions = actions
     
-    def _apply_action(self, action: torch.Tensor):
+    def _apply_action(self) -> None:
         """
-        Apply MultiDiscrete action.
+        Apply MultiDiscrete action from self._actions buffer.
+        
+        Isaac Lab API: Called by DirectRLEnv.step() after _pre_physics_step().
+        Reads actions from self._actions (set by _pre_physics_step).
         
         Includes:
         - Height constraint validation
         - Payload mass updates
         - Settling window arm
-        
-        Args:
-            action: (N, 5) tensor of [Op, Slot, X, Y, Rot]
         """
         n = self.num_envs
         device = self._device
+        action = self._actions  # Read from buffer
         
         # Parse action components
         op_type = action[:, 0]
