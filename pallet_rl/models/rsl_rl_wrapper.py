@@ -143,22 +143,87 @@ class PalletizerActorCritic(ActorCritic):
         # Distribution storage (set by act/evaluate)
         self.distributions: list = []
     
-    def _process_obs(self, obs: torch.Tensor) -> torch.Tensor:
+    def _unwrap_obs(self, obs) -> torch.Tensor:
+        """
+        Unwrap observations from TensorDict/dict to a flat torch.Tensor.
+        
+        RSL-RL OnPolicyRunner may pass observations as:
+        - TensorDict with keys like "policy", "critic"
+        - dict with similar structure
+        - Raw torch.Tensor (legacy behavior)
+        
+        Args:
+            obs: Observation in any of the above formats
+            
+        Returns:
+            torch.Tensor: Flat observation tensor (N, obs_dim)
+        """
+        # Case 1: Already a torch.Tensor - use directly
+        if isinstance(obs, torch.Tensor):
+            result = obs
+        # Case 2: TensorDict (from tensordict library)
+        elif hasattr(obs, 'get') and hasattr(obs, '__class__') and 'TensorDict' in obs.__class__.__name__:
+            # Try known keys in priority order
+            if "policy" in obs.keys():
+                result = obs["policy"]
+            elif "obs" in obs.keys():
+                result = obs["obs"]
+            else:
+                # Fallback: get first tensor value
+                for key in obs.keys():
+                    val = obs[key]
+                    if isinstance(val, torch.Tensor):
+                        result = val
+                        break
+                else:
+                    raise ValueError(f"TensorDict has no extractable tensor. Keys: {list(obs.keys())}")
+        # Case 3: Regular dict
+        elif isinstance(obs, dict):
+            if "policy" in obs:
+                result = obs["policy"]
+            elif "obs" in obs:
+                result = obs["obs"]
+            else:
+                # Fallback: get first tensor value
+                for key, val in obs.items():
+                    if isinstance(val, torch.Tensor):
+                        result = val
+                        break
+                else:
+                    raise ValueError(f"Dict has no extractable tensor. Keys: {list(obs.keys())}")
+        else:
+            raise TypeError(f"Unsupported observation type: {type(obs)}")
+        
+        # Ensure result is a tensor
+        assert isinstance(result, torch.Tensor), f"Expected torch.Tensor, got {type(result)}"
+        
+        # Handle 1D case (single env) by adding batch dimension
+        if result.dim() == 1:
+            result = result.unsqueeze(0)
+        
+        assert result.dim() == 2, f"Expected 2D tensor (N, obs_dim), got shape {result.shape}"
+        
+        return result
+    
+    def _process_obs(self, obs) -> torch.Tensor:
         """
         Process observation into fused feature vector.
         
         Args:
-            obs: Flattened observation (N, 38491)
+            obs: Observation (N, 38491) as Tensor, TensorDict, or dict
             
         Returns:
             fusion: Feature vector (N, 320)
         """
+        # Unwrap to tensor if needed
+        obs_tensor = self._unwrap_obs(obs)
+        
         # Split observation
-        images = obs[:, :self.image_dim]
+        images = obs_tensor[:, :self.image_dim]
         images = images.view(-1, 1, 160, 240)
         
-        # Vector = Buffer (50) + Box dims (3) + Proprio (24) = 77 dims
-        vector = obs[:, self.image_dim:self.image_dim + self.vector_dim]
+        # Vector = Buffer (60) + Box dims (3) + payload/mass/constraints (4) + Proprio (24) = 91 dims
+        vector = obs_tensor[:, self.image_dim:self.image_dim + self.vector_dim]
         
         # Encode
         vis_latent = self.cnn(images)
