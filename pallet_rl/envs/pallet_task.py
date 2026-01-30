@@ -428,6 +428,29 @@ class PalletTask(DirectRLEnv):
         # Initialize extras dict for logging
         self.extras = {}
     
+    def _get_box_pos_quat(self, global_idx: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Get box positions and quaternions by global flat index.
+        
+        Uses reshape-based indexing (not view) to avoid non-contiguous tensor errors.
+        Centralizes RigidObjectCollection data access pattern.
+        
+        Args:
+            global_idx: Flat indices (env_id * max_boxes + box_id), shape (M,), dtype=long
+            
+        Returns:
+            pos: Position tensor (M, 3)
+            quat: Quaternion tensor (M, 4) in (w,x,y,z) format
+        """
+        global_idx = global_idx.to(self._device).long()
+        boxes_data = self.scene["boxes"].data
+        
+        # Use reshape (safe for non-contiguous) instead of view
+        pos = boxes_data.object_pos_w.reshape(-1, 3)[global_idx]
+        quat = boxes_data.object_quat_w.reshape(-1, 4)[global_idx]
+        
+        return pos, quat
+    
     def _setup_scene(self):
         """
         Configure stage-level scene objects (Isaac Lab 5.0 API).
@@ -620,8 +643,7 @@ class PalletTask(DirectRLEnv):
             valid_envs = valid_eval.nonzero(as_tuple=False).flatten()
             eval_box_idx = self.last_moved_box_id[valid_envs]
             global_idx = valid_envs * self.cfg.max_boxes + eval_box_idx
-            current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
-            current_quat = self.scene["boxes"].data.root_quat_w[global_idx]  # (w,x,y,z)
+            current_pos, current_quat = self._get_box_pos_quat(global_idx)
             
             target_pos = self.last_target_pos[valid_envs]
             target_quat = self.last_target_quat[valid_envs]
@@ -716,8 +738,7 @@ class PalletTask(DirectRLEnv):
             
             # Get settled box positions and orientations
             global_idx = ready_envs * self.cfg.max_boxes + eval_box_ids
-            settled_pos = self.scene["boxes"].data.root_pos_w[global_idx]
-            settled_quat = self.scene["boxes"].data.root_quat_w[global_idx]  # (w,x,y,z)
+            settled_pos, settled_quat = self._get_box_pos_quat(global_idx)
             
             # Evaluate success criteria using configured thresholds
             dist = torch.norm(settled_pos[:, :2] - eval_targets[:, :2], dim=-1)
@@ -761,7 +782,7 @@ class PalletTask(DirectRLEnv):
                 valid_settling_envs = settling_envs[valid_box_mask]
                 valid_box_ids = box_ids[valid_box_mask]
                 global_idx = valid_settling_envs * self.cfg.max_boxes + valid_box_ids
-                current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
+                current_pos, _ = self._get_box_pos_quat(global_idx)
                 fell = current_pos[:, 2] < 0.05
                 
                 # Collapse during settling -> terminate and penalize
@@ -779,8 +800,7 @@ class PalletTask(DirectRLEnv):
             box_ids = self._settle_box_id[done_envs]
             global_idx = done_envs * self.cfg.max_boxes + box_ids
             
-            current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
-            current_quat = self.scene["boxes"].data.root_quat_w[global_idx]  # (w,x,y,z)
+            current_pos, current_quat = self._get_box_pos_quat(global_idx)
             target_pos = self._settle_target_pos[done_envs]
             target_quat = self._settle_target_quat[done_envs]
             
@@ -917,13 +937,11 @@ class PalletTask(DirectRLEnv):
             valid_envs = valid_eval.nonzero(as_tuple=False).flatten()
             eval_box_idx = self.last_moved_box_id[valid_envs]
             global_idx = valid_envs * self.cfg.max_boxes + eval_box_idx
-            current_pos = self.scene["boxes"].data.root_pos_w[global_idx]
+            current_pos, current_quat = self._get_box_pos_quat(global_idx)
             
             target_pos = self.last_target_pos[valid_envs]
             dist = torch.norm(current_pos[:, :2] - target_pos[:, :2], dim=-1)
             
-            # Get rotation (to check rotation drift for fails like toppled boxes)
-            current_quat = self.scene["boxes"].data.root_quat_w[global_idx]  # (w,x,y,z)
             # Target rotation was saved for most recent place (or identity if not set)
             target_quat = self._settle_target_quat[valid_envs]
             
@@ -1346,13 +1364,18 @@ class PalletTask(DirectRLEnv):
             
             # Move the stored box off-map (to holding area)
             if "boxes" in self.scene.keys():
-                global_store_idx = store_envs * self.cfg.max_boxes + stored_physical_id
+                global_store_idx = (store_envs * self.cfg.max_boxes + stored_physical_id).long()
                 holding_pos = self._inactive_box_pos.expand(len(store_envs), 3)
                 holding_quat = torch.zeros(len(store_envs), 4, device=device)
                 holding_quat[:, 0] = 1.0  # Identity quaternion
-                self.scene["boxes"].write_root_pose_to_sim(
-                    holding_pos, holding_quat, indices=global_store_idx
-                )
+                
+                # Isaac Lab API: use data buffer + write_data_to_sim (not write_root_pose_to_sim)
+                boxes_data = self.scene["boxes"].data
+                boxes_data.object_pos_w.reshape(-1, 3)[global_store_idx] = holding_pos
+                boxes_data.object_quat_w.reshape(-1, 4)[global_store_idx] = holding_quat
+                boxes_data.object_lin_vel_w.reshape(-1, 3)[global_store_idx] = 0.0
+                boxes_data.object_ang_vel_w.reshape(-1, 3)[global_store_idx] = 0.0
+                self.scene["boxes"].write_data_to_sim()
             
             # STORE does not count as a placement; last_moved_box_id stays -1 for these envs
         
