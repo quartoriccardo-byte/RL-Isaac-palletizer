@@ -1220,14 +1220,36 @@ class PalletTask(DirectRLEnv):
         # STORE and RETRIEVE handle their own box movements in _handle_buffer_actions
         if "boxes" in self.scene.keys() and place_only_mask.any():
             place_envs = place_only_mask.nonzero(as_tuple=False).flatten()
-            global_idx = place_envs * self.cfg.max_boxes + self.box_idx[place_envs]
+            box_ids = self.box_idx[place_envs]
             
-            self.scene["boxes"].write_root_pose_to_sim(
-                target_pos[place_envs], quat[place_envs], indices=global_idx
-            )
+            # Build pose: (num_place_envs, 7) = pos(3) + quat(4)
+            pose = torch.cat([target_pos[place_envs], quat[place_envs]], dim=-1)
             
+            # Build velocity: (num_place_envs, 6) = lin_vel(3) + ang_vel(3)
             vel = torch.zeros(len(place_envs), 6, device=device)
-            self.scene["boxes"].write_root_velocity_to_sim(vel, indices=global_idx)
+            
+            # RigidObjectCollection API: write per-object state
+            # We need to write state for specific (env, object) pairs
+            # Use write_object_state_to_sim with reshaped tensors
+            num_place = len(place_envs)
+            # Reshape to (num_envs, 1, ...) for single object per env
+            pose_reshaped = pose.unsqueeze(1)  # (num_place, 1, 7)
+            vel_reshaped = vel.unsqueeze(1)    # (num_place, 1, 6)
+            
+            # For each placing env, set the state of its specific box
+            # This requires iterating or using advanced indexing
+            # Simpler approach: use set_world_poses with global indices
+            global_idx = place_envs * self.cfg.max_boxes + box_ids
+            
+            # Get data buffer and write directly
+            boxes_data = self.scene["boxes"].data
+            boxes_data.object_pos_w.view(-1, 3)[global_idx] = target_pos[place_envs]
+            boxes_data.object_quat_w.view(-1, 4)[global_idx] = quat[place_envs]
+            boxes_data.object_lin_vel_w.view(-1, 3)[global_idx] = 0.0
+            boxes_data.object_ang_vel_w.view(-1, 3)[global_idx] = 0.0
+            
+            # Write to sim
+            self.scene["boxes"].write_data_to_sim()
             
             # =====================================================================
             # Payload Update for PLACE
@@ -1368,12 +1390,14 @@ class PalletTask(DirectRLEnv):
                 quat[rot_mask, 0] = 0.7071068
                 quat[rot_mask, 3] = 0.7071068
                 
-                self.scene["boxes"].write_root_pose_to_sim(
-                    target_pos, quat, indices=global_retr_idx
-                )
+                # Write to sim using data buffer approach (RigidObjectCollection API)
+                boxes_data = self.scene["boxes"].data
+                boxes_data.object_pos_w.view(-1, 3)[global_retr_idx] = target_pos
+                boxes_data.object_quat_w.view(-1, 4)[global_retr_idx] = quat
+                boxes_data.object_lin_vel_w.view(-1, 3)[global_retr_idx] = 0.0
+                boxes_data.object_ang_vel_w.view(-1, 3)[global_retr_idx] = 0.0
                 
-                vel = torch.zeros(len(retr_envs), 6, device=device)
-                self.scene["boxes"].write_root_velocity_to_sim(vel, indices=global_retr_idx)
+                self.scene["boxes"].write_data_to_sim()
                 
                 # ===============================================================
                 # Arm Settling Window for RETRIEVE
