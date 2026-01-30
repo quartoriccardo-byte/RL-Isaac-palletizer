@@ -469,8 +469,9 @@ class PalletTask(DirectRLEnv):
         
         # 1. Get box poses from scene (GPU tensors)
         if "boxes" in self.scene.keys():
-            all_pos = self.scene["boxes"].data.root_pos_w  # (N*max_boxes, 3)
-            all_rot_wxyz = self.scene["boxes"].data.root_quat_w  # (N*max_boxes, 4) (w,x,y,z)
+            boxes_data = self.scene["boxes"].data
+            all_pos = boxes_data.object_pos_w.reshape(-1, 3)   # (num_envs*num_boxes, 3)
+            all_rot_wxyz = boxes_data.object_quat_w.reshape(-1, 4)  # (num_envs*num_boxes, 4) (w,x,y,z)
             
             box_pos = all_pos.view(n, self.cfg.max_boxes, 3)
             # Convert Isaac (w,x,y,z) → Warp (x,y,z,w) before rasterization
