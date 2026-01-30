@@ -1243,7 +1243,13 @@ class PalletTask(DirectRLEnv):
             
             # Get data buffer and write directly
             boxes_data = self.scene["boxes"].data
-            boxes_data.object_pos_w.view(-1, 3)[global_idx] = target_pos[place_envs]
+            pos = boxes_data.object_pos_w                 # (num_envs, num_boxes, 3)  (tipico)
+            num_boxes = pos.shape[1]
+
+            global_idx = global_idx.to(torch.long)
+            env_ids = global_idx // num_boxes
+            box_ids = global_idx %  num_boxes
+            pos[env_ids, box_ids, :] = target_pos[place_envs]
             boxes_data.object_quat_w.view(-1, 4)[global_idx] = quat[place_envs]
             boxes_data.object_lin_vel_w.view(-1, 3)[global_idx] = 0.0
             boxes_data.object_ang_vel_w.view(-1, 3)[global_idx] = 0.0
