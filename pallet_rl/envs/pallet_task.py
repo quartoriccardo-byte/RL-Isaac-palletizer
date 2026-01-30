@@ -251,8 +251,11 @@ class PalletTask(DirectRLEnv):
         # IsaacLab 4.x+ fix: Create container prims BEFORE scene construction.
         # Spawners using regex-based prim_path (e.g. {ENV_REGEX_NS}/Boxes/box)
         # require the parent prim to exist in env_0 before InteractiveScene initializes.
+        # NOTE: In current IsaacLab versions, env_ns is a property of InteractiveScene (not InteractiveSceneCfg).
+        # InteractiveScene uses "/World/envs" as env namespace.
+        env_ns = getattr(cfg.scene, "env_ns", "/World/envs")        
         prim_utils.create_prim(
-            f"{cfg.scene.env_ns}/env_0/Boxes",
+            f"{env_ns}/env_0/Boxes",
             "Xform"
         )
         
