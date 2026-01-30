@@ -13,6 +13,7 @@ Architecture:
 from __future__ import annotations
 
 import torch
+import numpy as np
 from typing import Dict, Any
 
 # Isaac Lab imports (4.0+ namespace)
@@ -295,7 +296,7 @@ class PalletTask(DirectRLEnv):
         obs_dim = self.cfg.num_observations
         self.observation_space = gym.spaces.Box(
             low=-float('inf'), high=float('inf'),
-            shape=(obs_dim,), dtype=torch.float32
+            shape=(obs_dim,), dtype=np.float32,
         )
     
     def _init_state_tensors(self):
