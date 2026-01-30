@@ -142,6 +142,32 @@ class PalletizerActorCritic(ActorCritic):
         
         # Distribution storage (set by act/evaluate)
         self.distributions: list = []
+        
+        # =====================================================================
+        # RSL-RL ActorCritic normalization interface compatibility
+        # =====================================================================
+        # Since we skip the parent ActorCritic.__init__() (calling nn.Module.__init__
+        # directly), we must manually provide the normalization attributes that
+        # RSL-RL's PPO.update_normalization() expects.
+        # Normalization is disabled for now; can be enabled by implementing
+        # proper running-stats normalizers if needed.
+        self.actor_obs_normalization = False
+        self.critic_obs_normalization = False
+        self.actor_obs_normalizer = None
+        self.critic_obs_normalizer = None
+        self.obs_normalizer = None
+    
+    def update_normalization(self, obs: torch.Tensor) -> None:
+        """
+        No-op observation normalization update.
+        
+        RSL-RL PPO calls this every step. Since we disabled normalization,
+        we override with an empty implementation.
+        
+        Args:
+            obs: Observation tensor (ignored)
+        """
+        pass
     
     def _unwrap_obs(self, obs) -> torch.Tensor:
         """
