@@ -123,57 +123,65 @@ def main():
     # unknown contains Kit/Carb settings like --/rtx/post/dlss/execMode=0
     args, unknown = parse_args()
     
-    # Launch Isaac Lab app (MUST be before other imports that touch simulation)
-    from isaaclab.app import AppLauncher
-    
     # =========================================================================
-    # Pass Kit/Carb args (--/path=value) to SimulationApp at startup
+    # CRITICAL: Inject Kit/Carb args into sys.argv BEFORE importing AppLauncher
     # =========================================================================
-    # NGX/DLSS settings must be applied BEFORE Kit initializes to prevent
-    # CreateFeature spam. AppLauncher reads sys.argv, so we append unknown
-    # args there to ensure they're picked up during app construction.
-    # 
-    # Why post-startup carb.settings.set() doesn't work:
+    # NGX/DLSS settings must be in sys.argv BEFORE Kit initializes.
+    # AppLauncher/SimulationApp reads sys.argv during construction.
+    #
+    # Why post-startup carb.settings.set() doesn't prevent NGX errors:
     # NGX features are created during Kit/RTX initialization. By the time
     # simulation_app exists, NGX has already attempted feature creation.
     # Setting /ngx/enabled=false AFTER app startup is too late.
-    import sys
-    for arg in unknown:
-        if arg.startswith('--/'):
-            # This is a Kit/Carb setting, add to sys.argv for AppLauncher
-            if arg not in sys.argv:
-                sys.argv.append(arg)
-                print(f"[INFO] Appended Kit arg to sys.argv: {arg}")
     
+    # Collect user-provided Kit args from CLI
+    user_kit_args = [arg for arg in unknown if arg.startswith('--/')]
+    user_kit_paths = {arg.split('=')[0] for arg in user_kit_args}
+    
+    # Default Kit args for headless video/camera mode (NGX/DLSS disabling)
+    # Only add if user didn't explicitly provide them
+    default_kit_args = []
+    if args.video or args.enable_cameras:
+        defaults_map = {
+            '--/ngx/enabled': '--/ngx/enabled=false',
+            '--/rtx/post/dlss/enabled': '--/rtx/post/dlss/enabled=false',
+            '--/rtx/post/dlss/execMode': '--/rtx/post/dlss/execMode=0',
+            '--/rtx/post/aa/op': '--/rtx/post/aa/op=0',
+        }
+        for kit_path, kit_arg in defaults_map.items():
+            if kit_path not in user_kit_paths:
+                default_kit_args.append(kit_arg)
+    
+    # Inject all Kit args into sys.argv BEFORE AppLauncher import
+    all_kit_args = user_kit_args + default_kit_args
+    for arg in all_kit_args:
+        if arg not in sys.argv:
+            sys.argv.append(arg)
+            print(f"[INFO] Injected Kit startup arg: {arg}")
+    
+    # Now import and launch Isaac Lab app
+    from isaaclab.app import AppLauncher
     app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
     
     # =========================================================================
-    # Apply RTX/DLSS disabling settings to prevent NGX CreateFeature errors
+    # Post-startup carb settings (fallback reinforcement)
     # =========================================================================
-    # These errors occur in headless mode with cameras enabled due to DLSS/NGX
-    # not being properly initialized. Disabling these features avoids the spam.
     import carb
     try:
         s = carb.settings.get_settings()
-        # Disable NGX globally to prevent CreateFeature errors in headless mode
         s.set("/ngx/enabled", False)
-        print("[INFO] Applied carb setting: /ngx/enabled = False (disable NGX to avoid CreateFeature spam)")
-        s.set("/rtx/post/dlss/execMode", 0)  # Disable DLSS execution
+        s.set("/rtx/post/dlss/execMode", 0)
         s.set("/rtx/ambientOcclusion/enabled", False)
         s.set("/rtx/reflections/enabled", False)
         s.set("/rtx/translucency/enabled", False)
         s.set("/rtx/indirectDiffuse/enabled", False)
-        # Best-effort: disable anti-aliasing completely to avoid NGX
-        # Anti-aliasing mode: 0=Disabled, 1=TAA, 2=FXAA, 3=DLSS, 4=DLAA
-        # Using 0 (Disabled) eliminates all NGX CreateFeature attempts
         s.set("/rtx/post/aa/op", 0)
-        print("[INFO] Applied RTX/DLSS disabling carb settings to reduce NGX errors")
+        print("[INFO] Applied post-startup RTX/DLSS carb settings")
     except Exception as e:
         print(f"[WARN] Failed to apply RTX/DLSS settings: {e}")
     
-    # Apply carb settings from unknown args (guaranteed fallback that always works)
-    # This ensures Kit settings are applied even if AppLauncher didn't handle them
+    # Apply any remaining unknown carb settings
     if unknown:
         apply_carb_settings(unknown)
     
