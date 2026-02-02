@@ -150,8 +150,10 @@ def main():
         s.set("/rtx/reflections/enabled", False)
         s.set("/rtx/translucency/enabled", False)
         s.set("/rtx/indirectDiffuse/enabled", False)
-        # Best-effort: disable DLSS-based anti-aliasing if available
-        s.set("/rtx/post/aa/op", 2)  # 0=Off, 1=FXAA, 2=TAA, 3=DLSS (avoid 3)
+        # Best-effort: disable anti-aliasing completely to avoid NGX
+        # Anti-aliasing mode: 0=Disabled, 1=TAA, 2=FXAA, 3=DLSS, 4=DLAA
+        # Using 0 (Disabled) eliminates all NGX CreateFeature attempts
+        s.set("/rtx/post/aa/op", 0)
         print("[INFO] Applied RTX/DLSS disabling carb settings to reduce NGX errors")
     except Exception as e:
         print(f"[WARN] Failed to apply RTX/DLSS settings: {e}")
