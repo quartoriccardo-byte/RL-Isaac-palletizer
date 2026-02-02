@@ -185,6 +185,32 @@ The script:
 - Wraps it with `RslRlVecEnvWrapper` for RSL-RL
 - Uses `PalletizerActorCritic` for MultiDiscrete action distribution
 
+### Quick Video Smoke Test
+
+To verify video recording works, run a short training with recording enabled:
+
+```bash
+python scripts/train.py \
+  --headless \
+  --device cuda:0 \
+  --num_envs 4 \
+  --max_iterations 3 \
+  --log_dir runs/demo \
+  --experiment_name demo_smoke \
+  --enable_cameras \
+  --video \
+  --video_length 200 \
+  --video_interval 200
+```
+
+This outputs `.mp4` files to:
+
+```text
+runs/demo/demo_smoke/videos/
+```
+
+> **Note**: `--video` automatically enables `--enable_cameras` and forces `render_mode="rgb_array"` even in headless mode. The `RecordVideo` wrapper is applied before `RslRlVecEnvWrapper`.
+
 ---
 
 ## Evaluation

@@ -211,19 +211,52 @@ def main():
     env_cfg.sim.device = args.device
     
     # -------------------------------------------------------------------------
-    # Step 2: Create environment
+    # Step 2: Determine render mode (video recording requires rgb_array)
     # -------------------------------------------------------------------------
-    print("Creating environment...")
-    env = PalletTask(cfg=env_cfg, render_mode=None if args.headless else "rgb_array")
+    # If video recording is requested, force enable cameras and use rgb_array
+    if args.video:
+        args.enable_cameras = True
+        render_mode = "rgb_array"
+        print(f"[INFO] Video recording enabled: render_mode='rgb_array', cameras forced ON")
+    else:
+        render_mode = None if args.headless else "rgb_array"
     
     # -------------------------------------------------------------------------
-    # Step 3: Wrap for RSL-RL
+    # Step 3: Create environment
+    # -------------------------------------------------------------------------
+    print("Creating environment...")
+    env = PalletTask(cfg=env_cfg, render_mode=render_mode)
+    
+    # -------------------------------------------------------------------------
+    # Step 4: Apply RecordVideo wrapper (if video recording is requested)
+    # -------------------------------------------------------------------------
+    # IMPORTANT: RecordVideo must wrap the base Gymnasium env BEFORE RslRlVecEnvWrapper
+    if args.video:
+        from gymnasium.wrappers import RecordVideo
+        
+        video_folder = os.path.join(args.log_dir, args.experiment_name, "videos")
+        os.makedirs(video_folder, exist_ok=True)
+        
+        # step_trigger: record every video_interval steps for video_length frames
+        step_trigger = lambda step: step % args.video_interval == 0
+        
+        env = RecordVideo(
+            env,
+            video_folder=video_folder,
+            step_trigger=step_trigger,
+            video_length=args.video_length,
+            name_prefix="rl-video",
+        )
+        print(f"[INFO] Recording videos to: {video_folder}")
+    
+    # -------------------------------------------------------------------------
+    # Step 5: Wrap for RSL-RL
     # -------------------------------------------------------------------------
     print("Wrapping environment for RSL-RL...")
     env = RslRlVecEnvWrapper(env)
     
     # -------------------------------------------------------------------------
-    # Step 4: Inject custom policy class
+    # Step 6: Inject custom policy class
     # -------------------------------------------------------------------------
     # RSL-RL uses module-level lookup for policy class
     # We monkey-patch to use our custom CNN-based policy
@@ -231,7 +264,7 @@ def main():
     rsl_rl.modules.ActorCritic = PalletizerActorCritic
     
     # -------------------------------------------------------------------------
-    # Step 5: Create RSL-RL runner
+    # Step 7: Create RSL-RL runner
     # -------------------------------------------------------------------------
     print("Initializing RSL-RL runner...")
     rsl_cfg = get_rsl_rl_cfg(args)
@@ -251,14 +284,14 @@ def main():
     )
     
     # -------------------------------------------------------------------------
-    # Step 6: Load checkpoint if resuming
+    # Step 8: Load checkpoint if resuming
     # -------------------------------------------------------------------------
     if args.resume and args.checkpoint is not None:
         print(f"Resuming from checkpoint: {args.checkpoint}")
         runner.load(args.checkpoint)
     
     # -------------------------------------------------------------------------
-    # Step 7: Train!
+    # Step 9: Train!
     # -------------------------------------------------------------------------
     print(f"\nStarting training for {args.max_iterations} iterations...\n")
     
@@ -268,7 +301,7 @@ def main():
     )
     
     # -------------------------------------------------------------------------
-    # Step 8: Cleanup
+    # Step 10: Cleanup
     # -------------------------------------------------------------------------
     print("\nTraining complete. Shutting down...")
     
