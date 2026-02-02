@@ -137,6 +137,25 @@ def main():
         app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
     
+    # =========================================================================
+    # Apply RTX/DLSS disabling settings to prevent NGX CreateFeature errors
+    # =========================================================================
+    # These errors occur in headless mode with cameras enabled due to DLSS/NGX
+    # not being properly initialized. Disabling these features avoids the spam.
+    import carb
+    try:
+        s = carb.settings.get_settings()
+        s.set("/rtx/post/dlss/execMode", 0)  # Disable DLSS execution
+        s.set("/rtx/ambientOcclusion/enabled", False)
+        s.set("/rtx/reflections/enabled", False)
+        s.set("/rtx/translucency/enabled", False)
+        s.set("/rtx/indirectDiffuse/enabled", False)
+        # Best-effort: disable DLSS-based anti-aliasing if available
+        s.set("/rtx/post/aa/op", 2)  # 0=Off, 1=FXAA, 2=TAA, 3=DLSS (avoid 3)
+        print("[INFO] Applied RTX/DLSS disabling carb settings to reduce NGX errors")
+    except Exception as e:
+        print(f"[WARN] Failed to apply RTX/DLSS settings: {e}")
+    
     # Apply carb settings from unknown args (guaranteed fallback that always works)
     # This ensures Kit settings are applied even if AppLauncher didn't handle them
     if unknown:
@@ -271,8 +290,10 @@ def main():
         return cfg
 
     # ==========================================================================
-    # Training
+    # Training (wrapped in try/finally for robust cleanup)
     # ==========================================================================
+    # Ensures env.close() and simulation_app.close() are always called,
+    # which is critical for RecordVideo to finalize/flush video files.
 
     print(f"\n{'='*60}")
     print("Isaac Lab 4.0+ Palletizer Training")
@@ -283,110 +304,129 @@ def main():
     print(f"Headless: {args.headless}")
     print(f"{'='*60}\n")
     
-    # -------------------------------------------------------------------------
-    # Step 1: Create environment configuration
-    # -------------------------------------------------------------------------
-    env_cfg = PalletTaskCfg()
-    env_cfg.scene.num_envs = args.num_envs
-    env_cfg.sim.device = args.device
+    env = None
+    try:
     
-    # -------------------------------------------------------------------------
-    # Step 2: Determine render mode (video recording requires rgb_array)
-    # -------------------------------------------------------------------------
-    # If video recording is requested, force enable cameras and use rgb_array
-    if args.video:
-        args.enable_cameras = True
-        render_mode = "rgb_array"
-        print(f"[INFO] Video recording enabled: render_mode='rgb_array', cameras forced ON")
-    else:
-        render_mode = None if args.headless else "rgb_array"
+        # ---------------------------------------------------------------------
+        # Step 1: Create environment configuration
+        # ---------------------------------------------------------------------
+        env_cfg = PalletTaskCfg()
+        env_cfg.scene.num_envs = args.num_envs
+        env_cfg.sim.device = args.device
     
-    # -------------------------------------------------------------------------
-    # Step 3: Create environment
-    # -------------------------------------------------------------------------
-    print("Creating environment...")
-    env = PalletTask(cfg=env_cfg, render_mode=render_mode)
-    
-    # -------------------------------------------------------------------------
-    # Step 4: Apply RecordVideo wrapper (if video recording is requested)
-    # -------------------------------------------------------------------------
-    # IMPORTANT: RecordVideo must wrap the base Gymnasium env BEFORE RslRlVecEnvWrapper
-    if args.video:
-        from gymnasium.wrappers import RecordVideo
+        # ---------------------------------------------------------------------
+        # Step 2: Determine render mode (video recording requires rgb_array)
+        # ---------------------------------------------------------------------
+        # If video recording is requested, force enable cameras and use rgb_array
+        if args.video:
+            args.enable_cameras = True
+            render_mode = "rgb_array"
+            print(f"[INFO] Video recording enabled: render_mode='rgb_array', cameras forced ON")
+        else:
+            render_mode = None if args.headless else "rgb_array"
         
-        video_folder = os.path.join(args.log_dir, args.experiment_name, "videos")
-        os.makedirs(video_folder, exist_ok=True)
+        # ---------------------------------------------------------------------
+        # Step 3: Create environment
+        # ---------------------------------------------------------------------
+        print("Creating environment...")
+        env = PalletTask(cfg=env_cfg, render_mode=render_mode)
         
-        # step_trigger: record every video_interval steps for video_length frames
-        step_trigger = lambda step: step % args.video_interval == 0
+        # ---------------------------------------------------------------------
+        # Step 4: Apply RecordVideo wrapper (if video recording is requested)
+        # ---------------------------------------------------------------------
+        # IMPORTANT: RecordVideo must wrap the base Gymnasium env BEFORE RslRlVecEnvWrapper
+        if args.video:
+            from gymnasium.wrappers import RecordVideo
+            
+            video_folder = os.path.join(args.log_dir, args.experiment_name, "videos")
+            os.makedirs(video_folder, exist_ok=True)
+            
+            # step_trigger: record every video_interval steps for video_length frames
+            step_trigger = lambda step: step % args.video_interval == 0
+            
+            env = RecordVideo(
+                env,
+                video_folder=video_folder,
+                step_trigger=step_trigger,
+                video_length=args.video_length,
+                name_prefix="rl-video",
+            )
+            print(f"[INFO] Recording videos to: {video_folder}")
         
-        env = RecordVideo(
-            env,
-            video_folder=video_folder,
-            step_trigger=step_trigger,
-            video_length=args.video_length,
-            name_prefix="rl-video",
+        # ---------------------------------------------------------------------
+        # Step 5: Wrap for RSL-RL
+        # ---------------------------------------------------------------------
+        print("Wrapping environment for RSL-RL...")
+        env = RslRlVecEnvWrapper(env)
+        
+        # ---------------------------------------------------------------------
+        # Step 6: Inject custom policy class
+        # ---------------------------------------------------------------------
+        # RSL-RL uses module-level lookup for policy class
+        # We monkey-patch to use our custom CNN-based policy
+        import rsl_rl.modules
+        rsl_rl.modules.ActorCritic = PalletizerActorCritic
+        
+        # ---------------------------------------------------------------------
+        # Step 7: Create RSL-RL runner
+        # ---------------------------------------------------------------------
+        print("Initializing RSL-RL runner...")
+        rsl_cfg = get_rsl_rl_cfg(args)
+        
+        # DEBUG: Verify obs_groups is present at required locations
+        print(f"[DEBUG] rsl_cfg top-level keys: {list(rsl_cfg.keys())}")
+        print(f"[DEBUG] top obs_groups: {rsl_cfg.get('obs_groups')}")
+        print(f"[DEBUG] runner obs_groups: {rsl_cfg.get('runner', {}).get('obs_groups')}")
+        print(f"[DEBUG] policy.class_name: {rsl_cfg.get('policy', {}).get('class_name')}")
+        print(f"[DEBUG] algorithm.class_name: {rsl_cfg.get('algorithm', {}).get('class_name')}")
+        
+        runner = OnPolicyRunner(
+            env=env,
+            train_cfg=rsl_cfg,
+            log_dir=args.log_dir,
+            device=args.device
         )
-        print(f"[INFO] Recording videos to: {video_folder}")
-    
-    # -------------------------------------------------------------------------
-    # Step 5: Wrap for RSL-RL
-    # -------------------------------------------------------------------------
-    print("Wrapping environment for RSL-RL...")
-    env = RslRlVecEnvWrapper(env)
-    
-    # -------------------------------------------------------------------------
-    # Step 6: Inject custom policy class
-    # -------------------------------------------------------------------------
-    # RSL-RL uses module-level lookup for policy class
-    # We monkey-patch to use our custom CNN-based policy
-    import rsl_rl.modules
-    rsl_rl.modules.ActorCritic = PalletizerActorCritic
-    
-    # -------------------------------------------------------------------------
-    # Step 7: Create RSL-RL runner
-    # -------------------------------------------------------------------------
-    print("Initializing RSL-RL runner...")
-    rsl_cfg = get_rsl_rl_cfg(args)
-    
-    # DEBUG: Verify obs_groups is present at required locations
-    print(f"[DEBUG] rsl_cfg top-level keys: {list(rsl_cfg.keys())}")
-    print(f"[DEBUG] top obs_groups: {rsl_cfg.get('obs_groups')}")
-    print(f"[DEBUG] runner obs_groups: {rsl_cfg.get('runner', {}).get('obs_groups')}")
-    print(f"[DEBUG] policy.class_name: {rsl_cfg.get('policy', {}).get('class_name')}")
-    print(f"[DEBUG] algorithm.class_name: {rsl_cfg.get('algorithm', {}).get('class_name')}")
-    
-    runner = OnPolicyRunner(
-        env=env,
-        train_cfg=rsl_cfg,
-        log_dir=args.log_dir,
-        device=args.device
-    )
-    
-    # -------------------------------------------------------------------------
-    # Step 8: Load checkpoint if resuming
-    # -------------------------------------------------------------------------
-    if args.resume and args.checkpoint is not None:
-        print(f"Resuming from checkpoint: {args.checkpoint}")
-        runner.load(args.checkpoint)
-    
-    # -------------------------------------------------------------------------
-    # Step 9: Train!
-    # -------------------------------------------------------------------------
-    print(f"\nStarting training for {args.max_iterations} iterations...\n")
-    
-    runner.learn(
-        num_learning_iterations=args.max_iterations,
-        init_at_random_ep_len=True
-    )
-    
-    # -------------------------------------------------------------------------
-    # Step 10: Cleanup
-    # -------------------------------------------------------------------------
-    print("\nTraining complete. Shutting down...")
-    
-    if simulation_app is not None:
-        simulation_app.close()
+        
+        # ---------------------------------------------------------------------
+        # Step 8: Load checkpoint if resuming
+        # ---------------------------------------------------------------------
+        if args.resume and args.checkpoint is not None:
+            print(f"Resuming from checkpoint: {args.checkpoint}")
+            runner.load(args.checkpoint)
+        
+        # ---------------------------------------------------------------------
+        # Step 9: Train!
+        # ---------------------------------------------------------------------
+        print(f"\nStarting training for {args.max_iterations} iterations...\n")
+        
+        runner.learn(
+            num_learning_iterations=args.max_iterations,
+            init_at_random_ep_len=True
+        )
+        
+        print("\nTraining complete.")
+        
+    finally:
+        # =====================================================================
+        # Step 10: Robust Cleanup (always executed)
+        # =====================================================================
+        # Critical: close env first to finalize RecordVideo writers,
+        # then close simulation_app. This prevents hangs and ensures
+        # video files are properly saved.
+        print("\nShutting down...")
+        
+        if env is not None:
+            try:
+                env.close()
+                print("[INFO] Environment closed successfully.")
+            except Exception as e:
+                print(f"[WARN] env.close() failed: {e}")
+        
+        try:
+            simulation_app.close()
+            print("[INFO] Simulation app closed successfully.")
+        except Exception as e:
+            print(f"[WARN] simulation_app.close() failed: {e}")
 
 
 if __name__ == "__main__":
