@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 
 # =============================================================================
@@ -21,6 +22,12 @@ import sys
 # =============================================================================
 
 def parse_args():
+    """Parse command line arguments, allowing unknown Kit/Carb settings.
+    
+    Returns:
+        tuple: (args, unknown) where args is the Namespace of known args,
+               and unknown is a list of unrecognized arguments (e.g., --/rtx/...).
+    """
     parser = argparse.ArgumentParser(description="Train Palletizer with RSL-RL")
     
     # Simulation
@@ -45,7 +52,65 @@ def parse_args():
     parser.add_argument("--video_length", type=int, default=200, help="Video length in steps")
     parser.add_argument("--video_interval", type=int, default=2000, help="Video recording interval")
     
-    return parser.parse_args()
+    # Use parse_known_args to accept unknown Kit/Carb settings (--/path=value)
+    args, unknown = parser.parse_known_args()
+    return args, unknown
+
+
+def parse_carb_setting(value_str: str):
+    """Parse a carb setting value string to appropriate Python type.
+    
+    Converts:
+        - 'true'/'false' -> bool
+        - integer strings -> int
+        - float strings -> float
+        - otherwise -> str
+    """
+    # Boolean
+    if value_str.lower() == 'true':
+        return True
+    if value_str.lower() == 'false':
+        return False
+    
+    # Integer
+    try:
+        return int(value_str)
+    except ValueError:
+        pass
+    
+    # Float
+    try:
+        return float(value_str)
+    except ValueError:
+        pass
+    
+    # String fallback
+    return value_str
+
+
+def apply_carb_settings(unknown_args: list):
+    """Apply Kit/Carb settings from unknown arguments.
+    
+    Parses arguments of the form --/some/path=value and applies them
+    via carb.settings.get_settings().set().
+    
+    Args:
+        unknown_args: List of unrecognized CLI arguments.
+    """
+    import carb
+    settings = carb.settings.get_settings()
+    
+    # Pattern: --/some/path=value
+    pattern = re.compile(r'^--(/[^=]+)=(.*)$')
+    
+    for arg in unknown_args:
+        match = pattern.match(arg)
+        if match:
+            path = match.group(1)
+            value_str = match.group(2)
+            value = parse_carb_setting(value_str)
+            settings.set(path, value)
+            print(f"[INFO] Applied carb setting: {path} = {value}")
 
 
 # =============================================================================
@@ -55,12 +120,27 @@ def parse_args():
 def main():
     """Main training entry point."""
     # Parse arguments (inside main to avoid import-time side effects)
-    args = parse_args()
+    # unknown contains Kit/Carb settings like --/rtx/post/dlss/execMode=0
+    args, unknown = parse_args()
     
     # Launch Isaac Lab app (MUST be before other imports that touch simulation)
     from isaaclab.app import AppLauncher
-    app_launcher = AppLauncher(args)
+    
+    # Try to pass unknown args to AppLauncher if it supports extra_args parameter
+    # This allows Kit settings to be applied during app initialization
+    import inspect
+    launcher_sig = inspect.signature(AppLauncher.__init__)
+    if 'extra_args' in launcher_sig.parameters:
+        app_launcher = AppLauncher(args, extra_args=unknown)
+    else:
+        # Fallback: AppLauncher doesn't support extra_args, just pass known args
+        app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
+    
+    # Apply carb settings from unknown args (guaranteed fallback that always works)
+    # This ensures Kit settings are applied even if AppLauncher didn't handle them
+    if unknown:
+        apply_carb_settings(unknown)
     
     # ==========================================================================
     # IMPORTS AFTER AppLauncher (required for Isaac Lab compatibility)
