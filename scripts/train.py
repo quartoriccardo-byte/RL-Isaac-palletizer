@@ -126,15 +126,26 @@ def main():
     # Launch Isaac Lab app (MUST be before other imports that touch simulation)
     from isaaclab.app import AppLauncher
     
-    # Try to pass unknown args to AppLauncher if it supports extra_args parameter
-    # This allows Kit settings to be applied during app initialization
-    import inspect
-    launcher_sig = inspect.signature(AppLauncher.__init__)
-    if 'extra_args' in launcher_sig.parameters:
-        app_launcher = AppLauncher(args, extra_args=unknown)
-    else:
-        # Fallback: AppLauncher doesn't support extra_args, just pass known args
-        app_launcher = AppLauncher(args)
+    # =========================================================================
+    # Pass Kit/Carb args (--/path=value) to SimulationApp at startup
+    # =========================================================================
+    # NGX/DLSS settings must be applied BEFORE Kit initializes to prevent
+    # CreateFeature spam. AppLauncher reads sys.argv, so we append unknown
+    # args there to ensure they're picked up during app construction.
+    # 
+    # Why post-startup carb.settings.set() doesn't work:
+    # NGX features are created during Kit/RTX initialization. By the time
+    # simulation_app exists, NGX has already attempted feature creation.
+    # Setting /ngx/enabled=false AFTER app startup is too late.
+    import sys
+    for arg in unknown:
+        if arg.startswith('--/'):
+            # This is a Kit/Carb setting, add to sys.argv for AppLauncher
+            if arg not in sys.argv:
+                sys.argv.append(arg)
+                print(f"[INFO] Appended Kit arg to sys.argv: {arg}")
+    
+    app_launcher = AppLauncher(args)
     simulation_app = app_launcher.app
     
     # =========================================================================
