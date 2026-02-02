@@ -145,6 +145,9 @@ def main():
     import carb
     try:
         s = carb.settings.get_settings()
+        # Disable NGX globally to prevent CreateFeature errors in headless mode
+        s.set("/ngx/enabled", False)
+        print("[INFO] Applied carb setting: /ngx/enabled = False (disable NGX to avoid CreateFeature spam)")
         s.set("/rtx/post/dlss/execMode", 0)  # Disable DLSS execution
         s.set("/rtx/ambientOcclusion/enabled", False)
         s.set("/rtx/reflections/enabled", False)
