@@ -139,7 +139,6 @@ class PalletTaskCfg(DirectRLEnvCfg):
         device="cuda:0",
         # Render settings to disable NGX/DLSS and reduce VRAM usage
         render=RenderCfg(
-            enable_dlss=False,
             dlss_mode=0,
             enable_dl_denoiser=False,
             carb_settings={
