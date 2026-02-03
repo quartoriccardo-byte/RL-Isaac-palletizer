@@ -19,7 +19,7 @@ from typing import Dict, Any
 # Isaac Lab imports (4.0+ namespace)
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import SimulationCfg
+from isaaclab.sim import SimulationCfg, RenderCfg
 from isaaclab.utils import configclass
 from isaaclab.assets import RigidObjectCfg, RigidObjectCollectionCfg
 from isaaclab.sim.spawners import shapes as shape_spawners
@@ -136,7 +136,26 @@ class PalletTaskCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(
         dt=1/60.0,
         render_interval=2,
-        device="cuda:0"
+        device="cuda:0",
+        # Render settings to disable NGX/DLSS and reduce VRAM usage
+        render=RenderCfg(
+            enable_dlss=False,
+            dlss_mode=0,
+            enable_dl_denoiser=False,
+            carb_settings={
+                # Core NGX/DLSS disable
+                "/ngx/enabled": False,
+                "/rtx/post/dlss/enabled": False,
+                "/rtx-transient/dlssg/enabled": False,
+                "/rtx-transient/dldenoiser/enabled": False,
+                # Disable multi-GPU to reduce VRAM pressure
+                "/renderer/multiGpu/enabled": False,
+                # Reduce VRAM-heavy features
+                "/rtx/translucency/enabled": False,
+                "/rtx/reflections/enabled": False,
+                "/rtx/indirectDiffuse/enabled": False,
+            },
+        ),
     )
     
     # Scene configuration (IsaacLab 5.0: assets defined in PalletSceneCfg)

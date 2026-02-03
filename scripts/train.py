@@ -145,14 +145,23 @@ def main():
     default_kit_args = []
     if args.video or args.enable_cameras:
         defaults_map = {
+            # Core NGX/DLSS disable
             '--/ngx/enabled': '--/ngx/enabled=false',
             '--/rtx/post/dlss/enabled': '--/rtx/post/dlss/enabled=false',
             '--/rtx/post/dlss/execMode': '--/rtx/post/dlss/execMode=0',
-            # Use FXAA (op=2) instead of disabled (op=0) to avoid NGX spam
-            # while still getting anti-aliasing. TAA=1, FXAA=2, DLSS=3
-            '--/rtx/post/aa/op': '--/rtx/post/aa/op=2',
+            # Disable AA entirely (avoid NGX-related AA)
+            '--/rtx/post/aa/op': '--/rtx/post/aa/op=0',
             # Enable tonemapping for proper brightness in headless renders
             '--/rtx/post/tonemap/enabled': '--/rtx/post/tonemap/enabled=true',
+            # Disable DLSS Frame Generation and DL denoiser (NGX features)
+            '--/rtx-transient/dlssg/enabled': '--/rtx-transient/dlssg/enabled=false',
+            '--/rtx-transient/dldenoiser/enabled': '--/rtx-transient/dldenoiser/enabled=false',
+            # Disable multi-GPU to reduce VRAM pressure
+            '--/renderer/multiGpu/enabled': '--/renderer/multiGpu/enabled=false',
+            # Reduce RTX features that consume VRAM
+            '--/rtx/translucency/enabled': '--/rtx/translucency/enabled=false',
+            '--/rtx/reflections/enabled': '--/rtx/reflections/enabled=false',
+            '--/rtx/indirectDiffuse/enabled': '--/rtx/indirectDiffuse/enabled=false',
         }
         for kit_path, kit_arg in defaults_map.items():
             if kit_path not in user_kit_paths:
