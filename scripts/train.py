@@ -151,8 +151,8 @@ def main():
             '--/rtx/post/dlss/execMode': '--/rtx/post/dlss/execMode=0',
             # Disable AA entirely (avoid NGX-related AA)
             '--/rtx/post/aa/op': '--/rtx/post/aa/op=0',
-            # Enable tonemapping for proper brightness in headless renders
-            '--/rtx/post/tonemap/enabled': '--/rtx/post/tonemap/enabled=true',
+            # NOTE: Tonemapping NOT force-enabled - causes white frames with HydraStorm
+            # User can enable via --/rtx/post/tonemap/enabled=true if needed
             # Disable DLSS Frame Generation and DL denoiser (NGX features)
             '--/rtx-transient/dlssg/enabled': '--/rtx-transient/dlssg/enabled=false',
             '--/rtx-transient/dldenoiser/enabled': '--/rtx-transient/dldenoiser/enabled=false',
@@ -243,19 +243,70 @@ def main():
         - float32/float64 arrays in [0, 1] range
         
         This wrapper normalizes all outputs to uint8 [0, 255] numpy arrays.
+        
+        Debugging: Set DUMP_FRAMES=1 and optionally DUMP_DIR=/path to dump
+        raw and post-conversion frames to disk (first 50 frames only).
         """
+        
+        def __init__(self, env):
+            super().__init__(env)
+            # Frame dumping for debugging
+            self._dump_frames = os.environ.get('DUMP_FRAMES', '0') == '1'
+            self._dump_dir = os.environ.get('DUMP_DIR', '/tmp/isaac_frames')
+            self._frame_count = 0
+            self._max_dump_frames = 50
+            
+            if self._dump_frames:
+                os.makedirs(self._dump_dir, exist_ok=True)
+                print(f"[RenderNormWrapper] Frame dumping enabled: {self._dump_dir}")
         
         def render(self):
             frame = self.env.render()
             if frame is None:
                 return None
+            
+            # Dump raw frame before any conversion
+            if self._dump_frames and self._frame_count < self._max_dump_frames:
+                self._dump_frame(frame, f"raw_{self._frame_count:04d}")
+            
             # Convert torch tensor to numpy
             if hasattr(frame, 'cpu'):
                 frame = frame.cpu().numpy()
+            
             # Convert float [0,1] to uint8 [0,255]
             if frame.dtype in (np.float32, np.float64):
                 frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
+            # Already uint8 - pass through unchanged
+            
+            # Dump post-conversion frame
+            if self._dump_frames and self._frame_count < self._max_dump_frames:
+                self._dump_frame(frame, f"post_{self._frame_count:04d}")
+                self._frame_count += 1
+            
             return frame
+        
+        def _dump_frame(self, frame, name: str):
+            """Save frame to disk as PNG for debugging."""
+            try:
+                import cv2
+                # Handle torch tensor
+                if hasattr(frame, 'cpu'):
+                    arr = frame.cpu().numpy()
+                else:
+                    arr = np.array(frame)
+                
+                # Convert float to uint8 if needed
+                if arr.dtype in (np.float32, np.float64):
+                    arr = (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8)
+                
+                # OpenCV expects BGR
+                if len(arr.shape) == 3 and arr.shape[-1] == 3:
+                    arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+                
+                path = os.path.join(self._dump_dir, f"{name}.png")
+                cv2.imwrite(path, arr)
+            except Exception as e:
+                print(f"[RenderNormWrapper] Failed to dump {name}: {e}")
 
     # ==========================================================================
     # RSL-RL Configuration
