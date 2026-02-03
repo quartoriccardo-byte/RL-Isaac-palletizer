@@ -148,7 +148,11 @@ def main():
             '--/ngx/enabled': '--/ngx/enabled=false',
             '--/rtx/post/dlss/enabled': '--/rtx/post/dlss/enabled=false',
             '--/rtx/post/dlss/execMode': '--/rtx/post/dlss/execMode=0',
-            '--/rtx/post/aa/op': '--/rtx/post/aa/op=0',
+            # Use FXAA (op=2) instead of disabled (op=0) to avoid NGX spam
+            # while still getting anti-aliasing. TAA=1, FXAA=2, DLSS=3
+            '--/rtx/post/aa/op': '--/rtx/post/aa/op=2',
+            # Enable tonemapping for proper brightness in headless renders
+            '--/rtx/post/tonemap/enabled': '--/rtx/post/tonemap/enabled=true',
         }
         for kit_path, kit_arg in defaults_map.items():
             if kit_path not in user_kit_paths:
