@@ -489,18 +489,34 @@ class PalletTask(DirectRLEnv):
         # Stage Lighting for Headless Rendering
         # =====================================================================
         # Without lighting, RTX renders are completely black even with cameras.
-        # Add a DomeLight to provide ambient illumination for video recording.
+        # Add DomeLight (ambient fill) and DistantLight (directional key light).
+        
+        # DomeLight: high-intensity ambient fill
         light_path = "/World/DomeLight"
         if not prim_utils.is_prim_path_valid(light_path):
             prim_utils.create_prim(
                 light_path,
                 "DomeLight",
                 attributes={
-                    "inputs:intensity": 1000.0,
+                    "inputs:intensity": 3000.0,
                     "inputs:color": (1.0, 1.0, 1.0),
                 },
             )
             print("[INFO] Created DomeLight at /World/DomeLight for headless rendering")
+        
+        # DistantLight: directional key light for shadows and depth perception
+        dist_light_path = "/World/DistantLight"
+        if not prim_utils.is_prim_path_valid(dist_light_path):
+            prim_utils.create_prim(
+                dist_light_path,
+                "DistantLight",
+                attributes={
+                    "inputs:intensity": 5000.0,
+                    "inputs:color": (1.0, 0.98, 0.95),
+                    "inputs:angle": 1.0,
+                },
+            )
+            print("[INFO] Created DistantLight at /World/DistantLight for headless rendering")
 
         # IsaacLab 5.0: Create container Xform prims for rigid object collections.
         # RigidObjectCollection expects parent prims to exist before spawning.

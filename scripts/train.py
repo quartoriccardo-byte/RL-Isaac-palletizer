@@ -217,6 +217,31 @@ def main():
     from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
     from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
 
+    # =========================================================================
+    # RenderNormWrapper: Ensure render() returns uint8 RGB for RecordVideo
+    # =========================================================================
+    class RenderNormWrapper(gym.Wrapper):
+        """Lightweight wrapper ensuring render() returns uint8 RGB numpy array.
+        
+        RecordVideo expects uint8 numpy arrays, but Isaac Lab may return:
+        - torch.Tensor (GPU or CPU)
+        - float32/float64 arrays in [0, 1] range
+        
+        This wrapper normalizes all outputs to uint8 [0, 255] numpy arrays.
+        """
+        
+        def render(self):
+            frame = self.env.render()
+            if frame is None:
+                return None
+            # Convert torch tensor to numpy
+            if hasattr(frame, 'cpu'):
+                frame = frame.cpu().numpy()
+            # Convert float [0,1] to uint8 [0,255]
+            if frame.dtype in (np.float32, np.float64):
+                frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
+            return frame
+
     # ==========================================================================
     # RSL-RL Configuration
     # ==========================================================================
@@ -358,7 +383,8 @@ def main():
         # ---------------------------------------------------------------------
         # Step 4: Apply RecordVideo wrapper (if video recording is requested)
         # ---------------------------------------------------------------------
-        # IMPORTANT: RecordVideo must wrap the base Gymnasium env BEFORE RslRlVecEnvWrapper
+        # IMPORTANT: RenderNormWrapper ensures uint8 RGB output for RecordVideo.
+        # RecordVideo must wrap BEFORE RslRlVecEnvWrapper.
         if args.video:
             from gymnasium.wrappers import RecordVideo
             
@@ -367,6 +393,9 @@ def main():
             
             # step_trigger: record every video_interval steps for video_length frames
             step_trigger = lambda step: step % args.video_interval == 0
+            
+            # Wrap with RenderNormWrapper first to ensure uint8 RGB for RecordVideo
+            env = RenderNormWrapper(env)
             
             env = RecordVideo(
                 env,
