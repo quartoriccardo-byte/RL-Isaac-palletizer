@@ -16,6 +16,8 @@ import argparse
 import os
 import re
 import sys
+import gymnasium as gym
+import numpy as np
 
 # =============================================================================
 # Step 1: Parse arguments (no side effects at import time)
