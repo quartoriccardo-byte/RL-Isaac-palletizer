@@ -31,6 +31,9 @@ from isaaclab.sim.schemas import RigidBodyPropertiesCfg, CollisionPropertiesCfg,
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 # IsaacLab 5.0: prim utilities for creating container prims before spawning
 from isaacsim.core.utils import prims as prim_utils
+# Camera sensor for headless video recording
+from isaaclab.sensors import CameraCfg
+from isaaclab.sim.spawners.sensors import PinholeCameraCfg
 
 import gymnasium as gym
 
@@ -99,6 +102,25 @@ class PalletSceneCfg(InteractiveSceneCfg):
             )
             for i in range(_DEFAULT_MAX_BOXES)
         },
+    )
+    
+    # Camera sensor for video recording in headless mode
+    # Positioned to view the pallet from an elevated angle
+    camera: CameraCfg = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/Camera",
+        spawn=PinholeCameraCfg(
+            focal_length=24.0,
+            horizontal_aperture=20.955,
+        ),
+        offset=CameraCfg.OffsetCfg(
+            pos=(2.5, 2.5, 2.0),  # Elevated position looking down at pallet
+            rot=(0.6533, 0.2706, 0.2706, 0.6533),  # Look at origin (~45° down)
+            convention="ros",
+        ),
+        width=1280,
+        height=720,
+        data_types=["rgb"],
+        update_period=0.0,  # Update every frame
     )
 
 
@@ -314,6 +336,59 @@ class PalletTask(DirectRLEnv):
             shape=(int(obs_dim),),
             dtype=np.float32,
         )
+        
+        # Store render mode for render() implementation
+        self._render_mode = render_mode
+
+    def render(self):
+        """Return RGB frame from camera sensor for video recording.
+        
+        In headless mode, env.render() returns black without an explicit camera.
+        This method reads the camera sensor's RGB output and converts it to
+        a uint8 numpy array suitable for gymnasium.wrappers.RecordVideo.
+        
+        Returns:
+            np.ndarray: RGB frame (H, W, 3) as uint8, or None if no camera.
+        """
+        if self._render_mode != "rgb_array":
+            return None
+        
+        # Check if camera sensor exists in scene
+        if "camera" not in self.scene.keys():
+            return None
+        
+        try:
+            # Get camera sensor
+            camera = self.scene["camera"]
+            
+            # Force update the camera buffer
+            camera.update(dt=self.step_dt)
+            
+            # Get RGB data - shape: (num_envs, H, W, 3) or (num_envs, H, W, 4)
+            rgb_data = camera.data.output.get("rgb")
+            if rgb_data is None:
+                return None
+            
+            # Only return env_0's frame for video recording
+            frame = rgb_data[0]  # First environment
+            
+            # Convert torch tensor to numpy
+            if hasattr(frame, 'cpu'):
+                frame = frame.cpu().numpy()
+            
+            # Handle RGBA -> RGB (drop alpha channel if present)
+            if frame.shape[-1] == 4:
+                frame = frame[..., :3]
+            
+            # Convert float [0,1] to uint8 [0,255] if needed
+            if frame.dtype in (np.float32, np.float64):
+                frame = (np.clip(frame, 0.0, 1.0) * 255).astype(np.uint8)
+            
+            return frame
+            
+        except Exception as e:
+            print(f"[WARN] render() failed: {e}")
+            return None
 
     def _init_state_tensors(self):
         """Initialize all state tensors on GPU."""
