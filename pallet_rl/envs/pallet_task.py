@@ -105,7 +105,8 @@ class PalletSceneCfg(InteractiveSceneCfg):
     )
     
     # Camera sensor for video recording in headless mode
-    # Positioned to view the pallet from an elevated angle
+    # NOTE: Initial pose is neutral (identity quat). Runtime code will call
+    # set_world_poses_from_view() to properly aim at the pallet center.
     camera: CameraCfg = CameraCfg(
         prim_path="{ENV_REGEX_NS}/Camera",
         spawn=PinholeCameraCfg(
@@ -113,13 +114,13 @@ class PalletSceneCfg(InteractiveSceneCfg):
             horizontal_aperture=20.955,
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(2.5, 2.5, 2.0),  # Elevated position looking down at pallet
-            rot=(0.6533, 0.2706, 0.2706, 0.6533),  # Look at origin (~45° down)
-            convention="ros",
+            pos=(2.5, 2.5, 2.0),  # Initial offset (will be overridden at runtime)
+            rot=(1.0, 0.0, 0.0, 0.0),  # Identity quaternion - neutral pose
+            convention="ros",  # ROS: forward +Z, up -Y
         ),
         width=1280,
         height=720,
-        data_types=["rgb"],
+        data_types=["rgb", "distance_to_image_plane"],  # Add depth for debug
         update_period=0.0,  # Update every frame
     )
 
@@ -357,6 +358,52 @@ class PalletTask(DirectRLEnv):
         
         # Store render mode for render() implementation
         self._render_mode = render_mode
+        
+        # Setup camera look-at pose if rendering is enabled
+        if self._render_mode == "rgb_array":
+            self._setup_camera_lookat()
+    
+    def _setup_camera_lookat(self):
+        """Set camera pose using look-at API for robust framing.
+        
+        Uses set_world_poses_from_view() which computes the correct quaternion
+        from eye position and look-at target. This avoids quaternion convention
+        issues that cause gray frames (camera looking away from scene).
+        
+        Camera is positioned above and offset from the pallet center to show:
+        - The entire pallet area
+        - Boxes being placed/spawned
+        """
+        if "camera" not in self.scene.keys():
+            print("[CAMERA] No camera in scene, skipping look-at setup")
+            return
+        
+        try:
+            camera = self.scene["camera"]
+            device = torch.device(self._device)
+            
+            # Pallet center (origin per env) + some Z height bias
+            # Target slightly above pallet surface to show stacking
+            target_z = 0.4  # Look at 40cm above pallet surface
+            
+            # Eye position: oblique "3/4 top" view
+            # Elevated and offset to see both pallet and falling boxes
+            eye_x, eye_y, eye_z = 2.5, 2.5, 2.5
+            
+            # Create per-env tensors
+            eyes = torch.tensor([[eye_x, eye_y, eye_z]], device=device).repeat(self.num_envs, 1)
+            targets = torch.tensor([[0.0, 0.0, target_z]], device=device).repeat(self.num_envs, 1)
+            
+            # Apply look-at pose via IsaacLab API
+            camera.set_world_poses_from_view(eyes=eyes, targets=targets)
+            
+            print(f"[CAMERA] Set look-at pose: eye=({eye_x}, {eye_y}, {eye_z}), "
+                  f"target=(0, 0, {target_z}) for {self.num_envs} envs")
+                  
+        except Exception as e:
+            print(f"[CAMERA WARN] Failed to set look-at pose: {e}")
+            import traceback
+            traceback.print_exc()
 
     def render(self):
         """Return RGB frame from camera sensor for video recording.
@@ -408,6 +455,21 @@ class PalletTask(DirectRLEnv):
             print(f"[RENDER DBG] rgb dtype={frame_np.dtype} shape={frame_np.shape} "
                   f"min={frame_np.min():.4f} max={frame_np.max():.4f} "
                   f"mean={frame_np.mean():.4f} unique~{unique_count}")
+            
+            # DEBUG: Check depth buffer to verify camera sees geometry
+            depth_data = camera.data.output.get("distance_to_image_plane")
+            if depth_data is not None:
+                depth_np = depth_data[0].cpu().numpy() if hasattr(depth_data[0], 'cpu') else np.array(depth_data[0])
+                finite_mask = np.isfinite(depth_np)
+                finite_count = finite_mask.sum()
+                if finite_count > 0:
+                    depth_min = depth_np[finite_mask].min()
+                    depth_max = depth_np[finite_mask].max()
+                    depth_mean = depth_np[finite_mask].mean()
+                else:
+                    depth_min = depth_max = depth_mean = float('inf')
+                print(f"[RENDER DBG] depth finite_count={finite_count}/{depth_np.size} "
+                      f"min={depth_min:.2f} max={depth_max:.2f} mean={depth_mean:.2f}")
             
             # Convert torch tensor to numpy
             if hasattr(frame, 'cpu'):
