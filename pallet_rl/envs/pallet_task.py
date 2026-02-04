@@ -373,11 +373,17 @@ class PalletTask(DirectRLEnv):
         
         # Check if camera sensor exists in scene
         if "camera" not in self.scene.keys():
+            print(f"[RENDER ERR] Camera not in scene! Available keys: {list(self.scene.keys())}")
             return None
         
         try:
             # Get camera sensor
             camera = self.scene["camera"]
+            
+            # CRITICAL: Force a render tick BEFORE reading camera buffer
+            # Without this, the camera may return stale/uninitialized data
+            if hasattr(self, 'sim') and self.sim is not None:
+                self.sim.render()
             
             # Force update the camera buffer
             camera.update(dt=self.step_dt)
@@ -385,10 +391,23 @@ class PalletTask(DirectRLEnv):
             # Get RGB data - shape: (num_envs, H, W, 3) or (num_envs, H, W, 4)
             rgb_data = camera.data.output.get("rgb")
             if rgb_data is None:
+                print("[RENDER DBG] rgb_data is None after camera.update()")
                 return None
             
             # Only return env_0's frame for video recording
             frame = rgb_data[0]  # First environment
+            
+            # DEBUG: Log buffer statistics BEFORE any conversion
+            if hasattr(frame, 'cpu'):
+                frame_np = frame.cpu().numpy()
+            else:
+                frame_np = np.array(frame)
+            
+            # Sample for unique count (speed optimization)
+            unique_count = len(np.unique(frame_np.ravel()[:10000]))
+            print(f"[RENDER DBG] rgb dtype={frame_np.dtype} shape={frame_np.shape} "
+                  f"min={frame_np.min():.4f} max={frame_np.max():.4f} "
+                  f"mean={frame_np.mean():.4f} unique~{unique_count}")
             
             # Convert torch tensor to numpy
             if hasattr(frame, 'cpu'):
@@ -406,6 +425,8 @@ class PalletTask(DirectRLEnv):
             
         except Exception as e:
             print(f"[WARN] render() failed: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
     def _init_state_tensors(self):

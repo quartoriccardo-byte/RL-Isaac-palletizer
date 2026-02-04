@@ -428,6 +428,12 @@ def main():
         env_cfg = PalletTaskCfg()
         env_cfg.scene.num_envs = args.num_envs
         env_cfg.sim.device = args.device
+        
+        # CRITICAL: Force render_interval=1 when cameras/video enabled
+        # Higher values cause stale camera buffers in headless mode
+        if args.video or args.enable_cameras:
+            env_cfg.sim.render_interval = 1
+            print(f"[INFO] Forced render_interval=1 for camera capture")
     
         # ---------------------------------------------------------------------
         # Step 2: Determine render mode (video recording requires rgb_array)
@@ -445,6 +451,26 @@ def main():
         # ---------------------------------------------------------------------
         print("Creating environment...")
         env = PalletTask(cfg=env_cfg, render_mode=render_mode)
+        
+        # ---------------------------------------------------------------------
+        # Step 3b: Camera warm-up (BEFORE wrapping with RecordVideo)
+        # ---------------------------------------------------------------------
+        # Isaac Sim cameras may return stale/uninitialized buffers on early reads.
+        # Perform several render passes to "warm up" the camera pipeline.
+        if args.video or args.enable_cameras:
+            print("[INFO] Warming up camera with 10 render passes...")
+            import torch
+            obs, _ = env.reset()
+            for i in range(10):
+                # Step with no-op action (zeros)
+                action = torch.zeros(env.num_envs, 5, device=args.device)
+                obs, _, _, _, _ = env.step(action)
+                frame = env.render()
+                if frame is not None:
+                    print(f"  Warm-up {i+1}/10: shape={frame.shape} min={frame.min()} max={frame.max()} mean={frame.mean():.2f}")
+                else:
+                    print(f"  Warm-up {i+1}/10: frame is None")
+            print("[INFO] Camera warm-up complete")
         
         # ---------------------------------------------------------------------
         # Step 4: Apply RecordVideo wrapper (if video recording is requested)
