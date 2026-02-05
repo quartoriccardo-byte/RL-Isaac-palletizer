@@ -223,6 +223,23 @@ python scripts/eval.py \
   --checkpoint path/to/checkpoint.pt
 ```
 
+### Mosaic Evaluation Video
+
+Record an evaluation video showing 8 parallel environments in a 2×4 grid:
+
+```bash
+python scripts/eval_video_overview.py \
+  --headless \
+  --checkpoint path/to/model.pt \
+  --num_envs 8 \
+  --eval_steps 500 \
+  --tile_rows 2 \
+  --tile_cols 4 \
+  --video_folder runs/mosaic_eval
+```
+
+Output: `runs/mosaic_eval/rl-video-step-0.mp4` with 2×4 tiled view.
+
 ---
 
 ## Testing
