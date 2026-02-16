@@ -242,14 +242,64 @@ Output: `runs/mosaic_eval/rl-video-step-0.mp4` with 2×4 tiled view.
 
 ---
 
+## Mockup Video
+
+Generate a demonstration video showing scripted box packing:
+
+```bash
+python scripts/mockup_video.py \
+  --headless \
+  --output_path mockup_demo.mp4 \
+  --num_boxes 15 \
+  --duration_s 20 \
+  --fps 30 \
+  --seed 42
+```
+
+Features:
+
+- Bottom-left-first bin packing heuristic with rotation
+- Smooth carry animation with cosine interpolation
+- Visible retry/reset on failed placements
+- Euro pallet mesh visual + cement floor
+- Cinematic camera angle
+
+---
+
+## Depth Camera Training
+
+Alternative heightmap source using an overhead depth sensor (more realistic, slower):
+
+```python
+cfg = PalletTaskCfg()
+cfg.heightmap_source = "depth_camera"  # default: "warp"
+cfg.depth_cam_resolution = (160, 240)
+cfg.depth_noise_enable = True
+```
+
+> **Note**: Depth camera requires the rendering pipeline (Storm or RTX) and is significantly slower than the Warp rasterizer with many environments. **Default is `"warp"`** for no impact on training performance. Use `"depth_camera"` for sim-to-real transfer experiments.
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `heightmap_source` | `"warp"` | `"warp"` (analytical) or `"depth_camera"` (sensor) |
+| `depth_cam_height_m` | 3.0m | Sensor height above ground |
+| `depth_cam_resolution` | (160, 240) | Depth image resolution |
+| `depth_cam_decimation` | 1 | Compute every N-th step |
+| `depth_noise_sigma_m` | 0.003m | Gaussian noise std |
+| `depth_noise_scale` | 0.7 | Underestimate factor |
+
+---
+
 ## Testing
 
 ```bash
-# Constraint logic tests (no Isaac required)
-python tests/test_constraints.py
-
-# Run all tests
+# All lightweight tests (no Isaac required)
 python -m pytest tests/ -v
+
+# Specific test suites
+python -m pytest tests/test_action_fix.py -v      # Action space fix
+python -m pytest tests/test_depth_heightmap.py -v  # Depth heightmap pipeline
+python -m pytest tests/test_constraints.py -v      # Constraint logic
 ```
 
 ---
@@ -280,21 +330,28 @@ Key parameters in `PalletTaskCfg`:
 ```text
 pallet_rl/
 ├── envs/
-│   └── pallet_task.py        # Isaac Lab DirectRLEnv palletizing task
+│   └── pallet_task.py           # Isaac Lab DirectRLEnv palletizing task
 ├── models/
-│   └── rsl_rl_wrapper.py     # PalletizerActorCritic (MultiDiscrete)
+│   └── rsl_rl_wrapper.py        # PalletizerActorCritic (MultiDiscrete)
 ├── utils/
 │   ├── heightmap_rasterizer.py  # Warp-based GPU heightmap kernel
+│   ├── depth_heightmap.py       # Depth camera → heightmap pipeline
 │   └── quaternions.py           # Isaac↔Warp quaternion conversions
 ├── configs/
-│   └── rsl_rl_config.yaml    # RSL-RL PPO config
+│   └── rsl_rl_config.yaml       # RSL-RL PPO config
+assets/
+├── EuroPalletH0_2.STL           # Euro pallet mesh
 scripts/
-├── train.py                  # Training entrypoint
-└── eval.py                   # Evaluation entrypoint
+├── train.py                     # Training entrypoint
+├── eval.py                      # Evaluation entrypoint
+├── eval_video_overview.py       # Mosaic evaluation video
+└── mockup_video.py              # Scripted demo video generator
 tests/
-├── test_constraints.py       # Constraint logic tests
-├── test_bugs.py              # Utility function tests
-└── test_quaternions.py       # Quaternion helper tests
+├── test_action_fix.py           # Action space fix tests
+├── test_depth_heightmap.py      # Depth heightmap tests
+├── test_constraints.py          # Constraint logic tests
+├── test_bugs.py                 # Utility function tests
+└── test_quaternions.py          # Quaternion helper tests
 ```
 
 ---
@@ -306,7 +363,7 @@ tests/
 ```text
 DirectRLEnv.step(action)
   │
-  ├─ _pre_physics_step(action)
+  ├─ _pre_physics_step(action)   ← Discrete→normalized conversion (auto-detect)
   ├─ _apply_action(action)         ← Height validation, box placement, buffer logic
   │                                    Payload updates, settling window armed
   ├─ Physics stepping              ← cfg.decimation × sim.step()

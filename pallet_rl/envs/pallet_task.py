@@ -29,6 +29,8 @@ from isaaclab.sim.spawners.shapes import CuboidCfg
 from isaaclab.sim.schemas import RigidBodyPropertiesCfg, CollisionPropertiesCfg, MassPropertiesCfg
 # IsaacLab API update: ground plane spawner moved to from_files module
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
+# Visual materials for ground plane / box coloring
+from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
 # IsaacLab 5.0: prim utilities for creating container prims before spawning
 from isaacsim.core.utils import prims as prim_utils
 # Camera sensor for headless video recording
@@ -39,6 +41,7 @@ import gymnasium as gym
 
 from pallet_rl.utils.heightmap_rasterizer import WarpHeightmapGenerator
 from pallet_rl.utils.quaternions import wxyz_to_xyzw, quat_angle_deg
+from pallet_rl.utils.depth_heightmap import DepthHeightmapConverter, DepthHeightmapCfg
 
 
 # =============================================================================
@@ -257,6 +260,43 @@ class PalletTaskCfg(DirectRLEnvCfg):
     reward_drift: float = -3.0  # penalty when box drifts but doesn't fall (increased from -2)
     reward_stable: float = 1.0  # bonus for stable placement
     
+    # =========================================================================
+    # Feature: Visual Pallet Mesh (STL→USD, purely visual)
+    # =========================================================================
+    use_pallet_mesh_visual: bool = False
+    pallet_mesh_stl_path: str = "assets/EuroPalletH0_2.STL"
+    pallet_mesh_scale: tuple[float, float, float] = (0.001, 0.001, 0.001)  # mm→m
+    pallet_mesh_offset_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    pallet_mesh_offset_quat_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    pallet_mesh_cache_dir: str = "assets/_usd_cache"
+    
+    # =========================================================================
+    # Feature: Heightmap Source Selection
+    # =========================================================================
+    heightmap_source: str = "warp"  # "warp" (default, fast) or "depth_camera"
+    
+    # Depth camera config (only used when heightmap_source="depth_camera")
+    depth_cam_height_m: float = 3.0
+    depth_cam_fov_deg: float = 40.0  # covers ~1.4×0.93m at 3m (>1.2×0.8 pallet)
+    depth_cam_resolution: tuple[int, int] = (160, 240)  # (H, W)
+    depth_cam_update_period: float = 0.0  # 0 = every frame
+    depth_cam_decimation: int = 1  # 1 = every step, N = skip N-1
+    
+    # Depth noise model (underestimated realism)
+    depth_noise_enable: bool = True
+    depth_noise_sigma_m: float = 0.003  # 3mm base noise
+    depth_noise_scale: float = 0.7  # underestimate factor
+    depth_noise_quantization_m: float = 0.002
+    depth_noise_dropout_prob: float = 0.001
+    
+    # Heightmap crop bounds (world XY, slightly wider than pallet)
+    depth_crop_x: tuple[float, float] = (-0.65, 0.65)
+    depth_crop_y: tuple[float, float] = (-0.45, 0.45)
+    
+    # Debug: save depth frames to disk
+    depth_debug_save_frames: bool = False
+    depth_debug_save_dir: str = "debug/depth_frames"
+    
     # Observation dimension (computed)
     @property
     def num_observations(self) -> int:
@@ -337,6 +377,31 @@ class PalletTask(DirectRLEnv):
             map_shape=self.cfg.map_shape,
             pallet_dims=self.cfg.pallet_size
         )
+        
+        # Depth camera heightmap converter (initialized only when needed)
+        self._depth_converter: DepthHeightmapConverter | None = None
+        if self.cfg.heightmap_source == "depth_camera":
+            depth_cfg = DepthHeightmapCfg(
+                cam_height=self.cfg.depth_cam_resolution[0],
+                cam_width=self.cfg.depth_cam_resolution[1],
+                fov_deg=self.cfg.depth_cam_fov_deg,
+                sensor_height_m=self.cfg.depth_cam_height_m,
+                map_h=self.cfg.map_shape[0],
+                map_w=self.cfg.map_shape[1],
+                crop_x=self.cfg.depth_crop_x,
+                crop_y=self.cfg.depth_crop_y,
+                noise_enable=self.cfg.depth_noise_enable,
+                noise_sigma_m=self.cfg.depth_noise_sigma_m,
+                noise_scale=self.cfg.depth_noise_scale,
+                noise_quantization_m=self.cfg.depth_noise_quantization_m,
+                noise_dropout_prob=self.cfg.depth_noise_dropout_prob,
+            )
+            self._depth_converter = DepthHeightmapConverter(depth_cfg, device=self._device)
+            print(f"[INFO] Depth camera heightmap pipeline enabled (res={self.cfg.depth_cam_resolution})")
+        
+        # Counter for depth decimation
+        self._depth_step_count = 0
+        self._cached_depth_heightmap: torch.Tensor | None = None
         
         # State tensors (all GPU-resident)
         self._init_state_tensors()
@@ -652,11 +717,17 @@ class PalletTask(DirectRLEnv):
         Downstream code expects `self.scene["boxes"]` and `self.scene["pallet"]`
         which are automatically available from the scene config.
         """
-        # Ground plane (simple infinite plane primitive)
-        # IsaacLab API update: ground plane spawner moved to from_files module
+        # Ground plane with cement-gray visual material (collision enabled by default)
+        # PreviewSurfaceCfg applies a PBR material for a minimal industrial floor look
         spawn_ground_plane(
             "/World/groundPlane",
-            GroundPlaneCfg(),
+            GroundPlaneCfg(
+                visual_material=PreviewSurfaceCfg(
+                    diffuse_color=(0.55, 0.53, 0.50),  # warm concrete gray
+                    roughness=0.92,
+                    metallic=0.0,
+                ),
+            ),
             translation=(0.0, 0.0, 0.0),
             orientation=(1.0, 0.0, 0.0, 0.0),
         )
@@ -702,6 +773,110 @@ class PalletTask(DirectRLEnv):
 
         if not prim_utils.is_prim_path_valid(boxes_path):
             prim_utils.create_prim(boxes_path, "Xform")
+        
+        # =====================================================================
+        # Optional: Visual Pallet Mesh (STL→USD)
+        # =====================================================================
+        # When enabled, converts STL to USD (cached), spawns as visual-only prim
+        # at the pallet position. The cuboid pallet collider remains for physics.
+        if self.cfg.use_pallet_mesh_visual:
+            self._spawn_pallet_mesh_visual(source_env_path)
+    
+    def _spawn_pallet_mesh_visual(self, source_env_path: str):
+        """
+        Spawn visual-only pallet mesh from STL file.
+        
+        Converts STL→USD using MeshConverter (cached), creates visual-only Xform prim.
+        The physics collider remains the cuboid pallet defined in PalletSceneCfg.
+        
+        Args:
+            source_env_path: USD path to env_0 (e.g. "/World/envs/env_0")
+        """
+        import os
+        import hashlib
+        
+        stl_path = self.cfg.pallet_mesh_stl_path
+        if not os.path.isabs(stl_path):
+            # Resolve relative to package root
+            pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            stl_path = os.path.join(os.path.dirname(pkg_dir), stl_path)
+        
+        if not os.path.exists(stl_path):
+            print(f"[WARNING] Pallet mesh STL not found at {stl_path}, skipping visual mesh")
+            return
+        
+        # Cache directory for converted USD
+        cache_dir = self.cfg.pallet_mesh_cache_dir
+        if not os.path.isabs(cache_dir):
+            pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            cache_dir = os.path.join(os.path.dirname(pkg_dir), cache_dir)
+        os.makedirs(cache_dir, exist_ok=True)
+        
+        # Hash-based cache filename
+        stl_hash = hashlib.md5(open(stl_path, "rb").read()).hexdigest()[:8]
+        scale_str = "_".join(f"{s:.4f}" for s in self.cfg.pallet_mesh_scale)
+        usd_name = f"pallet_mesh_{stl_hash}_{scale_str}.usd"
+        usd_path = os.path.join(cache_dir, usd_name)
+        
+        # Convert STL→USD if not cached
+        if not os.path.exists(usd_path):
+            try:
+                from isaaclab.sim.converters import MeshConverter, MeshConverterCfg
+                
+                converter_cfg = MeshConverterCfg(
+                    asset_path=stl_path,
+                    usd_dir=cache_dir,
+                    usd_file_name=usd_name,
+                    force_usd_conversion=False,
+                    make_instanceable=False,
+                )
+                converter = MeshConverter(converter_cfg)
+                usd_path = converter.usd_path
+                print(f"[INFO] Converted pallet mesh STL→USD: {usd_path}")
+            except Exception as e:
+                print(f"[WARNING] Failed to convert pallet mesh: {e}")
+                return
+        else:
+            print(f"[INFO] Using cached pallet mesh USD: {usd_path}")
+        
+        # Spawn visual-only prim at pallet position
+        mesh_prim_path = f"{source_env_path}/PalletMeshVisual"
+        try:
+            from isaaclab.sim.spawners.from_files import UsdFileCfg
+            
+            # Get pallet position from config
+            pallet_pos = self.cfg.pallet_pos  # (x, y, z)
+            offset = self.cfg.pallet_mesh_offset_pos
+            final_pos = (
+                pallet_pos[0] + offset[0],
+                pallet_pos[1] + offset[1],
+                pallet_pos[2] + offset[2],
+            )
+            
+            spawner = UsdFileCfg(
+                usd_path=usd_path,
+                scale=self.cfg.pallet_mesh_scale,
+                rigid_props=None,
+                collision_props=None,
+            )
+            spawner.func(mesh_prim_path, spawner, translation=final_pos, orientation=self.cfg.pallet_mesh_offset_quat_wxyz)
+            print(f"[INFO] Spawned visual pallet mesh at {mesh_prim_path}")
+            
+            # Optionally hide the cuboid pallet visual
+            pallet_visual_path = f"{source_env_path}/Pallet"
+            try:
+                from pxr import UsdGeom
+                stage = prim_utils.get_current_stage()
+                pallet_prim = stage.GetPrimAtPath(pallet_visual_path)
+                if pallet_prim.IsValid():
+                    imageable = UsdGeom.Imageable(pallet_prim)
+                    imageable.MakeInvisible()
+                    print(f"[INFO] Hidden cuboid pallet visual at {pallet_visual_path}")
+            except Exception as e:
+                print(f"[WARNING] Could not hide cuboid pallet: {e}")
+                
+        except Exception as e:
+            print(f"[WARNING] Failed to spawn pallet mesh visual: {e}")
     
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """
@@ -731,26 +906,72 @@ class PalletTask(DirectRLEnv):
         # Pallet positions (centered at origin per env)
         pallet_pos = torch.zeros(n, 3, device=device)
         
-        # 2. Generate heightmap (GPU-only via Warp)
-        # Only boxes that have been placed (indices 0..box_idx-1) are "active" for
-        # rasterization. Use strict < to exclude the current/next box.
-        box_indices = torch.arange(self.cfg.max_boxes, device=device).view(1, -1)
-        active_mask = box_indices < self.box_idx.view(-1, 1)  # (N, max_boxes)
-        
-        # Update preallocated buffer: copy active dims, zero inactive
-        self._box_dims_for_hmap.copy_(self.box_dims)
-        self._box_dims_for_hmap[~active_mask] = 0.0
-        
-        # Move inactive boxes off-map (guarantees they're never in rasterization bounds)
-        box_pos_for_hmap = box_pos.clone()
-        box_pos_for_hmap[~active_mask] = self._inactive_box_pos
+        # 2. Generate heightmap
+        if self.cfg.heightmap_source == "depth_camera" and self._depth_converter is not None:
+            # ---------------------------------------------------------------
+            # Depth camera path: read sensor → convert → heightmap
+            # ---------------------------------------------------------------
+            depth_cam = self.scene["render_camera"]
+            depth_data = depth_cam.data
+            
+            # Get depth image: Isaac Lab returns (N, H, W, 1) for single-channel
+            depth_img = depth_data.output["distance_to_image_plane"]  # (N, H, W, 1)
+            if depth_img.dim() == 4 and depth_img.shape[-1] == 1:
+                depth_img = depth_img.squeeze(-1)  # (N, H, W)
+            
+            # Camera world poses
+            cam_pos = depth_data.pos_w  # (N, 3)
+            cam_quat_wxyz = depth_data.quat_w_world  # (N, 4) wxyz
+            
+            # Decimation: reuse cached heightmap on non-update steps
+            self._depth_step_count += 1
+            dec = self.cfg.depth_cam_decimation
+            if dec > 1 and self._cached_depth_heightmap is not None:
+                if (self._depth_step_count - 1) % dec != 0:
+                    heightmap = self._cached_depth_heightmap
+                else:
+                    heightmap = self._depth_converter.depth_to_heightmap(
+                        depth_img, cam_pos, cam_quat_wxyz
+                    )
+                    self._cached_depth_heightmap = heightmap
+            else:
+                heightmap = self._depth_converter.depth_to_heightmap(
+                    depth_img, cam_pos, cam_quat_wxyz
+                )
+                self._cached_depth_heightmap = heightmap
+            
+            # Optional debug frame saving
+            if self.cfg.depth_debug_save_frames:
+                import os
+                os.makedirs(self.cfg.depth_debug_save_dir, exist_ok=True)
+                step = self._depth_step_count
+                torch.save(
+                    {"depth": depth_img[0].cpu(), "heightmap": heightmap[0].cpu()},
+                    os.path.join(self.cfg.depth_debug_save_dir, f"frame_{step:06d}.pt"),
+                )
+        else:
+            # ---------------------------------------------------------------
+            # Warp path (default): analytical rasterization from box poses
+            # ---------------------------------------------------------------
+            # Only boxes that have been placed (indices 0..box_idx-1) are "active" for
+            # rasterization. Use strict < to exclude the current/next box.
+            box_indices = torch.arange(self.cfg.max_boxes, device=device).view(1, -1)
+            active_mask = box_indices < self.box_idx.view(-1, 1)  # (N, max_boxes)
+            
+            # Update preallocated buffer: copy active dims, zero inactive
+            self._box_dims_for_hmap.copy_(self.box_dims)
+            self._box_dims_for_hmap[~active_mask] = 0.0
+            
+            # Move inactive boxes off-map (guarantees they're never in rasterization bounds)
+            box_pos_for_hmap = box_pos.clone()
+            box_pos_for_hmap[~active_mask] = self._inactive_box_pos
 
-        heightmap = self.heightmap_gen.forward(
-            box_pos_for_hmap.reshape(-1, 3),
-            box_rot.reshape(-1, 4),
-            self._box_dims_for_hmap.reshape(-1, 3),
-            pallet_pos,
-        )  # (N, H, W)
+            heightmap = self.heightmap_gen.forward(
+                box_pos_for_hmap.reshape(-1, 3),
+                box_rot.reshape(-1, 4),
+                self._box_dims_for_hmap.reshape(-1, 3),
+                pallet_pos,
+            )  # (N, H, W)
         
         # 3. Normalize and flatten heightmap
         heightmap_norm = heightmap / self.cfg.max_height
@@ -1305,11 +1526,33 @@ class PalletTask(DirectRLEnv):
         Isaac Lab API: This method receives actions and stores them in a buffer.
         The framework then calls _apply_action() (no args) to apply them.
         
+        Handles two action formats (backwards-compatible):
+        1. Discrete indices from MultiCategorical policy: values 0..K-1 (ints or floats >1)
+           → Converted to center-of-bin normalized values in [-1, 1]
+        2. Already-normalized float actions in [-1, 1] (legacy)
+           → Passed through with clamp
+        
         Args:
-            actions: Continuous actions from policy (N, 5) in [-1, 1]
+            actions: Actions from policy (N, 5) — discrete indices or normalized floats
         """
-        # Ensure on device and clamp to valid range
-        actions = actions.to(self._device)
+        actions = actions.to(self._device).float()
+        
+        # =====================================================================
+        # Discrete Index Detection & Conversion
+        # =====================================================================
+        # The policy (PalletizerActorCritic.act()) outputs integer indices for
+        # each action dimension: [op∈{0..2}, slot∈{0..9}, x∈{0..15}, y∈{0..23}, rot∈{0..1}].
+        # Previously, clamp(-1,1) would corrupt indices >1 (e.g. slot=9 → 1.0).
+        #
+        # Detection heuristic: if ANY value > 1.5, actions are discrete indices.
+        # Center-of-bin: norm_val = (idx + 0.5) / K * 2.0 - 1.0
+        is_discrete = actions.abs().max() > 1.5
+        
+        if is_discrete:
+            dims = self.cfg.action_dims  # (3, 10, 16, 24, 2)
+            for col, k in enumerate(dims):
+                actions[:, col] = (actions[:, col].float() + 0.5) / k * 2.0 - 1.0
+        
         self._actions = torch.clamp(actions, -1.0, 1.0)
     
     def _apply_action(self) -> None:
