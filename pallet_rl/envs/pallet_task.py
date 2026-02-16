@@ -107,24 +107,47 @@ class PalletSceneCfg(InteractiveSceneCfg):
         },
     )
     
-    # Camera sensor for video recording in headless mode
-    # NOTE: Initial pose is neutral (identity quat). Runtime code will call
-    # set_world_poses_from_view() to properly aim at the pallet center.
-    camera: CameraCfg = CameraCfg(
-        prim_path="{ENV_REGEX_NS}/Camera",
+    # =====================================================================
+    # Render camera: cinematic oblique view for video recording
+    # =====================================================================
+    # Runtime code calls set_world_poses_from_view() to aim at pallet center.
+    render_camera: CameraCfg = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/RenderCamera",
         spawn=PinholeCameraCfg(
             focal_length=24.0,
             horizontal_aperture=20.955,
         ),
         offset=CameraCfg.OffsetCfg(
-            pos=(2.5, 2.5, 2.0),  # Initial offset (will be overridden at runtime)
-            rot=(1.0, 0.0, 0.0, 0.0),  # Identity quaternion - neutral pose
-            convention="ros",  # ROS: forward +Z, up -Y
+            pos=(2.5, 2.5, 2.0),
+            rot=(1.0, 0.0, 0.0, 0.0),
+            convention="ros",
         ),
         width=1280,
         height=720,
-        data_types=["rgb", "distance_to_image_plane"],  # Add depth for debug
-        update_period=0.0,  # Update every frame
+        data_types=["rgb"],
+        update_period=0.0,
+    )
+    
+    # =====================================================================
+    # Depth camera: top-down overhead view for depth-based heightmap
+    # =====================================================================
+    # Only used when heightmap_source="depth_camera".
+    # Pose: 3m above pallet center, looking straight down.
+    depth_camera: CameraCfg = CameraCfg(
+        prim_path="{ENV_REGEX_NS}/DepthCamera",
+        spawn=PinholeCameraCfg(
+            focal_length=24.0,
+            horizontal_aperture=20.955,
+        ),
+        offset=CameraCfg.OffsetCfg(
+            pos=(0.0, 0.0, 3.0),
+            rot=(0.0, 0.0, 1.0, 0.0),  # 180° around Y → looking down (-Z)
+            convention="ros",
+        ),
+        width=240,
+        height=160,
+        data_types=["distance_to_image_plane"],
+        update_period=0.0,
     )
 
 
@@ -439,12 +462,12 @@ class PalletTask(DirectRLEnv):
         - The entire pallet area
         - Boxes being placed/spawned
         """
-        if "camera" not in self.scene.keys():
-            print("[CAMERA] No camera in scene, skipping look-at setup")
+        if "render_camera" not in self.scene.keys():
+            print("[CAMERA] No render_camera in scene, skipping look-at setup")
             return
         
         try:
-            camera = self.scene["camera"]
+            camera = self.scene["render_camera"]
             device = torch.device(self._device)
             
             # Pallet center (origin per env) + some Z height bias
@@ -484,13 +507,13 @@ class PalletTask(DirectRLEnv):
             return None
         
         # Check if camera sensor exists in scene
-        if "camera" not in self.scene.keys():
-            print(f"[RENDER ERR] Camera not in scene! Available keys: {list(self.scene.keys())}")
+        if "render_camera" not in self.scene.keys():
+            print(f"[RENDER ERR] render_camera not in scene! Available keys: {list(self.scene.keys())}")
             return None
         
         try:
-            # Get camera sensor
-            camera = self.scene["camera"]
+            # Get render camera sensor
+            camera = self.scene["render_camera"]
             
             # CRITICAL: Force a render tick BEFORE reading camera buffer
             # Without this, the camera may return stale/uninitialized data
@@ -911,7 +934,7 @@ class PalletTask(DirectRLEnv):
             # ---------------------------------------------------------------
             # Depth camera path: read sensor → convert → heightmap
             # ---------------------------------------------------------------
-            depth_cam = self.scene["render_camera"]
+            depth_cam = self.scene["depth_camera"]
             depth_data = depth_cam.data
             
             # Get depth image: Isaac Lab returns (N, H, W, 1) for single-channel

@@ -212,12 +212,12 @@ def main():
                 self.env.sim.render()
             
             # Get camera sensor
-            if "camera" not in self.env.scene.keys():
-                print(f"[MOSAIC ERR] No camera in scene!")
+            if "render_camera" not in self.env.scene.keys():
+                print(f"[MOSAIC ERR] No render_camera in scene!")
                 return None
             
             try:
-                camera = self.env.scene["camera"]
+                camera = self.env.scene["render_camera"]
                 camera.update(dt=self.env.step_dt)
                 
                 # Get RGB: shape (num_envs, H, W, 3/4)
@@ -314,8 +314,8 @@ def main():
         env_cfg.sim.render_interval = 1  # Force render every step
         
         # Override camera resolution for tiling
-        env_cfg.scene.camera.width = args.cam_width
-        env_cfg.scene.camera.height = args.cam_height
+        env_cfg.scene.render_camera.width = args.cam_width
+        env_cfg.scene.render_camera.height = args.cam_height
         
         render_mode = "rgb_array"
         
