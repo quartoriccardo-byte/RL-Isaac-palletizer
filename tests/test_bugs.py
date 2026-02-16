@@ -93,8 +93,11 @@ def test_rsl_rl_wrapper_entropy():
     actions = model.act(obs)
     assert actions.shape == (batch_size, 5), f"Expected (4,5), got {actions.shape}"
     
-    # Now entropy should work
-    entropy = model.entropy()
+    # Now entropy should work (compatible with property or callable)
+    entropy_attr = model.entropy
+    entropy = entropy_attr() if callable(entropy_attr) else entropy_attr
+    assert entropy is not None, "Entropy should not be None"
+    assert isinstance(entropy, torch.Tensor), f"Expected Tensor, got {type(entropy)}"
     assert entropy.shape == (batch_size,), f"Expected ({batch_size},), got {entropy.shape}"
     assert torch.all(entropy >= 0), "Entropy should be non-negative"
     
