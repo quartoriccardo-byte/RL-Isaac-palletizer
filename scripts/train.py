@@ -54,6 +54,15 @@ def parse_args():
     parser.add_argument("--video_length", type=int, default=200, help="Video length in steps")
     parser.add_argument("--video_interval", type=int, default=2000, help="Video recording interval")
     
+    # Depth-camera heightmap validation (overrides env config from CLI)
+    parser.add_argument("--heightmap_source", type=str, default=None,
+                        choices=["warp", "depth_camera"],
+                        help="Heightmap source override (default: use env config)")
+    parser.add_argument("--depth_debug_save_frames", action="store_true",
+                        help="Save raw depth + heightmap frames to disk")
+    parser.add_argument("--depth_debug_save_dir", type=str, default=None,
+                        help="Directory for depth debug frames")
+    
     # Use parse_known_args to accept unknown Kit/Carb settings (--/path=value)
     args, unknown = parser.parse_known_args()
     return args, unknown
@@ -139,6 +148,11 @@ def main():
     # Collect user-provided Kit args from CLI
     user_kit_args = [arg for arg in unknown if arg.startswith('--/')]
     user_kit_paths = {arg.split('=')[0] for arg in user_kit_args}
+    
+    # Force cameras when depth-camera heightmap is requested
+    if getattr(args, 'heightmap_source', None) == "depth_camera" and not args.enable_cameras:
+        args.enable_cameras = True
+        print("[INFO] heightmap_source=depth_camera -> forcing --enable_cameras at startup")
     
     # Default Kit args for headless video/camera mode (NGX/DLSS disabling)
     # Only add if user didn't explicitly provide them
@@ -428,6 +442,17 @@ def main():
         env_cfg = PalletTaskCfg()
         env_cfg.scene.num_envs = args.num_envs
         env_cfg.sim.device = args.device
+        
+        # CLI overrides for depth-camera heightmap validation
+        if args.heightmap_source is not None:
+            env_cfg.heightmap_source = args.heightmap_source
+            print(f"[INFO] Env override: heightmap_source={args.heightmap_source}")
+        if args.depth_debug_save_frames:
+            env_cfg.depth_debug_save_frames = True
+            print("[INFO] Env override: depth_debug_save_frames=True")
+        if args.depth_debug_save_dir is not None:
+            env_cfg.depth_debug_save_dir = args.depth_debug_save_dir
+            print(f"[INFO] Env override: depth_debug_save_dir={args.depth_debug_save_dir}")
         
         # CRITICAL: Force render_interval=1 when cameras/video enabled
         # Higher values cause stale camera buffers in headless mode

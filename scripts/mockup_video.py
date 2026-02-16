@@ -7,8 +7,8 @@ to showcase the environment with floor, pallet mesh, colored boxes, and
 visible retry/reset on failed placements.
 
 Usage:
-    python scripts/mockup_video.py --headless --output_path mockup_demo.mp4
-    python scripts/mockup_video.py --headless --num_boxes 20 --duration_s 25
+    ~/isaac-sim/python.sh scripts/mockup_video.py --headless --output_path mockup_demo.mp4
+    ~/isaac-sim/python.sh scripts/mockup_video.py --headless --num_boxes 20 --duration_s 25
 """
 
 from __future__ import annotations
@@ -24,7 +24,12 @@ import time
 # =============================================================================
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args():
+    """Parse CLI arguments, allowing unknown Kit/Carb settings (--/rtx/...).
+
+    Returns:
+        tuple: (args, unknown) where unknown may contain --/path=value args.
+    """
     parser = argparse.ArgumentParser(description="Generate palletizer mockup video")
     parser.add_argument("--headless", action="store_true", default=False)
     parser.add_argument("--output_path", type=str, default="mockup_demo.mp4")
@@ -36,16 +41,59 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--enable_cameras", action="store_true", default=True)
     parser.add_argument("--cam_width", type=int, default=1280)
     parser.add_argument("--cam_height", type=int, default=720)
-    return parser.parse_args()
+    parser.add_argument("--livestream", type=int, default=0, help="Livestream mode")
+    return parser.parse_known_args()
 
 
-args = parse_args()
+def inject_kit_args(args, unknown):
+    """Inject Kit/Carb startup args into sys.argv before AppLauncher init.
+
+    Adds safe defaults (NGX/DLSS disable, VRAM reduction) unless the user
+    already provided the same --/path via CLI.  Also forces cameras on
+    since the mockup script always needs them for recording.
+    """
+    # Force cameras for recording
+    if not args.enable_cameras:
+        args.enable_cameras = True
+        print("[INFO] Forced --enable_cameras for mockup recording")
+
+    # Collect user-provided Kit args
+    user_kit_args = [arg for arg in unknown if arg.startswith('--/')]
+    user_kit_paths = {arg.split('=')[0] for arg in user_kit_args}
+
+    # Safe defaults (only added when user didn't override)
+    defaults_map = {
+        '--/ngx/enabled': '--/ngx/enabled=false',
+        '--/rtx/post/dlss/enabled': '--/rtx/post/dlss/enabled=false',
+        '--/rtx/post/dlss/execMode': '--/rtx/post/dlss/execMode=0',
+        '--/rtx/post/aa/op': '--/rtx/post/aa/op=0',
+        '--/rtx-transient/dlssg/enabled': '--/rtx-transient/dlssg/enabled=false',
+        '--/rtx-transient/dldenoiser/enabled': '--/rtx-transient/dldenoiser/enabled=false',
+        '--/renderer/multiGpu/enabled': '--/renderer/multiGpu/enabled=false',
+        '--/rtx/translucency/enabled': '--/rtx/translucency/enabled=false',
+        '--/rtx/reflections/enabled': '--/rtx/reflections/enabled=false',
+        '--/rtx/indirectDiffuse/enabled': '--/rtx/indirectDiffuse/enabled=false',
+    }
+    default_kit_args = []
+    for kit_path, kit_arg in defaults_map.items():
+        if kit_path not in user_kit_paths:
+            default_kit_args.append(kit_arg)
+
+    # Inject into sys.argv BEFORE AppLauncher reads them
+    for arg in user_kit_args + default_kit_args:
+        if arg not in sys.argv:
+            sys.argv.append(arg)
+            print(f"[INFO] Injected Kit startup arg: {arg}")
+
+
+args, unknown = parse_args()
+inject_kit_args(args, unknown)
 
 # Launch Isaac Sim BEFORE any isaaclab imports
 from isaaclab.app import AppLauncher
 
-launcher = AppLauncher(headless=args.headless, enable_cameras=args.enable_cameras)
-simulation_app = launcher.app
+app_launcher = AppLauncher(args)
+simulation_app = app_launcher.app
 
 # Now safe to import Isaac Lab modules
 import torch
