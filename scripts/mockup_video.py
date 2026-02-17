@@ -41,10 +41,14 @@ def parse_args():
     parser.add_argument("--enable_cameras", action="store_true", default=True)
     parser.add_argument("--cam_width", type=int, default=1280)
     parser.add_argument("--cam_height", type=int, default=720)
-    parser.add_argument("--sim_substeps", type=int, default=2,
+    parser.add_argument("--sim_substeps", type=int, default=4,
                         help="Physics substeps per rendered frame (more = smoother)")
-    parser.add_argument("--drop_speed_mps", type=float, default=0.25,
-                        help="Controlled descent speed in m/s before releasing box")
+    parser.add_argument("--drop_speed_mps", type=float, default=0.15,
+                        help="Controlled descent speed in m/s during kinematic lowering")
+    parser.add_argument("--release_gap", type=float, default=0.01,
+                        help="Gap (m) above resting position where box is released to physics")
+    parser.add_argument("--settle_frames", type=int, default=80,
+                        help="Number of frames to let physics settle after release (no pose writes)")
     return parser.parse_known_args()
 
 
@@ -406,14 +410,16 @@ def main():
     total_frames = int(args.duration_s * args.fps)
     frames_per_box = max(total_frames // max(len(placements), 1), 30)
     
-    # Phases per box animation:
-    # 1. Spawn at side (5 frames)  
-    # 2. Carry to target (20 frames — smooth interpolation)
-    # 3. Drop + settle (15 frames)
-    # 4. Pause (5 frames)
+    # Phases per box animation (cinematic state machine):
+    # 1. Spawn at side (5 frames) — show box appearing
+    # 2. Carry to hover (20 frames — smooth interpolation) 
+    # 3. Controlled descent (variable frames — kinematic lowering at drop_speed_mps)
+    #    → stops at release_gap above resting position
+    # 4. Release + settle (settle_frames — PURE PHYSICS, no pose writes!)
+    #    → box falls release_gap under gravity and settles naturally
+    # 5. Pause (5 frames — admire placement)
     SPAWN_FRAMES = 5
     CARRY_FRAMES = 20
-    SETTLE_FRAMES = 35  # Extra settling for stable mockup box resting
     PAUSE_FRAMES = 5
     
     # Retry animation extras
@@ -421,6 +427,8 @@ def main():
     RETRY_REAPPROACH_FRAMES = 15
     
     print(f"\n[INFO] Generating {total_frames} frames ({args.duration_s}s @ {args.fps}fps)...")
+    print(f"[INFO] Cinematic params: drop_speed={args.drop_speed_mps} m/s, "
+          f"release_gap={args.release_gap}m, settle_frames={args.settle_frames}")
     
     placed_count = 0
     frame_count = 0
@@ -435,17 +443,19 @@ def main():
         rot = placement["rotation"]
         box_id = placement["box_id"]
         
-        # Target position (center of box, top of stack)
+        # Target resting position (center of box = z_base + half height)
         target_z = z_base + bh / 2.0
         target_pos = torch.tensor([wx, wy, target_z], device=device)
         
-        # Spawn position (off to the side)
+        # Spawn position (off to the side, safely above everything)
         spawn_pos = torch.tensor([1.2, -0.5, 0.6], device=device)
         
-        # Pre-drop hover position (above target)
+        # Hover position: above target, high enough to clear any stacked boxes
         hover_pos = target_pos.clone()
-        # Gentler hover: use mockup drop height for controlled descent
         hover_pos[2] = z_base + bh + cfg.mockup_drop_height_m
+        
+        # Release position: just above resting (the box will fall release_gap under gravity)
+        release_z = target_z + args.release_gap
         
         # Rotation quaternion (wxyz format)
         if rot == 0:
@@ -456,77 +466,61 @@ def main():
         
         is_retry_box = (RETRY_BOX_IDX is not None and pi == RETRY_BOX_IDX)
         
-        # =====================================================================
-        # Phase 1: Spawn at side
-        # =====================================================================
+        # =================================================================
+        # Phase 1: Spawn at side (kinematic — set pose each frame)
+        # =================================================================
         for f in range(SPAWN_FRAMES):
             if frame_count >= total_frames:
                 break
-            
-            # Set box position (kinematic-like: just set pose)
             env._set_box_pose(placed_count, spawn_pos, quat, device)
-            
-            # Step sim and render
             _step_and_capture(frames)
             frame_count += 1
         
-        # =====================================================================
-        # Phase 2: Carry to target (smooth interpolation)
-        # =====================================================================
+        # =================================================================
+        # Phase 2: Carry from spawn to hover (kinematic smooth interp)
+        # =================================================================
         for f in range(CARRY_FRAMES):
             if frame_count >= total_frames:
                 break
-            
             t = f / max(CARRY_FRAMES - 1, 1)
-            # Smooth ease-in-out
-            t_smooth = 0.5 - 0.5 * math.cos(math.pi * t)
-            
-            # Interpolate: spawn → hover (carry phase)
-            if t_smooth < 0.7:
-                # Phase A: spawn → hover
-                ta = t_smooth / 0.7
-                pos = spawn_pos + (hover_pos - spawn_pos) * ta
-            else:
-                # Phase B: hold at hover (descent happens in Phase 2.5)
-                pos = hover_pos.clone()
-            
+            t_smooth = 0.5 - 0.5 * math.cos(math.pi * t)  # ease-in-out
+            pos = spawn_pos + (hover_pos - spawn_pos) * t_smooth
             env._set_box_pose(placed_count, pos, quat, device)
-            
             _step_and_capture(frames)
             frame_count += 1
         
-        # =====================================================================
-        # Phase 2.5a: Controlled Descent
-        # =====================================================================
-        # Move box kinematically from hover to just above contact,
-        # then release it to dynamic physics for final settle.
+        # =================================================================
+        # Phase 3: Controlled kinematic descent (hover → release_z)
+        # =================================================================
+        # Lower box at constant speed, stopping ABOVE contact.
+        # Each frame: move down by drop_speed_mps * frame_dt.
+        # NEVER penetrate the target surface.
         descent_start_z = hover_pos[2].item()
-        descent_end_z = z_base + bh / 2.0 + 0.005  # 5mm above resting
-        descent_dist = max(descent_start_z - descent_end_z, 0.0)
+        descent_dist = max(descent_start_z - release_z, 0.0)
         frame_dt = 1.0 / args.fps
-        # Number of frames at the configured descent speed
-        descent_frames = max(1, int(descent_dist / max(args.drop_speed_mps * frame_dt, 1e-6)))
+        # Number of frames for descent at configured speed
+        descent_speed_per_frame = args.drop_speed_mps * frame_dt
+        descent_frames = max(1, int(descent_dist / max(descent_speed_per_frame, 1e-9)))
         
         for f in range(descent_frames):
             if frame_count >= total_frames:
                 break
             frac = f / max(descent_frames - 1, 1)
+            current_z = descent_start_z + (release_z - descent_start_z) * frac
             pos = target_pos.clone()
-            pos[2] = descent_start_z + (descent_end_z - descent_start_z) * frac
+            pos[2] = current_z
             env._set_box_pose(placed_count, pos, quat, device)
             _step_and_capture(frames)
             frame_count += 1
         
-        # =====================================================================
-        # Phase 2.5b: Retry demo (intentional bad placement)
-        # =====================================================================
+        # =================================================================
+        # Phase 3b: Retry demo (intentional bad placement — optional)
+        # =================================================================
         if is_retry_box:
             print(f"  [RETRY] Box {box_id}: simulating failed placement + retry")
-            
-            # Move to a bad position (edge of pallet)
             bad_pos = target_pos.clone()
-            bad_pos[0] += 0.25  # offset to create overhang
-            bad_pos[2] += 0.1
+            bad_pos[0] += 0.25  # overhang
+            bad_pos[2] = release_z + 0.1
             
             for f in range(RETRY_BACKUP_FRAMES):
                 if frame_count >= total_frames:
@@ -535,32 +529,37 @@ def main():
                 _step_and_capture(frames)
                 frame_count += 1
             
-            # "Detect failure" — move box back up
+            # Move back to correct position above target
             for f in range(RETRY_REAPPROACH_FRAMES):
                 if frame_count >= total_frames:
                     break
                 t = f / max(RETRY_REAPPROACH_FRAMES - 1, 1)
                 t_smooth = 0.5 - 0.5 * math.cos(math.pi * t)
-                pos = bad_pos + (target_pos - bad_pos) * t_smooth
-                env._set_box_pose(placed_count, pos, quat, device)
+                pos_interp = bad_pos.clone()
+                pos_interp[0] = bad_pos[0] + (target_pos[0] - bad_pos[0]) * t_smooth
+                pos_interp[1] = bad_pos[1] + (target_pos[1] - bad_pos[1]) * t_smooth
+                pos_interp[2] = bad_pos[2] + (release_z - bad_pos[2]) * t_smooth
+                env._set_box_pose(placed_count, pos_interp, quat, device)
                 _step_and_capture(frames)
                 frame_count += 1
         
-        # =====================================================================
-        # Phase 3: Drop + settle
-        # =====================================================================
-        # Set final position and let physics settle
-        env._set_box_pose(placed_count, target_pos, quat, device)
-        
-        for f in range(SETTLE_FRAMES):
+        # =================================================================
+        # Phase 4: RELEASE + SETTLE (pure physics — NO POSE WRITES)
+        # =================================================================
+        # The box is at release_z (~1cm above resting). We now let it go:
+        # just step physics. The box drops the tiny gap under gravity and
+        # settles naturally with the high-friction/damping mockup config.
+        # CRITICAL: do NOT call _set_box_pose here. That was the root cause
+        # of the snapping/down-up teleport behavior.
+        for f in range(args.settle_frames):
             if frame_count >= total_frames:
                 break
             _step_and_capture(frames)
             frame_count += 1
         
-        # =====================================================================
-        # Phase 4: Pause (admire the placement)
-        # =====================================================================
+        # =================================================================
+        # Phase 5: Pause (admire the placement)
+        # =================================================================
         for f in range(PAUSE_FRAMES):
             if frame_count >= total_frames:
                 break

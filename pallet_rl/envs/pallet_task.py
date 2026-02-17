@@ -1165,7 +1165,30 @@ class PalletTask(DirectRLEnv):
             stage = prim_utils.get_current_stage()
             cfg = self.cfg
             
-            applied_count = 0
+            # --- Pallet collider verification (debug log) ---
+            pallet_path = f"{source_env_path}/Pallet"
+            pallet_prim = stage.GetPrimAtPath(pallet_path)
+            if pallet_prim.IsValid():
+                has_collision = pallet_prim.HasAPI(UsdPhysics.CollisionAPI)
+                has_rb = pallet_prim.HasAPI(UsdPhysics.RigidBodyAPI)
+                is_kinematic = False
+                if has_rb:
+                    rb = UsdPhysics.RigidBodyAPI(pallet_prim)
+                    kin_attr = rb.GetKinematicEnabledAttr()
+                    is_kinematic = kin_attr.Get() if kin_attr else False
+                # Read pose
+                from pxr import UsdGeom, Gf
+                xformable = UsdGeom.Xformable(pallet_prim)
+                local_mat = xformable.GetLocalTransformation()
+                center = local_mat.ExtractTranslation()
+                pallet_bottom_z = center[2] - 0.075  # half of 0.15m cuboid
+                print(f"[INFO] Pallet collider verification:")
+                print(f"  path={pallet_path}")
+                print(f"  CollisionAPI={has_collision}, RigidBodyAPI={has_rb}, kinematic={is_kinematic}")
+                print(f"  center=({center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f}), bottom_z={pallet_bottom_z:.4f}")
+            else:
+                print(f"[WARNING] Pallet prim not found at {pallet_path}")
+            
             for i in range(cfg.max_boxes):
                 box_path = f"{source_env_path}/Boxes/box_{i}"
                 box_prim = stage.GetPrimAtPath(box_path)
