@@ -41,7 +41,10 @@ def parse_args():
     parser.add_argument("--enable_cameras", action="store_true", default=True)
     parser.add_argument("--cam_width", type=int, default=1280)
     parser.add_argument("--cam_height", type=int, default=720)
-    parser.add_argument("--livestream", type=int, default=0, help="Livestream mode")
+    parser.add_argument("--sim_substeps", type=int, default=2,
+                        help="Physics substeps per rendered frame (more = smoother)")
+    parser.add_argument("--drop_speed_mps", type=float, default=0.25,
+                        help="Controlled descent speed in m/s before releasing box")
     return parser.parse_known_args()
 
 
@@ -311,6 +314,7 @@ def main():
     cfg.max_boxes = max(args.num_boxes + 5, cfg.max_boxes)  # Extra for retries
     cfg.use_pallet_mesh_visual = True  # Show Euro pallet mesh
     cfg.mockup_mode = True              # Gentle physics for demo video
+    cfg.decimation = 1                  # Single physics step per env.step()
     
     # Ensure sim device matches CLI --device (e.g. "cuda:2")
     # Without this, PalletTaskCfg.sim.device="cuda" would not carry the index.
@@ -342,6 +346,21 @@ def main():
     
     # We'll collect frames manually and write video at the end
     frames = []
+    
+    # =========================================================================
+    # Helper: multi-substep physics + capture
+    # =========================================================================
+    sim_dt = env.sim.get_physics_dt()
+    substeps = args.sim_substeps
+    
+    def _step_and_capture(frames_list):
+        """Run N physics substeps, update scene, render one frame."""
+        for _ in range(substeps):
+            env.sim.step()
+        env.scene.update(dt=sim_dt * substeps)
+        fr = env.render()
+        if fr is not None:
+            frames_list.append(fr)
     
     # =========================================================================
     # Generate box dimensions and plan placements
@@ -448,11 +467,7 @@ def main():
             env._set_box_pose(placed_count, spawn_pos, quat, device)
             
             # Step sim and render
-            env.sim.step()
-            env.scene.update(dt=env.sim.get_physics_dt())
-            frame = env.render()
-            if frame is not None:
-                frames.append(frame)
+            _step_and_capture(frames)
             frame_count += 1
         
         # =====================================================================
@@ -466,27 +481,44 @@ def main():
             # Smooth ease-in-out
             t_smooth = 0.5 - 0.5 * math.cos(math.pi * t)
             
-            # Interpolate: spawn → hover → target (two-phase trajectory)
+            # Interpolate: spawn → hover (carry phase)
             if t_smooth < 0.7:
                 # Phase A: spawn → hover
                 ta = t_smooth / 0.7
                 pos = spawn_pos + (hover_pos - spawn_pos) * ta
             else:
-                # Phase B: hover → target
-                tb = (t_smooth - 0.7) / 0.3
-                pos = hover_pos + (target_pos - hover_pos) * tb
+                # Phase B: hold at hover (descent happens in Phase 2.5)
+                pos = hover_pos.clone()
             
             env._set_box_pose(placed_count, pos, quat, device)
             
-            env.sim.step()
-            env.scene.update(dt=env.sim.get_physics_dt())
-            frame = env.render()
-            if frame is not None:
-                frames.append(frame)
+            _step_and_capture(frames)
             frame_count += 1
         
         # =====================================================================
-        # Phase 2.5: Retry demo (intentional bad placement)
+        # Phase 2.5a: Controlled Descent
+        # =====================================================================
+        # Move box kinematically from hover to just above contact,
+        # then release it to dynamic physics for final settle.
+        descent_start_z = hover_pos[2].item()
+        descent_end_z = z_base + bh / 2.0 + 0.005  # 5mm above resting
+        descent_dist = max(descent_start_z - descent_end_z, 0.0)
+        frame_dt = 1.0 / args.fps
+        # Number of frames at the configured descent speed
+        descent_frames = max(1, int(descent_dist / max(args.drop_speed_mps * frame_dt, 1e-6)))
+        
+        for f in range(descent_frames):
+            if frame_count >= total_frames:
+                break
+            frac = f / max(descent_frames - 1, 1)
+            pos = target_pos.clone()
+            pos[2] = descent_start_z + (descent_end_z - descent_start_z) * frac
+            env._set_box_pose(placed_count, pos, quat, device)
+            _step_and_capture(frames)
+            frame_count += 1
+        
+        # =====================================================================
+        # Phase 2.5b: Retry demo (intentional bad placement)
         # =====================================================================
         if is_retry_box:
             print(f"  [RETRY] Box {box_id}: simulating failed placement + retry")
@@ -500,11 +532,7 @@ def main():
                 if frame_count >= total_frames:
                     break
                 env._set_box_pose(placed_count, bad_pos, quat, device)
-                env.sim.step()
-                env.scene.update(dt=env.sim.get_physics_dt())
-                frame = env.render()
-                if frame is not None:
-                    frames.append(frame)
+                _step_and_capture(frames)
                 frame_count += 1
             
             # "Detect failure" — move box back up
@@ -515,11 +543,7 @@ def main():
                 t_smooth = 0.5 - 0.5 * math.cos(math.pi * t)
                 pos = bad_pos + (target_pos - bad_pos) * t_smooth
                 env._set_box_pose(placed_count, pos, quat, device)
-                env.sim.step()
-                env.scene.update(dt=env.sim.get_physics_dt())
-                frame = env.render()
-                if frame is not None:
-                    frames.append(frame)
+                _step_and_capture(frames)
                 frame_count += 1
         
         # =====================================================================
@@ -531,11 +555,7 @@ def main():
         for f in range(SETTLE_FRAMES):
             if frame_count >= total_frames:
                 break
-            env.sim.step()
-            env.scene.update(dt=env.sim.get_physics_dt())
-            frame = env.render()
-            if frame is not None:
-                frames.append(frame)
+            _step_and_capture(frames)
             frame_count += 1
         
         # =====================================================================
@@ -544,11 +564,7 @@ def main():
         for f in range(PAUSE_FRAMES):
             if frame_count >= total_frames:
                 break
-            env.sim.step()
-            env.scene.update(dt=env.sim.get_physics_dt())
-            frame = env.render()
-            if frame is not None:
-                frames.append(frame)
+            _step_and_capture(frames)
             frame_count += 1
         
         placed_count += 1
@@ -556,11 +572,7 @@ def main():
     
     # Fill remaining frames with static scene
     while frame_count < total_frames:
-        env.sim.step()
-        env.scene.update(dt=env.sim.get_physics_dt())
-        frame = env.render()
-        if frame is not None:
-            frames.append(frame)
+        _step_and_capture(frames)
         frame_count += 1
     
     # =========================================================================

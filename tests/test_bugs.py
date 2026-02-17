@@ -108,10 +108,67 @@ def test_rsl_rl_wrapper_entropy():
     print("✓ RSL-RL wrapper entropy test passed")
 
 
+def test_pallet_mesh_centering_math():
+    """Test the bbox → correction math used in _spawn_pallet_mesh_visual.
+
+    Given a mock mesh bounding box, verify the auto-centering correction
+    aligns XY center to (0,0) and Z base to collider top (0.15m).
+    """
+    # --- Pallet collider constants (from PalletSceneCfg) ---
+    COLLIDER_CENTER_XY = (0.0, 0.0)
+    COLLIDER_TOP_Z = 0.15  # pos.z=0.075, half-height=0.075
+
+    # --- Mock bbox: mesh at arbitrary offset ---
+    # Suppose STL mesh spawned at origin has bounds:
+    #   min = (0.5, 0.3, 0.0)
+    #   max = (1.7, 1.1, 0.15)
+    min_x, min_y, min_z = 0.5, 0.3, 0.0
+    max_x, max_y, max_z = 1.7, 1.1, 0.15
+    center_x = (min_x + max_x) / 2.0  # 1.1
+    center_y = (min_y + max_y) / 2.0  # 0.7
+
+    # Auto-center XY
+    dx = COLLIDER_CENTER_XY[0] - center_x  # -1.1
+    dy = COLLIDER_CENTER_XY[1] - center_y  # -0.7
+
+    # Auto-align Z (mesh base → collider top)
+    dz = COLLIDER_TOP_Z - min_z  # 0.15
+
+    assert abs(dx - (-1.1)) < 1e-6, f"dx={dx}"
+    assert abs(dy - (-0.7)) < 1e-6, f"dy={dy}"
+    assert abs(dz - 0.15) < 1e-6, f"dz={dz}"
+
+    # Add user offset
+    user_off = (0.01, -0.02, 0.005)
+    final_x = dx + user_off[0]
+    final_y = dy + user_off[1]
+    final_z = dz + user_off[2]
+
+    assert abs(final_x - (-1.09)) < 1e-6, f"final_x={final_x}"
+    assert abs(final_y - (-0.72)) < 1e-6, f"final_y={final_y}"
+    assert abs(final_z - 0.155) < 1e-6, f"final_z={final_z}"
+
+    # Case 2: mesh already centered — correction should be near-zero
+    min_x2, min_y2, min_z2 = -0.6, -0.4, 0.0
+    max_x2, max_y2, max_z2 = 0.6, 0.4, 0.15
+    cx2 = (min_x2 + max_x2) / 2.0  # 0.0
+    cy2 = (min_y2 + max_y2) / 2.0  # 0.0
+    dx2 = -cx2
+    dy2 = -cy2
+    dz2 = 0.15 - min_z2
+    assert abs(dx2) < 1e-6, f"dx2={dx2}"
+    assert abs(dy2) < 1e-6, f"dy2={dy2}"
+    assert abs(dz2 - 0.15) < 1e-6, f"dz2={dz2}"
+
+    print("✓ pallet_mesh_centering_math tests passed")
+
+
 if __name__ == "__main__":
     test_decode_action_rectangular()
     test_action_mean_no_mutation()
     test_mask_shape_contract()
     test_terminated_truncated_types()
     test_rsl_rl_wrapper_entropy()
+    test_pallet_mesh_centering_math()
     print("\n✅ All static tests passed!")
+

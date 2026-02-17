@@ -295,6 +295,8 @@ class PalletTaskCfg(DirectRLEnvCfg):
     pallet_mesh_offset_pos: tuple[float, float, float] = (0.0, 0.0, 0.0)
     pallet_mesh_offset_quat_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
     pallet_mesh_cache_dir: str = "assets/_usd_cache"
+    pallet_mesh_auto_center: bool = True   # auto-center mesh XY on pallet collider
+    pallet_mesh_auto_align_z: bool = True  # align mesh Z base to collider top
     
     # =========================================================================
     # Mockup Mode: Physics/Visual Overrides for Demo Videos
@@ -310,10 +312,10 @@ class PalletTaskCfg(DirectRLEnvCfg):
     mockup_box_restitution: float = 0.0
     
     # --- Mockup rigid body stability ---
-    mockup_box_linear_damping: float = 1.0
-    mockup_box_angular_damping: float = 1.0
-    mockup_box_max_linear_velocity: float = 3.0     # m/s
-    mockup_box_max_angular_velocity: float = 15.0    # rad/s
+    mockup_box_linear_damping: float = 2.0
+    mockup_box_angular_damping: float = 2.0
+    mockup_box_max_linear_velocity: float = 2.0     # m/s
+    mockup_box_max_angular_velocity: float = 10.0    # rad/s
     mockup_solver_position_iterations: int = 12
     mockup_solver_velocity_iterations: int = 4
     mockup_contact_offset: float = 0.02
@@ -832,60 +834,61 @@ class PalletTask(DirectRLEnv):
             print("[INFO] Created DistantLight at /World/DistantLight for headless rendering")
 
         # =====================================================================
-        # Cement / Linoleum Floor Slab
+        # Visual-Only Concrete / Linoleum Floor
         # =====================================================================
-        # A large flat kinematic cuboid covers the grid-textured ground plane.
-        # Physics material: high friction, zero restitution for box stability.
-        floor_path = "/World/FloorSlab"
+        # Thin visual slab placed just below z=0 to cover the default grid
+        # ground plane. Collision stays on the ground plane itself.
+        floor_path = "/World/FloorVisual"
         if not prim_utils.is_prim_path_valid(floor_path):
+            _floor_spawned = False
+            # Strategy 1: CuboidCfg with visual_material only (no physics)
             try:
-                _floor_vis_kwargs = {}
-                try:
-                    _floor_vis_kwargs["visual_material"] = PreviewSurfaceCfg(
-                        diffuse_color=(0.55, 0.55, 0.55),  # cement gray
+                floor_spawner = CuboidCfg(
+                    size=(20.0, 20.0, 0.02),
+                    visual_material=PreviewSurfaceCfg(
+                        diffuse_color=(0.55, 0.55, 0.55),
                         roughness=0.9,
                         metallic=0.0,
-                    )
-                except TypeError:
-                    pass  # version compat
-                
-                floor_spawner = CuboidCfg(
-                    size=(20.0, 20.0, 0.1),
-                    rigid_props=RigidBodyPropertiesCfg(kinematic_enabled=True),
-                    collision_props=CollisionPropertiesCfg(),
-                    mass_props=MassPropertiesCfg(mass=0.0),
-                    **_floor_vis_kwargs,
+                    ),
                 )
                 floor_spawner.func(
                     floor_path, floor_spawner,
-                    translation=(0.0, 0.0, -0.05),
+                    translation=(0.0, 0.0, -0.01),
                     orientation=(1.0, 0.0, 0.0, 0.0),
                 )
-                print("[INFO] Spawned cement floor slab at /World/FloorSlab")
+                _floor_spawned = True
+                print("[INFO] Spawned visual floor slab via CuboidCfg")
             except Exception as e:
-                print(f"[WARNING] Failed to spawn floor slab: {e}")
+                print(f"[INFO] CuboidCfg visual-only floor failed ({e}), trying USD fallback")
             
-            # Apply high-friction physics material to floor via USD
-            try:
-                from pxr import UsdPhysics, Sdf
-                stage = prim_utils.get_current_stage()
-                mat_path = "/World/FloorSlab/PhysicsMaterial"
-                UsdPhysics.MaterialAPI.Apply(stage.DefinePrim(Sdf.Path(mat_path)))
-                mat_prim = stage.GetPrimAtPath(mat_path)
-                mat_api = UsdPhysics.MaterialAPI(mat_prim)
-                mat_api.CreateStaticFrictionAttr().Set(1.2)
-                mat_api.CreateDynamicFrictionAttr().Set(1.0)
-                mat_api.CreateRestitutionAttr().Set(0.0)
-                # Bind material to floor collision prim
-                floor_prim = stage.GetPrimAtPath(floor_path)
-                if floor_prim.IsValid():
-                    binding = UsdPhysics.MaterialAPI.Apply(floor_prim)
-                    binding.CreateStaticFrictionAttr().Set(1.2)
-                    binding.CreateDynamicFrictionAttr().Set(1.0)
-                    binding.CreateRestitutionAttr().Set(0.0)
-                print("[INFO] Applied floor physics material (friction=1.2/1.0, restitution=0.0)")
-            except Exception as e:
-                print(f"[WARNING] Could not apply floor physics material: {e}")
+            # Strategy 2: raw USD Cube prim + PreviewSurface shader
+            if not _floor_spawned:
+                try:
+                    from pxr import UsdGeom, UsdShade, Sdf, Gf
+                    stage = prim_utils.get_current_stage()
+                    cube_prim = stage.DefinePrim(floor_path, "Cube")
+                    cube_prim.GetAttribute("size").Set(1.0)
+                    xform = UsdGeom.Xformable(cube_prim)
+                    xform.ClearXformOpOrder()
+                    xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -0.01))
+                    xform.AddScaleOp().Set(Gf.Vec3f(20.0, 20.0, 0.02))
+                    # Apply concrete shader
+                    mat_path = f"{floor_path}/ConcreteMat"
+                    mat = UsdShade.Material.Define(stage, mat_path)
+                    shader = UsdShade.Shader.Define(stage, f"{mat_path}/Shader")
+                    shader.CreateIdAttr("UsdPreviewSurface")
+                    shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                        Gf.Vec3f(0.55, 0.55, 0.55)
+                    )
+                    shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.9)
+                    shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+                    mat.CreateSurfaceOutput().ConnectToSource(
+                        shader.ConnectableAPI(), "surface"
+                    )
+                    UsdShade.MaterialBindingAPI.Apply(cube_prim).Bind(mat)
+                    print("[INFO] Spawned visual floor slab via USD fallback")
+                except Exception as e2:
+                    print(f"[WARNING] Both floor strategies failed: {e2}")
 
         # IsaacLab 5.0: Create container Xform prims for rigid object collections.
         # RigidObjectCollection expects parent prims to exist before spawning.
@@ -912,13 +915,15 @@ class PalletTask(DirectRLEnv):
     
     def _spawn_pallet_mesh_visual(self, source_env_path: str):
         """
-        Spawn visual-only pallet mesh from STL file.
+        Spawn visual-only pallet mesh from STL file with auto-centering.
         
-        Converts STL→USD using MeshConverter (cached), creates visual-only Xform prim.
-        The physics collider remains the cuboid pallet defined in PalletSceneCfg.
-        
-        Robust STL selection: if configured path doesn't exist, globs assets/
-        for .stl files and prefers filenames containing "pallet".
+        Pipeline:
+          1. Resolve STL path (robust glob fallback)
+          2. Convert STL→USD via MeshConverter (cached)
+          3. Spawn at origin
+          4. Compute world bbox via UsdGeom.BBoxCache
+          5. Auto-center XY on pallet collider + align Z base to collider top
+          6. Apply wood material + hide cuboid pallet visual
         
         Args:
             source_env_path: USD path to env_0 (e.g. "/World/envs/env_0")
@@ -927,47 +932,41 @@ class PalletTask(DirectRLEnv):
         import glob
         import hashlib
         
+        # --- 1. Resolve STL path ---
         stl_path = self.cfg.pallet_mesh_stl_path
         if not os.path.isabs(stl_path):
-            # Resolve relative to package root
             pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             stl_path = os.path.join(os.path.dirname(pkg_dir), stl_path)
         
         if not os.path.exists(stl_path):
-            # Robust fallback: search assets/ for any .stl file
             pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             assets_dir = os.path.join(os.path.dirname(pkg_dir), "assets")
             stl_files = sorted(glob.glob(os.path.join(assets_dir, "*.stl")) +
                                glob.glob(os.path.join(assets_dir, "*.STL")))
             if stl_files:
-                # Prefer files with "pallet" in the name
                 pallet_files = [f for f in stl_files if "pallet" in os.path.basename(f).lower()]
                 stl_path = pallet_files[0] if pallet_files else stl_files[0]
                 print(f"[INFO] Auto-selected pallet STL: {os.path.basename(stl_path)}")
             else:
                 print(f"[WARNING] No STL files found in {assets_dir}, skipping pallet mesh")
                 return
-        
         print(f"[INFO] Using pallet STL: {stl_path}")
         
-        # Cache directory for converted USD
+        # --- 2. Convert STL→USD (cached) ---
         cache_dir = self.cfg.pallet_mesh_cache_dir
         if not os.path.isabs(cache_dir):
             pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             cache_dir = os.path.join(os.path.dirname(pkg_dir), cache_dir)
         os.makedirs(cache_dir, exist_ok=True)
         
-        # Hash-based cache filename
         stl_hash = hashlib.md5(open(stl_path, "rb").read()).hexdigest()[:8]
         scale_str = "_".join(f"{s:.4f}" for s in self.cfg.pallet_mesh_scale)
         usd_name = f"pallet_mesh_{stl_hash}_{scale_str}.usd"
         usd_path = os.path.join(cache_dir, usd_name)
         
-        # Convert STL→USD if not cached
         if not os.path.exists(usd_path):
             try:
                 from isaaclab.sim.converters import MeshConverter, MeshConverterCfg
-                
                 converter_cfg = MeshConverterCfg(
                     asset_path=stl_path,
                     usd_dir=cache_dir,
@@ -984,21 +983,10 @@ class PalletTask(DirectRLEnv):
         else:
             print(f"[INFO] Using cached pallet mesh USD: {usd_path}")
         
-        # Spawn visual-only prim at pallet position
-        # NOTE: Pallet init_state pos is (0, 0, 0.075), not cfg.pallet_pos
+        # --- 3. Spawn at origin first (will be repositioned in step 5) ---
         mesh_prim_path = f"{source_env_path}/PalletMeshVisual"
         try:
             from isaaclab.sim.spawners.from_files import UsdFileCfg
-            
-            # Pallet center from PalletSceneCfg.pallet.init_state
-            pallet_pos = (0.0, 0.0, 0.075)
-            offset = self.cfg.pallet_mesh_offset_pos
-            final_pos = (
-                pallet_pos[0] + offset[0],
-                pallet_pos[1] + offset[1],
-                pallet_pos[2] + offset[2],
-            )
-            
             spawner = UsdFileCfg(
                 usd_path=usd_path,
                 scale=self.cfg.pallet_mesh_scale,
@@ -1007,48 +995,116 @@ class PalletTask(DirectRLEnv):
             )
             spawner.func(
                 mesh_prim_path, spawner,
-                translation=final_pos,
+                translation=(0.0, 0.0, 0.0),
                 orientation=self.cfg.pallet_mesh_offset_quat_wxyz,
             )
             print(f"[INFO] Spawned visual pallet mesh at {mesh_prim_path}")
-            
-            # Apply wood-ish material to the mesh prim
-            try:
-                from pxr import UsdShade, Sdf, Gf
-                stage = prim_utils.get_current_stage()
-                mat_path = f"{mesh_prim_path}/WoodMaterial"
-                mat = UsdShade.Material.Define(stage, mat_path)
-                shader = UsdShade.Shader.Define(stage, f"{mat_path}/Shader")
-                shader.CreateIdAttr("UsdPreviewSurface")
-                shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-                    Gf.Vec3f(0.72, 0.55, 0.35)  # warm wood tone
-                )
-                shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.85)
-                shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-                mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-                # Bind to all geometry under the mesh prim
-                mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
-                if mesh_prim.IsValid():
-                    UsdShade.MaterialBindingAPI.Apply(mesh_prim).Bind(mat)
-                print(f"[INFO] Applied wood material to pallet mesh")
-            except Exception as e:
-                print(f"[WARNING] Could not apply wood material: {e}")
-            
-            # Hide the cuboid pallet visual (keep collision)
-            pallet_visual_path = f"{source_env_path}/Pallet"
-            try:
-                from pxr import UsdGeom
-                stage = prim_utils.get_current_stage()
-                pallet_prim = stage.GetPrimAtPath(pallet_visual_path)
-                if pallet_prim.IsValid():
-                    imageable = UsdGeom.Imageable(pallet_prim)
-                    imageable.MakeInvisible()
-                    print(f"[INFO] Hidden cuboid pallet visual at {pallet_visual_path}")
-            except Exception as e:
-                print(f"[WARNING] Could not hide cuboid pallet: {e}")
-                
         except Exception as e:
             print(f"[WARNING] Failed to spawn pallet mesh visual: {e}")
+            return
+        
+        # --- 4. Compute bounding box for auto-centering ---
+        # Pallet collider: 1.2×0.8×0.15m at pos=(0,0,0.075), top surface at z=0.15
+        _COLLIDER_CENTER_XY = (0.0, 0.0)
+        _COLLIDER_TOP_Z = 0.15  # 0.075 + 0.15/2
+        
+        dx, dy, dz = 0.0, 0.0, 0.0
+        try:
+            from pxr import UsdGeom, Usd
+            stage = prim_utils.get_current_stage()
+            mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
+            
+            if mesh_prim.IsValid():
+                cache = UsdGeom.BBoxCache(
+                    Usd.TimeCode.Default(),
+                    includedPurposes=[UsdGeom.Tokens.default_],
+                    useExtentsHint=True,
+                )
+                bbox = cache.ComputeWorldBound(mesh_prim)
+                aligned = bbox.ComputeAlignedRange()
+                min_pt = aligned.GetMin()
+                max_pt = aligned.GetMax()
+                center = (aligned.GetMin() + aligned.GetMax()) / 2.0
+                
+                print(f"[INFO] Pallet mesh bbox:")
+                print(f"  min = ({min_pt[0]:.4f}, {min_pt[1]:.4f}, {min_pt[2]:.4f})")
+                print(f"  max = ({max_pt[0]:.4f}, {max_pt[1]:.4f}, {max_pt[2]:.4f})")
+                print(f"  center = ({center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f})")
+                
+                # --- 5a. Auto-center XY ---
+                if self.cfg.pallet_mesh_auto_center:
+                    dx = _COLLIDER_CENTER_XY[0] - center[0]
+                    dy = _COLLIDER_CENTER_XY[1] - center[1]
+                
+                # --- 5b. Auto-align Z (mesh base → collider top) ---
+                if self.cfg.pallet_mesh_auto_align_z:
+                    dz = _COLLIDER_TOP_Z - min_pt[2]
+                
+                print(f"[INFO] Auto-correction: dx={dx:.4f}, dy={dy:.4f}, dz={dz:.4f}")
+            else:
+                print("[WARNING] Pallet mesh prim not valid for bbox computation")
+        except Exception as e:
+            print(f"[WARNING] BBox computation failed, using manual offset: {e}")
+        
+        # --- 5c. Apply correction + user offset ---
+        user_off = self.cfg.pallet_mesh_offset_pos
+        final_x = dx + user_off[0]
+        final_y = dy + user_off[1]
+        final_z = dz + user_off[2]
+        
+        try:
+            from pxr import UsdGeom, Gf
+            stage = prim_utils.get_current_stage()
+            mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
+            if mesh_prim.IsValid():
+                xformable = UsdGeom.Xformable(mesh_prim)
+                # Find or create translate op
+                ops = xformable.GetOrderedXformOps()
+                translate_op = None
+                for op in ops:
+                    if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                        translate_op = op
+                        break
+                if translate_op is None:
+                    translate_op = xformable.AddTranslateOp()
+                translate_op.Set(Gf.Vec3d(final_x, final_y, final_z))
+                print(f"[INFO] Pallet mesh final position: ({final_x:.4f}, {final_y:.4f}, {final_z:.4f})")
+        except Exception as e:
+            print(f"[WARNING] Could not reposition pallet mesh: {e}")
+        
+        # --- 6a. Apply wood material ---
+        try:
+            from pxr import UsdShade, Sdf, Gf
+            stage = prim_utils.get_current_stage()
+            mat_path = f"{mesh_prim_path}/WoodMaterial"
+            mat = UsdShade.Material.Define(stage, mat_path)
+            shader = UsdShade.Shader.Define(stage, f"{mat_path}/Shader")
+            shader.CreateIdAttr("UsdPreviewSurface")
+            shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                Gf.Vec3f(0.72, 0.55, 0.35)  # warm wood tone
+            )
+            shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.85)
+            shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+            mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+            mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
+            if mesh_prim.IsValid():
+                UsdShade.MaterialBindingAPI.Apply(mesh_prim).Bind(mat)
+            print("[INFO] Applied wood material to pallet mesh")
+        except Exception as e:
+            print(f"[WARNING] Could not apply wood material: {e}")
+        
+        # --- 6b. Hide cuboid pallet visual (keep collision) ---
+        pallet_visual_path = f"{source_env_path}/Pallet"
+        try:
+            from pxr import UsdGeom
+            stage = prim_utils.get_current_stage()
+            pallet_prim = stage.GetPrimAtPath(pallet_visual_path)
+            if pallet_prim.IsValid():
+                imageable = UsdGeom.Imageable(pallet_prim)
+                imageable.MakeInvisible()
+                print(f"[INFO] Hidden cuboid pallet visual at {pallet_visual_path}")
+        except Exception as e:
+            print(f"[WARNING] Could not hide cuboid pallet: {e}")
     
     def _apply_mockup_physics(self, source_env_path: str):
         """
