@@ -627,18 +627,31 @@ def _patched_init(self, *a, **kw):
     _original_init(self, *a, **kw)
     
     def _set_box_pose(box_local_idx: int, pos: torch.Tensor, quat_wxyz: torch.Tensor, device: str):
-        """Set pose for a single box in env 0 (mockup mode, single env)."""
+        """Set pose for a single box in env 0 (mockup mode, single env).
+        
+        Also zeros linear and angular velocities to prevent residual momentum
+        from causing jitter or unnatural motion after teleporting.
+        """
         try:
             boxes = self.scene["boxes"]
             # For single env: object_pos_w is (1, max_boxes, 3)
             boxes.data.object_pos_w[0, box_local_idx] = pos.to(device)
             boxes.data.object_quat_w[0, box_local_idx] = quat_wxyz.to(device)
+            # Zero velocities to prevent residual momentum
+            boxes.data.object_lin_vel_w[0, box_local_idx] = 0.0
+            boxes.data.object_ang_vel_w[0, box_local_idx] = 0.0
             
-            # Write to sim
+            # Write pose to sim
             all_pos = boxes.data.object_pos_w.reshape(-1, 3)
             all_quat = boxes.data.object_quat_w.reshape(-1, 4)
             boxes.write_object_pose_to_sim(
                 torch.cat([all_pos, all_quat], dim=-1)
+            )
+            # Write velocities to sim
+            all_lin = boxes.data.object_lin_vel_w.reshape(-1, 3)
+            all_ang = boxes.data.object_ang_vel_w.reshape(-1, 3)
+            boxes.write_object_velocity_to_sim(
+                torch.cat([all_lin, all_ang], dim=-1)
             )
         except Exception as e:
             print(f"[WARNING] _set_box_pose failed: {e}")

@@ -112,11 +112,12 @@ def test_pallet_mesh_centering_math():
     """Test the bbox → correction math used in _spawn_pallet_mesh_visual.
 
     Given a mock mesh bounding box, verify the auto-centering correction
-    aligns XY center to (0,0) and Z base to collider top (0.15m).
+    aligns XY center to pallet collider center and Z base to collider bottom (z=0).
     """
-    # --- Pallet collider constants (from PalletSceneCfg) ---
+    # --- Pallet collider constants (from PalletSceneCfg / USD read) ---
     COLLIDER_CENTER_XY = (0.0, 0.0)
-    COLLIDER_TOP_Z = 0.15  # pos.z=0.075, half-height=0.075
+    # Collider at z=0.075 with half-height 0.075 → bottom z=0.0
+    COLLIDER_BOTTOM_Z = 0.0
 
     # --- Mock bbox: mesh at arbitrary offset ---
     # Suppose STL mesh spawned at origin has bounds:
@@ -131,12 +132,12 @@ def test_pallet_mesh_centering_math():
     dx = COLLIDER_CENTER_XY[0] - center_x  # -1.1
     dy = COLLIDER_CENTER_XY[1] - center_y  # -0.7
 
-    # Auto-align Z (mesh base → collider top)
-    dz = COLLIDER_TOP_Z - min_z  # 0.15
+    # Auto-align Z (mesh base → collider bottom)
+    dz = COLLIDER_BOTTOM_Z - min_z  # 0.0
 
     assert abs(dx - (-1.1)) < 1e-6, f"dx={dx}"
     assert abs(dy - (-0.7)) < 1e-6, f"dy={dy}"
-    assert abs(dz - 0.15) < 1e-6, f"dz={dz}"
+    assert abs(dz - 0.0) < 1e-6, f"dz={dz}"
 
     # Add user offset
     user_off = (0.01, -0.02, 0.005)
@@ -146,7 +147,7 @@ def test_pallet_mesh_centering_math():
 
     assert abs(final_x - (-1.09)) < 1e-6, f"final_x={final_x}"
     assert abs(final_y - (-0.72)) < 1e-6, f"final_y={final_y}"
-    assert abs(final_z - 0.155) < 1e-6, f"final_z={final_z}"
+    assert abs(final_z - 0.005) < 1e-6, f"final_z={final_z}"
 
     # Case 2: mesh already centered — correction should be near-zero
     min_x2, min_y2, min_z2 = -0.6, -0.4, 0.0
@@ -155,10 +156,10 @@ def test_pallet_mesh_centering_math():
     cy2 = (min_y2 + max_y2) / 2.0  # 0.0
     dx2 = -cx2
     dy2 = -cy2
-    dz2 = 0.15 - min_z2
+    dz2 = COLLIDER_BOTTOM_Z - min_z2
     assert abs(dx2) < 1e-6, f"dx2={dx2}"
     assert abs(dy2) < 1e-6, f"dy2={dy2}"
-    assert abs(dz2 - 0.15) < 1e-6, f"dz2={dz2}"
+    assert abs(dz2) < 1e-6, f"dz2={dz2}"
 
     print("✓ pallet_mesh_centering_math tests passed")
 

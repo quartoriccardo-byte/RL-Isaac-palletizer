@@ -92,8 +92,13 @@ class PalletSceneCfg(InteractiveSceneCfg):
                 # Size will be overridden at reset based on `box_dims`
                 spawn=CuboidCfg(
                     size=(0.4, 0.3, 0.2),
-                    rigid_props=RigidBodyPropertiesCfg(),  # Dynamic rigid body
-                    collision_props=CollisionPropertiesCfg(),
+                    rigid_props=RigidBodyPropertiesCfg(
+                        max_depenetration_velocity=1.0,  # prevent contact "popping"
+                    ),
+                    collision_props=CollisionPropertiesCfg(
+                        contact_offset=0.005,
+                        rest_offset=0.0,
+                    ),
                     mass_props=MassPropertiesCfg(density=250.0),
                 ),
                 init_state=RigidObjectCfg.InitialStateCfg(
@@ -296,7 +301,15 @@ class PalletTaskCfg(DirectRLEnvCfg):
     pallet_mesh_offset_quat_wxyz: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
     pallet_mesh_cache_dir: str = "assets/_usd_cache"
     pallet_mesh_auto_center: bool = True   # auto-center mesh XY on pallet collider
-    pallet_mesh_auto_align_z: bool = True  # align mesh Z base to collider top
+    pallet_mesh_auto_align_z: bool = True  # align mesh Z base to collider bottom (z=0)
+    
+    # =========================================================================
+    # Visual Floor Configuration
+    # =========================================================================
+    floor_visual_enabled: bool = True
+    floor_size_xy: tuple[float, float] = (20.0, 20.0)
+    floor_thickness: float = 0.02
+    floor_color: tuple[float, float, float] = (0.55, 0.53, 0.50)  # cement-ish
     
     # =========================================================================
     # Mockup Mode: Physics/Visual Overrides for Demo Videos
@@ -319,6 +332,13 @@ class PalletTaskCfg(DirectRLEnvCfg):
     mockup_solver_position_iterations: int = 12
     mockup_solver_velocity_iterations: int = 4
     mockup_contact_offset: float = 0.02
+    mockup_rest_offset: float = 0.001
+    mockup_max_depenetration_velocity: float = 0.5  # m/s, prevents popping
+    mockup_enable_ccd: bool = True  # continuous collision detection
+    
+    # --- Mockup pallet surface friction ---
+    mockup_pallet_static_friction: float = 1.0
+    mockup_pallet_dynamic_friction: float = 0.8
     
     # --- Mockup drop height (lower = gentler placement) ---
     mockup_drop_height_m: float = 0.4
@@ -839,25 +859,30 @@ class PalletTask(DirectRLEnv):
         # Thin visual slab placed just below z=0 to cover the default grid
         # ground plane. Collision stays on the ground plane itself.
         floor_path = "/World/FloorVisual"
-        if not prim_utils.is_prim_path_valid(floor_path):
+        if self.cfg.floor_visual_enabled and not prim_utils.is_prim_path_valid(floor_path):
+            _fsx, _fsy = self.cfg.floor_size_xy
+            _ft = self.cfg.floor_thickness
+            _fc = self.cfg.floor_color
+            _fz = -_ft / 2.0  # top surface at z=0
             _floor_spawned = False
             # Strategy 1: CuboidCfg with visual_material only (no physics)
             try:
                 floor_spawner = CuboidCfg(
-                    size=(20.0, 20.0, 0.02),
+                    size=(_fsx, _fsy, _ft),
                     visual_material=PreviewSurfaceCfg(
-                        diffuse_color=(0.55, 0.55, 0.55),
+                        diffuse_color=_fc,
                         roughness=0.9,
                         metallic=0.0,
                     ),
                 )
                 floor_spawner.func(
                     floor_path, floor_spawner,
-                    translation=(0.0, 0.0, -0.01),
+                    translation=(0.0, 0.0, _fz),
                     orientation=(1.0, 0.0, 0.0, 0.0),
                 )
                 _floor_spawned = True
-                print("[INFO] Spawned visual floor slab via CuboidCfg")
+                print(f"[INFO] Spawned visual floor slab via CuboidCfg "
+                      f"({_fsx}x{_fsy}x{_ft}, color={_fc})")
             except Exception as e:
                 print(f"[INFO] CuboidCfg visual-only floor failed ({e}), trying USD fallback")
             
@@ -870,15 +895,15 @@ class PalletTask(DirectRLEnv):
                     cube_prim.GetAttribute("size").Set(1.0)
                     xform = UsdGeom.Xformable(cube_prim)
                     xform.ClearXformOpOrder()
-                    xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, -0.01))
-                    xform.AddScaleOp().Set(Gf.Vec3f(20.0, 20.0, 0.02))
+                    xform.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, _fz))
+                    xform.AddScaleOp().Set(Gf.Vec3f(_fsx, _fsy, _ft))
                     # Apply concrete shader
                     mat_path = f"{floor_path}/ConcreteMat"
                     mat = UsdShade.Material.Define(stage, mat_path)
                     shader = UsdShade.Shader.Define(stage, f"{mat_path}/Shader")
                     shader.CreateIdAttr("UsdPreviewSurface")
                     shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-                        Gf.Vec3f(0.55, 0.55, 0.55)
+                        Gf.Vec3f(*_fc)
                     )
                     shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.9)
                     shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
@@ -886,7 +911,8 @@ class PalletTask(DirectRLEnv):
                         shader.ConnectableAPI(), "surface"
                     )
                     UsdShade.MaterialBindingAPI.Apply(cube_prim).Bind(mat)
-                    print("[INFO] Spawned visual floor slab via USD fallback")
+                    print(f"[INFO] Spawned visual floor slab via USD fallback "
+                          f"({_fsx}x{_fsy}x{_ft}, color={_fc})")
                 except Exception as e2:
                     print(f"[WARNING] Both floor strategies failed: {e2}")
 
@@ -1004,16 +1030,33 @@ class PalletTask(DirectRLEnv):
             return
         
         # --- 4. Compute bounding box for auto-centering ---
-        # Pallet collider: 1.2×0.8×0.15m at pos=(0,0,0.075), top surface at z=0.15
-        _COLLIDER_CENTER_XY = (0.0, 0.0)
-        _COLLIDER_TOP_Z = 0.15  # 0.075 + 0.15/2
-        
+        # Read pallet collider transform from USD (robust, no hardcoding)
+        pallet_prim_path = f"{source_env_path}/Pallet"
         dx, dy, dz = 0.0, 0.0, 0.0
         try:
-            from pxr import UsdGeom, Usd
+            from pxr import UsdGeom, Usd, Gf
             stage = prim_utils.get_current_stage()
-            mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
             
+            # --- 4a. Read pallet collider pose from USD ---
+            pallet_prim = stage.GetPrimAtPath(pallet_prim_path)
+            collider_center = Gf.Vec3d(0.0, 0.0, 0.075)  # fallback
+            pallet_half_h = 0.075  # half of 0.15m cuboid height
+            if pallet_prim.IsValid():
+                pallet_xform = UsdGeom.Xformable(pallet_prim)
+                local_mat = pallet_xform.GetLocalTransformation()
+                collider_center = local_mat.ExtractTranslation()
+                # Read cuboid half-height from scene config
+                pallet_size_z = 0.15  # from PalletSceneCfg pallet CuboidCfg
+                pallet_half_h = pallet_size_z / 2.0
+                print(f"[INFO] Pallet collider center from USD: "
+                      f"({collider_center[0]:.4f}, {collider_center[1]:.4f}, {collider_center[2]:.4f})")
+            else:
+                print("[WARNING] Pallet prim not found, using fallback center (0,0,0.075)")
+            
+            collider_bottom_z = collider_center[2] - pallet_half_h  # = 0.0
+            
+            # --- 4b. Compute mesh bounding box ---
+            mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
             if mesh_prim.IsValid():
                 cache = UsdGeom.BBoxCache(
                     Usd.TimeCode.Default(),
@@ -1024,21 +1067,21 @@ class PalletTask(DirectRLEnv):
                 aligned = bbox.ComputeAlignedRange()
                 min_pt = aligned.GetMin()
                 max_pt = aligned.GetMax()
-                center = (aligned.GetMin() + aligned.GetMax()) / 2.0
+                center = (min_pt + max_pt) / 2.0
                 
                 print(f"[INFO] Pallet mesh bbox:")
                 print(f"  min = ({min_pt[0]:.4f}, {min_pt[1]:.4f}, {min_pt[2]:.4f})")
                 print(f"  max = ({max_pt[0]:.4f}, {max_pt[1]:.4f}, {max_pt[2]:.4f})")
                 print(f"  center = ({center[0]:.4f}, {center[1]:.4f}, {center[2]:.4f})")
                 
-                # --- 5a. Auto-center XY ---
+                # --- 5a. Auto-center XY on pallet collider center ---
                 if self.cfg.pallet_mesh_auto_center:
-                    dx = _COLLIDER_CENTER_XY[0] - center[0]
-                    dy = _COLLIDER_CENTER_XY[1] - center[1]
+                    dx = collider_center[0] - center[0]
+                    dy = collider_center[1] - center[1]
                 
-                # --- 5b. Auto-align Z (mesh base → collider top) ---
+                # --- 5b. Auto-align Z: mesh bottom → collider bottom (z=0) ---
                 if self.cfg.pallet_mesh_auto_align_z:
-                    dz = _COLLIDER_TOP_Z - min_pt[2]
+                    dz = collider_bottom_z - min_pt[2]
                 
                 print(f"[INFO] Auto-correction: dx={dx:.4f}, dy={dy:.4f}, dz={dz:.4f}")
             else:
@@ -1145,8 +1188,7 @@ class PalletTask(DirectRLEnv):
                 phys_mat.CreateDynamicFrictionAttr().Set(cfg.mockup_box_dynamic_friction)
                 phys_mat.CreateRestitutionAttr().Set(cfg.mockup_box_restitution)
                 
-                # --- Rigid body stability (damping, velocity clamp, solver) ---
-                # Find the rigid body prim (may be the box prim itself or a child)
+                # --- Rigid body stability (damping, velocity clamp, solver, depenet, CCD) ---
                 rb_api = None
                 if box_prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
                     rb_api = PhysxSchema.PhysxRigidBodyAPI(box_prim)
@@ -1160,9 +1202,34 @@ class PalletTask(DirectRLEnv):
                     rb_api.CreateMaxAngularVelocityAttr().Set(cfg.mockup_box_max_angular_velocity)
                     rb_api.CreateSolverPositionIterationCountAttr().Set(cfg.mockup_solver_position_iterations)
                     rb_api.CreateSolverVelocityIterationCountAttr().Set(cfg.mockup_solver_velocity_iterations)
-                    rb_api.CreateContactOffsetAttr().Set(cfg.mockup_contact_offset)
+                    rb_api.CreateMaxDepenetrationVelocityAttr().Set(cfg.mockup_max_depenetration_velocity)
+                    if cfg.mockup_enable_ccd:
+                        rb_api.CreateEnableCCDAttr().Set(True)
+                
+                # Collision properties: contact/rest offsets
+                col_api = None
+                if box_prim.HasAPI(PhysxSchema.PhysxCollisionAPI):
+                    col_api = PhysxSchema.PhysxCollisionAPI(box_prim)
+                else:
+                    col_api = PhysxSchema.PhysxCollisionAPI.Apply(box_prim)
+                if col_api is not None:
+                    col_api.CreateContactOffsetAttr().Set(cfg.mockup_contact_offset)
+                    col_api.CreateRestOffsetAttr().Set(cfg.mockup_rest_offset)
                 
                 applied_count += 1
+            
+            # --- Apply friction to pallet surface for box-pallet contact ---
+            pallet_path = f"{source_env_path}/Pallet"
+            pallet_prim = stage.GetPrimAtPath(pallet_path)
+            if pallet_prim.IsValid():
+                UsdPhysics.MaterialAPI.Apply(pallet_prim)
+                pal_mat = UsdPhysics.MaterialAPI(pallet_prim)
+                pal_mat.CreateStaticFrictionAttr().Set(cfg.mockup_pallet_static_friction)
+                pal_mat.CreateDynamicFrictionAttr().Set(cfg.mockup_pallet_dynamic_friction)
+                pal_mat.CreateRestitutionAttr().Set(0.0)
+                print(f"[INFO] Applied mockup friction to pallet collider: "
+                      f"static={cfg.mockup_pallet_static_friction}, "
+                      f"dynamic={cfg.mockup_pallet_dynamic_friction}")
             
             print(f"[INFO] Applied mockup physics to {applied_count} box prims")
             print(f"  friction: static={cfg.mockup_box_static_friction}, "
@@ -1172,6 +1239,8 @@ class PalletTask(DirectRLEnv):
                   f"angular={cfg.mockup_box_angular_damping}")
             print(f"  velocity clamp: linear={cfg.mockup_box_max_linear_velocity} m/s, "
                   f"angular={cfg.mockup_box_max_angular_velocity} rad/s")
+            print(f"  depenetration: max_vel={cfg.mockup_max_depenetration_velocity} m/s, "
+                  f"CCD={cfg.mockup_enable_ccd}")
             print(f"  solver iterations: pos={cfg.mockup_solver_position_iterations}, "
                   f"vel={cfg.mockup_solver_velocity_iterations}")
             
