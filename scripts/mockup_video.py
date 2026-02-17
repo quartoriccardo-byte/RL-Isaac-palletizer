@@ -310,6 +310,7 @@ def main():
     cfg.sim.render_interval = 1  # Every frame for video
     cfg.max_boxes = max(args.num_boxes + 5, cfg.max_boxes)  # Extra for retries
     cfg.use_pallet_mesh_visual = True  # Show Euro pallet mesh
+    cfg.mockup_mode = True              # Gentle physics for demo video
     
     # Ensure sim device matches CLI --device (e.g. "cuda:2")
     # Without this, PalletTaskCfg.sim.device="cuda" would not carry the index.
@@ -393,7 +394,7 @@ def main():
     # 4. Pause (5 frames)
     SPAWN_FRAMES = 5
     CARRY_FRAMES = 20
-    SETTLE_FRAMES = 20
+    SETTLE_FRAMES = 35  # Extra settling for stable mockup box resting
     PAUSE_FRAMES = 5
     
     # Retry animation extras
@@ -424,7 +425,8 @@ def main():
         
         # Pre-drop hover position (above target)
         hover_pos = target_pos.clone()
-        hover_pos[2] = max(z_base + bh + 0.3, 0.8)  # hover above
+        # Gentler hover: use mockup drop height for controlled descent
+        hover_pos[2] = z_base + bh + cfg.mockup_drop_height_m
         
         # Rotation quaternion (wxyz format)
         if rot == 0:

@@ -297,6 +297,31 @@ class PalletTaskCfg(DirectRLEnvCfg):
     pallet_mesh_cache_dir: str = "assets/_usd_cache"
     
     # =========================================================================
+    # Mockup Mode: Physics/Visual Overrides for Demo Videos
+    # =========================================================================
+    # When True, applies aggressive damping, friction, velocity clamping,
+    # and a gentler drop height for stable, aesthetic box placements.
+    # Training should keep this False (default).
+    mockup_mode: bool = False
+    
+    # --- Mockup box physics material ---
+    mockup_box_static_friction: float = 1.5
+    mockup_box_dynamic_friction: float = 1.2
+    mockup_box_restitution: float = 0.0
+    
+    # --- Mockup rigid body stability ---
+    mockup_box_linear_damping: float = 1.0
+    mockup_box_angular_damping: float = 1.0
+    mockup_box_max_linear_velocity: float = 3.0     # m/s
+    mockup_box_max_angular_velocity: float = 15.0    # rad/s
+    mockup_solver_position_iterations: int = 12
+    mockup_solver_velocity_iterations: int = 4
+    mockup_contact_offset: float = 0.02
+    
+    # --- Mockup drop height (lower = gentler placement) ---
+    mockup_drop_height_m: float = 0.4
+    
+    # =========================================================================
     # Feature: Heightmap Source Selection
     # =========================================================================
     heightmap_source: str = "warp"  # "warp" (default, fast) or "depth_camera"
@@ -806,6 +831,62 @@ class PalletTask(DirectRLEnv):
             )
             print("[INFO] Created DistantLight at /World/DistantLight for headless rendering")
 
+        # =====================================================================
+        # Cement / Linoleum Floor Slab
+        # =====================================================================
+        # A large flat kinematic cuboid covers the grid-textured ground plane.
+        # Physics material: high friction, zero restitution for box stability.
+        floor_path = "/World/FloorSlab"
+        if not prim_utils.is_prim_path_valid(floor_path):
+            try:
+                _floor_vis_kwargs = {}
+                try:
+                    _floor_vis_kwargs["visual_material"] = PreviewSurfaceCfg(
+                        diffuse_color=(0.55, 0.55, 0.55),  # cement gray
+                        roughness=0.9,
+                        metallic=0.0,
+                    )
+                except TypeError:
+                    pass  # version compat
+                
+                floor_spawner = CuboidCfg(
+                    size=(20.0, 20.0, 0.1),
+                    rigid_props=RigidBodyPropertiesCfg(kinematic_enabled=True),
+                    collision_props=CollisionPropertiesCfg(),
+                    mass_props=MassPropertiesCfg(mass=0.0),
+                    **_floor_vis_kwargs,
+                )
+                floor_spawner.func(
+                    floor_path, floor_spawner,
+                    translation=(0.0, 0.0, -0.05),
+                    orientation=(1.0, 0.0, 0.0, 0.0),
+                )
+                print("[INFO] Spawned cement floor slab at /World/FloorSlab")
+            except Exception as e:
+                print(f"[WARNING] Failed to spawn floor slab: {e}")
+            
+            # Apply high-friction physics material to floor via USD
+            try:
+                from pxr import UsdPhysics, Sdf
+                stage = prim_utils.get_current_stage()
+                mat_path = "/World/FloorSlab/PhysicsMaterial"
+                UsdPhysics.MaterialAPI.Apply(stage.DefinePrim(Sdf.Path(mat_path)))
+                mat_prim = stage.GetPrimAtPath(mat_path)
+                mat_api = UsdPhysics.MaterialAPI(mat_prim)
+                mat_api.CreateStaticFrictionAttr().Set(1.2)
+                mat_api.CreateDynamicFrictionAttr().Set(1.0)
+                mat_api.CreateRestitutionAttr().Set(0.0)
+                # Bind material to floor collision prim
+                floor_prim = stage.GetPrimAtPath(floor_path)
+                if floor_prim.IsValid():
+                    binding = UsdPhysics.MaterialAPI.Apply(floor_prim)
+                    binding.CreateStaticFrictionAttr().Set(1.2)
+                    binding.CreateDynamicFrictionAttr().Set(1.0)
+                    binding.CreateRestitutionAttr().Set(0.0)
+                print("[INFO] Applied floor physics material (friction=1.2/1.0, restitution=0.0)")
+            except Exception as e:
+                print(f"[WARNING] Could not apply floor physics material: {e}")
+
         # IsaacLab 5.0: Create container Xform prims for rigid object collections.
         # RigidObjectCollection expects parent prims to exist before spawning.
         # We create them under the source env path (env_0) which is then cloned.
@@ -822,6 +903,12 @@ class PalletTask(DirectRLEnv):
         # at the pallet position. The cuboid pallet collider remains for physics.
         if self.cfg.use_pallet_mesh_visual:
             self._spawn_pallet_mesh_visual(source_env_path)
+        
+        # =====================================================================
+        # Mockup-Mode Physics Overrides
+        # =====================================================================
+        if self.cfg.mockup_mode:
+            self._apply_mockup_physics(source_env_path)
     
     def _spawn_pallet_mesh_visual(self, source_env_path: str):
         """
@@ -830,10 +917,14 @@ class PalletTask(DirectRLEnv):
         Converts STL→USD using MeshConverter (cached), creates visual-only Xform prim.
         The physics collider remains the cuboid pallet defined in PalletSceneCfg.
         
+        Robust STL selection: if configured path doesn't exist, globs assets/
+        for .stl files and prefers filenames containing "pallet".
+        
         Args:
             source_env_path: USD path to env_0 (e.g. "/World/envs/env_0")
         """
         import os
+        import glob
         import hashlib
         
         stl_path = self.cfg.pallet_mesh_stl_path
@@ -843,8 +934,21 @@ class PalletTask(DirectRLEnv):
             stl_path = os.path.join(os.path.dirname(pkg_dir), stl_path)
         
         if not os.path.exists(stl_path):
-            print(f"[WARNING] Pallet mesh STL not found at {stl_path}, skipping visual mesh")
-            return
+            # Robust fallback: search assets/ for any .stl file
+            pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            assets_dir = os.path.join(os.path.dirname(pkg_dir), "assets")
+            stl_files = sorted(glob.glob(os.path.join(assets_dir, "*.stl")) +
+                               glob.glob(os.path.join(assets_dir, "*.STL")))
+            if stl_files:
+                # Prefer files with "pallet" in the name
+                pallet_files = [f for f in stl_files if "pallet" in os.path.basename(f).lower()]
+                stl_path = pallet_files[0] if pallet_files else stl_files[0]
+                print(f"[INFO] Auto-selected pallet STL: {os.path.basename(stl_path)}")
+            else:
+                print(f"[WARNING] No STL files found in {assets_dir}, skipping pallet mesh")
+                return
+        
+        print(f"[INFO] Using pallet STL: {stl_path}")
         
         # Cache directory for converted USD
         cache_dir = self.cfg.pallet_mesh_cache_dir
@@ -881,12 +985,13 @@ class PalletTask(DirectRLEnv):
             print(f"[INFO] Using cached pallet mesh USD: {usd_path}")
         
         # Spawn visual-only prim at pallet position
+        # NOTE: Pallet init_state pos is (0, 0, 0.075), not cfg.pallet_pos
         mesh_prim_path = f"{source_env_path}/PalletMeshVisual"
         try:
             from isaaclab.sim.spawners.from_files import UsdFileCfg
             
-            # Get pallet position from config
-            pallet_pos = self.cfg.pallet_pos  # (x, y, z)
+            # Pallet center from PalletSceneCfg.pallet.init_state
+            pallet_pos = (0.0, 0.0, 0.075)
             offset = self.cfg.pallet_mesh_offset_pos
             final_pos = (
                 pallet_pos[0] + offset[0],
@@ -900,10 +1005,36 @@ class PalletTask(DirectRLEnv):
                 rigid_props=None,
                 collision_props=None,
             )
-            spawner.func(mesh_prim_path, spawner, translation=final_pos, orientation=self.cfg.pallet_mesh_offset_quat_wxyz)
+            spawner.func(
+                mesh_prim_path, spawner,
+                translation=final_pos,
+                orientation=self.cfg.pallet_mesh_offset_quat_wxyz,
+            )
             print(f"[INFO] Spawned visual pallet mesh at {mesh_prim_path}")
             
-            # Optionally hide the cuboid pallet visual
+            # Apply wood-ish material to the mesh prim
+            try:
+                from pxr import UsdShade, Sdf, Gf
+                stage = prim_utils.get_current_stage()
+                mat_path = f"{mesh_prim_path}/WoodMaterial"
+                mat = UsdShade.Material.Define(stage, mat_path)
+                shader = UsdShade.Shader.Define(stage, f"{mat_path}/Shader")
+                shader.CreateIdAttr("UsdPreviewSurface")
+                shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+                    Gf.Vec3f(0.72, 0.55, 0.35)  # warm wood tone
+                )
+                shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.85)
+                shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+                mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+                # Bind to all geometry under the mesh prim
+                mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
+                if mesh_prim.IsValid():
+                    UsdShade.MaterialBindingAPI.Apply(mesh_prim).Bind(mat)
+                print(f"[INFO] Applied wood material to pallet mesh")
+            except Exception as e:
+                print(f"[WARNING] Could not apply wood material: {e}")
+            
+            # Hide the cuboid pallet visual (keep collision)
             pallet_visual_path = f"{source_env_path}/Pallet"
             try:
                 from pxr import UsdGeom
@@ -918,6 +1049,82 @@ class PalletTask(DirectRLEnv):
                 
         except Exception as e:
             print(f"[WARNING] Failed to spawn pallet mesh visual: {e}")
+    
+    def _apply_mockup_physics(self, source_env_path: str):
+        """
+        Apply mockup-mode physics overrides to box prims via USD attributes.
+        
+        Sets high friction, zero restitution, linear/angular damping,
+        solver iterations, and velocity clamping on all box prims.
+        Only called when mockup_mode=True; does not affect training defaults.
+        
+        Args:
+            source_env_path: USD path to env_0 (e.g. "/World/envs/env_0")
+        """
+        try:
+            from pxr import UsdPhysics, PhysxSchema, Sdf
+            stage = prim_utils.get_current_stage()
+            cfg = self.cfg
+            
+            applied_count = 0
+            for i in range(cfg.max_boxes):
+                box_path = f"{source_env_path}/Boxes/box_{i}"
+                box_prim = stage.GetPrimAtPath(box_path)
+                if not box_prim.IsValid():
+                    continue
+                
+                # --- Physics material (friction + restitution) ---
+                mat_path = f"{box_path}/MockupPhysMat"
+                UsdPhysics.MaterialAPI.Apply(stage.DefinePrim(Sdf.Path(mat_path)))
+                mat_prim = stage.GetPrimAtPath(mat_path)
+                mat_api = UsdPhysics.MaterialAPI(mat_prim)
+                mat_api.CreateStaticFrictionAttr().Set(cfg.mockup_box_static_friction)
+                mat_api.CreateDynamicFrictionAttr().Set(cfg.mockup_box_dynamic_friction)
+                mat_api.CreateRestitutionAttr().Set(cfg.mockup_box_restitution)
+                
+                # Bind material to box
+                UsdPhysics.MaterialAPI.Apply(box_prim)
+                phys_mat = UsdPhysics.MaterialAPI(box_prim)
+                phys_mat.CreateStaticFrictionAttr().Set(cfg.mockup_box_static_friction)
+                phys_mat.CreateDynamicFrictionAttr().Set(cfg.mockup_box_dynamic_friction)
+                phys_mat.CreateRestitutionAttr().Set(cfg.mockup_box_restitution)
+                
+                # --- Rigid body stability (damping, velocity clamp, solver) ---
+                # Find the rigid body prim (may be the box prim itself or a child)
+                rb_api = None
+                if box_prim.HasAPI(PhysxSchema.PhysxRigidBodyAPI):
+                    rb_api = PhysxSchema.PhysxRigidBodyAPI(box_prim)
+                else:
+                    rb_api = PhysxSchema.PhysxRigidBodyAPI.Apply(box_prim)
+                
+                if rb_api is not None:
+                    rb_api.CreateLinearDampingAttr().Set(cfg.mockup_box_linear_damping)
+                    rb_api.CreateAngularDampingAttr().Set(cfg.mockup_box_angular_damping)
+                    rb_api.CreateMaxLinearVelocityAttr().Set(cfg.mockup_box_max_linear_velocity)
+                    rb_api.CreateMaxAngularVelocityAttr().Set(cfg.mockup_box_max_angular_velocity)
+                    rb_api.CreateSolverPositionIterationCountAttr().Set(cfg.mockup_solver_position_iterations)
+                    rb_api.CreateSolverVelocityIterationCountAttr().Set(cfg.mockup_solver_velocity_iterations)
+                    rb_api.CreateContactOffsetAttr().Set(cfg.mockup_contact_offset)
+                
+                applied_count += 1
+            
+            print(f"[INFO] Applied mockup physics to {applied_count} box prims")
+            print(f"  friction: static={cfg.mockup_box_static_friction}, "
+                  f"dynamic={cfg.mockup_box_dynamic_friction}, "
+                  f"restitution={cfg.mockup_box_restitution}")
+            print(f"  damping: linear={cfg.mockup_box_linear_damping}, "
+                  f"angular={cfg.mockup_box_angular_damping}")
+            print(f"  velocity clamp: linear={cfg.mockup_box_max_linear_velocity} m/s, "
+                  f"angular={cfg.mockup_box_max_angular_velocity} rad/s")
+            print(f"  solver iterations: pos={cfg.mockup_solver_position_iterations}, "
+                  f"vel={cfg.mockup_solver_velocity_iterations}")
+            
+        except ImportError as e:
+            print(f"[WARNING] PhysX/USD schemas not available for mockup physics: {e}")
+        except Exception as e:
+            print(f"[WARNING] Failed to apply mockup physics: {e}")
+            import traceback
+            traceback.print_exc()
     
     def _get_observations(self) -> Dict[str, torch.Tensor]:
         """
