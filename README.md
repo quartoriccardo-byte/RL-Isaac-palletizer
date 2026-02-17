@@ -266,6 +266,36 @@ Features:
 
 ---
 
+## Multi-GPU Setup
+
+On machines with mixed GPU architectures (e.g. GTX 1080 Ti on GPU 0/1, RTX 6000 on GPU 2), Isaac Sim must target an **RTX-capable** GPU (compute capability ≥ 7.0) for both rendering and PhysX.
+
+### Key points
+
+- **`CUDA_VISIBLE_DEVICES` does NOT control Vulkan/RTX GPU selection.** Use Kit args instead.
+- Run Isaac scripts **outside an active conda env**, or source `setup_conda_env.sh` first, to avoid picking up `libcuda` stubs that cause `CUDA error 36`.
+- Pass `--device cuda:N` together with Kit GPU args:
+
+```bash
+# Example: RTX 6000 is GPU 2
+~/isaac-sim/python.sh scripts/mockup_video.py \
+  --headless \
+  --device cuda:2 \
+  --num_boxes 15 \
+  --duration_s 20
+```
+
+The mockup script automatically injects `--/renderer/activeGpu=N` and `--/physics/cudaDevice=N` from `--device cuda:N`. To override manually:
+
+```bash
+~/isaac-sim/python.sh scripts/mockup_video.py \
+  --headless --device cuda:2 \
+  --/renderer/activeGpu=2 \
+  --/physics/cudaDevice=2
+```
+
+---
+
 ## Depth Camera Training
 
 Alternative heightmap source using an overhead depth sensor (more realistic, slower):

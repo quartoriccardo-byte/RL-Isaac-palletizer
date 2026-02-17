@@ -51,11 +51,23 @@ def inject_kit_args(args, unknown):
     Adds safe defaults (NGX/DLSS disable, VRAM reduction) unless the user
     already provided the same --/path via CLI.  Also forces cameras on
     since the mockup script always needs them for recording.
+
+    GPU selection notes:
+      --/renderer/activeGpu=N   selects the Vulkan/RTX rendering GPU.
+      --/physics/cudaDevice=N   selects the PhysX CUDA GPU.
+      These are NOT controlled by CUDA_VISIBLE_DEVICES.  On multi-GPU
+      machines with mixed architectures (e.g. GTX 1080 Ti + RTX 6000),
+      both must point at an RTX-capable GPU (compute capability >= 7.0).
     """
     # Force cameras for recording
     if not args.enable_cameras:
         args.enable_cameras = True
         print("[INFO] Forced --enable_cameras for mockup recording")
+
+    # Infer GPU index from --device (e.g. "cuda:2" -> "2", "cuda" -> "0")
+    gpu_idx = "0"
+    if hasattr(args, "device") and ":" in args.device:
+        gpu_idx = args.device.split(":")[-1]
 
     # Collect user-provided Kit args
     user_kit_args = [arg for arg in unknown if arg.startswith('--/')]
@@ -73,6 +85,9 @@ def inject_kit_args(args, unknown):
         '--/rtx/translucency/enabled': '--/rtx/translucency/enabled=false',
         '--/rtx/reflections/enabled': '--/rtx/reflections/enabled=false',
         '--/rtx/indirectDiffuse/enabled': '--/rtx/indirectDiffuse/enabled=false',
+        # GPU pinning: force renderer and PhysX onto the correct GPU
+        '--/renderer/activeGpu': f'--/renderer/activeGpu={gpu_idx}',
+        '--/physics/cudaDevice': f'--/physics/cudaDevice={gpu_idx}',
     }
     default_kit_args = []
     for kit_path, kit_arg in defaults_map.items():
@@ -295,6 +310,10 @@ def main():
     cfg.sim.render_interval = 1  # Every frame for video
     cfg.max_boxes = max(args.num_boxes + 5, cfg.max_boxes)  # Extra for retries
     cfg.use_pallet_mesh_visual = True  # Show Euro pallet mesh
+    
+    # Ensure sim device matches CLI --device (e.g. "cuda:2")
+    # Without this, PalletTaskCfg.sim.device="cuda" would not carry the index.
+    cfg.sim.device = args.device
     
     # Override camera for cinematic view
     cfg.scene.render_camera.width = args.cam_width

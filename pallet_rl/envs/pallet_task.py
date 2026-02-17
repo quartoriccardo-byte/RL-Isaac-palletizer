@@ -163,7 +163,10 @@ class PalletTaskCfg(DirectRLEnvCfg):
     sim: SimulationCfg = SimulationCfg(
         dt=1/60.0,
         render_interval=2,
-        device="cuda:0",
+        # NOTE: Use "cuda" (no index) so AppLauncher / CLI --device cuda:N
+        # selects the actual GPU. Hardcoding "cuda:0" ignored the CLI flag
+        # and caused PhysX to init on a non-RTX GPU (sm_61 < 7.0 required).
+        device="cuda",
         # Render settings to disable NGX/DLSS and reduce VRAM usage
         render=RenderCfg(
             dlss_mode=0,
@@ -740,17 +743,32 @@ class PalletTask(DirectRLEnv):
         Downstream code expects `self.scene["boxes"]` and `self.scene["pallet"]`
         which are automatically available from the scene config.
         """
-        # Ground plane with cement-gray visual material (collision enabled by default)
-        # PreviewSurfaceCfg applies a PBR material for a minimal industrial floor look
+        # Ground plane with cement-gray appearance (collision enabled by default).
+        # Version-safe: not all IsaacLab versions accept "visual_material" in
+        # GroundPlaneCfg.  Try it first; fall back to "color" or plain.
+        _ground_kwargs: dict = {}
+        try:
+            _ground_kwargs["visual_material"] = PreviewSurfaceCfg(
+                diffuse_color=(0.55, 0.53, 0.50),  # warm concrete gray
+                roughness=0.92,
+                metallic=0.0,
+            )
+            _ground_cfg = GroundPlaneCfg(**_ground_kwargs)
+        except TypeError:
+            # Older/newer IsaacLab without visual_material support
+            _ground_kwargs.pop("visual_material", None)
+            # Some versions expose a simple "color" field instead
+            _has_color = hasattr(GroundPlaneCfg, "color") or "color" in {
+                f.name for f in getattr(GroundPlaneCfg, "__dataclass_fields__", {}).values()
+            }
+            if _has_color:
+                _ground_kwargs["color"] = (0.55, 0.53, 0.50)
+            _ground_cfg = GroundPlaneCfg(**_ground_kwargs)
+            print("[INFO] GroundPlaneCfg: visual_material unsupported, using fallback")
+
         spawn_ground_plane(
             "/World/groundPlane",
-            GroundPlaneCfg(
-                visual_material=PreviewSurfaceCfg(
-                    diffuse_color=(0.55, 0.53, 0.50),  # warm concrete gray
-                    roughness=0.92,
-                    metallic=0.0,
-                ),
-            ),
+            _ground_cfg,
             translation=(0.0, 0.0, 0.0),
             orientation=(1.0, 0.0, 0.0, 0.0),
         )
