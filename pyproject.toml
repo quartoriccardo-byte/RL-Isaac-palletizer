@@ -18,9 +18,11 @@ dependencies = [
 include = ["pallet_rl*"]
 
 [project.optional-dependencies]
-# Training dependencies (RSL-RL pinned to 3.x — 4.x breaks ActorCritic API)
+# Training dependencies
+# RSL-RL 3.x provides rsl_rl.modules.ActorCritic which we subclass.
+# 4.x changes the API and is NOT compatible.
 train = [
-    "rsl-rl-lib==3.3.0",
+    "rsl-rl-lib>=3.2,<4",
 ]
 # Extra dependencies used only by legacy utilities (CPU heightmap channels, etc.).
 # These are not required for the main Isaac Lab + RSL-RL training/eval pipeline.

@@ -863,7 +863,7 @@ class PalletTask(DirectRLEnv):
             _fsx, _fsy = self.cfg.floor_size_xy
             _ft = self.cfg.floor_thickness
             _fc = self.cfg.floor_color
-            _fz = -_ft / 2.0  # top surface at z=0
+            _fz = -_ft / 2.0 - 0.001  # top surface at z=-0.001 (avoids z-fight with ground plane)
             _floor_spawned = False
             # Strategy 1: CuboidCfg with visual_material only (no physics)
             try:
@@ -1060,8 +1060,8 @@ class PalletTask(DirectRLEnv):
             if mesh_prim.IsValid():
                 cache = UsdGeom.BBoxCache(
                     Usd.TimeCode.Default(),
-                    includedPurposes=[UsdGeom.Tokens.default_],
-                    useExtentsHint=True,
+                    includedPurposes=[UsdGeom.Tokens.default_, UsdGeom.Tokens.render],
+                    useExtentsHint=False,  # False = recompute from geometry (STL extents hints are unreliable)
                 )
                 bbox = cache.ComputeWorldBound(mesh_prim)
                 aligned = bbox.ComputeAlignedRange()
@@ -1084,6 +1084,14 @@ class PalletTask(DirectRLEnv):
                     dz = collider_bottom_z - min_pt[2]
                 
                 print(f"[INFO] Auto-correction: dx={dx:.4f}, dy={dy:.4f}, dz={dz:.4f}")
+                
+                # Fallback: if bottom is still floating, force it down
+                corrected_min_z = min_pt[2] + dz
+                if corrected_min_z > 0.005:
+                    extra_dz = -corrected_min_z
+                    dz += extra_dz
+                    print(f"[WARNING] Mesh still floating (min_z={corrected_min_z:.4f}), "
+                          f"applying extra dz={extra_dz:.4f}")
             else:
                 print("[WARNING] Pallet mesh prim not valid for bbox computation")
         except Exception as e:
@@ -1189,6 +1197,7 @@ class PalletTask(DirectRLEnv):
             else:
                 print(f"[WARNING] Pallet prim not found at {pallet_path}")
             
+            applied_count = 0
             for i in range(cfg.max_boxes):
                 box_path = f"{source_env_path}/Boxes/box_{i}"
                 box_prim = stage.GetPrimAtPath(box_path)

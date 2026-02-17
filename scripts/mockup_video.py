@@ -1,12 +1,16 @@
 """
-Mockup Video Generator for Palletizer RL
+[LEGACY] Mockup Video Generator for Palletizer RL
+
+⚠️  DEPRECATED — Use scripts/mockup_video_physics.py instead.
+    This script uses teleport-based animation which causes clip-then-snap artifacts.
+    The physics-based version uses a proper kinematic→dynamic state machine.
 
 Generates a ~20-second, 30 FPS demonstration video of plausible box packing
 on a Euro pallet. Uses scripted placement heuristics (not a trained policy)
 to showcase the environment with floor, pallet mesh, colored boxes, and
 visible retry/reset on failed placements.
 
-Usage:
+Usage (legacy):
     ~/isaac-sim/python.sh scripts/mockup_video.py --headless --output_path mockup_demo.mp4
     ~/isaac-sim/python.sh scripts/mockup_video.py --headless --num_boxes 20 --duration_s 25
 """

@@ -7,14 +7,15 @@ Key architecture:
   - Pallet STL is VISUAL ONLY, auto-aligned by pallet_task.py.
   - Visible floor slab comes from PalletTaskCfg.floor_visual_enabled.
   - Box state machine per placement:
-      1) SPAWN:  teleport to side, set kinematic, zero vel
-      2) CARRY:  kinematic move to above target
-      3) LOWER:  kinematic lowering at controlled speed
-      4) RELEASE: switch to dynamic, zero vel, let physics settle
-      5) SETTLE: pure physics, check velocities
-      6) FREEZE: convert to kinematic for stable stacking base
-  - Placement validation with retry on failure.
-  - All pallet_task.py features (floor, mesh, physics tuning) are reused.
+      1) SPAWN:   teleport to side, set kinematic, zero vel
+      2) CARRY:   kinematic ease-in-out to above target (no contacts)
+      3) LOWER:   kinematic descent at controlled speed
+      4) SETTLE:  switch to dynamic, zero vel, pure physics
+      5) PAUSE:   brief static view, advance to next box
+  - After settle, boxes stay DYNAMIC (natural sleep) by default.
+    --freeze_after_settle converts to kinematic (opt-in, may break contacts).
+  - Placement validation with AABB overlap check + retry on failure.
+  - All pallet_task.py features (floor, mesh, mockup physics) are reused.
 
 Run:
   ~/isaac-sim/python.sh scripts/mockup_video_physics.py \\
@@ -61,14 +62,15 @@ def parse_args():
                         help="Z height during carry phase (m)")
     parser.add_argument("--lower_speed", type=float, default=0.20,
                         help="Kinematic descent speed (m/s)")
-    parser.add_argument("--release_clearance", type=float, default=0.02,
+    parser.add_argument("--release_clearance", type=float, default=0.04,
                         help="Height above target where box switches to dynamic (m)")
-    parser.add_argument("--settle_s", type=float, default=1.0,
+    parser.add_argument("--settle_s", type=float, default=1.5,
                         help="Max settle time per box (seconds)")
     parser.add_argument("--settle_vel_threshold", type=float, default=0.05,
                         help="Velocity norm below which box is considered settled")
-    parser.add_argument("--freeze_after_settle", action="store_true", default=True,
-                        help="Convert placed box to kinematic after settling")
+    parser.add_argument("--freeze_after_settle", action="store_true", default=False,
+                        help="Convert placed box to kinematic after settling "
+                             "(opt-in; may break stacking contacts)")
     parser.add_argument("--max_retries", type=int, default=3,
                         help="Max retries per box before skipping")
     parser.add_argument("--sim_substeps", type=int, default=4,
@@ -130,7 +132,7 @@ simulation_app = app_launcher.app
 import torch
 import numpy as np
 
-from pxr import UsdPhysics, PhysxSchema, UsdGeom, Gf, Sdf
+from pxr import UsdPhysics, PhysxSchema
 
 from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
 
@@ -165,9 +167,9 @@ def set_disable_gravity(stage, prim_path: str, disable: bool):
 
 def tune_rigid_body(stage, prim_path: str, *,
                     lin_damp=2.0, ang_damp=2.0,
-                    max_depen_vel=1.5, max_lin_vel=2.0,
+                    max_depen_vel=0.5, max_lin_vel=2.0,
                     pos_iters=16, vel_iters=4):
-    """Set PhysX rigid body tuning parameters."""
+    """Set PhysX rigid body tuning parameters for stable contacts."""
     prim = stage.GetPrimAtPath(prim_path)
     if not prim.IsValid():
         return
@@ -187,7 +189,7 @@ def tune_rigid_body(stage, prim_path: str, *,
 
 
 def set_physics_material(stage, prim_path: str, *,
-                         static_friction=1.0, dynamic_friction=0.8,
+                         static_friction=1.2, dynamic_friction=0.9,
                          restitution=0.0):
     """Apply/update a UsdPhysics material on a prim."""
     prim = stage.GetPrimAtPath(prim_path)
@@ -200,24 +202,50 @@ def set_physics_material(stage, prim_path: str, *,
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Simple packing heuristic
+# AABB overlap check
+# ═══════════════════════════════════════════════════════════════════════
+
+def aabb_overlap(pos_a, dims_a, pos_b, dims_b, margin: float = 0.005) -> bool:
+    """Check if two axis-aligned bounding boxes overlap (with a small margin).
+
+    Boxes are assumed to be axis-aligned (yaw 0 or 90° → already rotated into
+    dims).  This is intentionally conservative — a small margin prevents
+    false-positive triggers from touching-but-not-penetrating surfaces.
+
+    Returns True if boxes overlap beyond margin.
+    """
+    for axis in range(3):
+        half_a = 0.5 * dims_a[axis] - margin
+        half_b = 0.5 * dims_b[axis] - margin
+        if abs(pos_a[axis] - pos_b[axis]) >= half_a + half_b:
+            return False
+    return True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Deterministic grid packing
 # ═══════════════════════════════════════════════════════════════════════
 
 def generate_placements(num_boxes: int, pallet_lx: float, pallet_ly: float,
                         pallet_top_z: float, seed: int = 42):
     """
-    Generate plausible box placements using a simple grid packing.
-    Returns list of dicts with keys: dims, target_xyz, yaw.
+    Generate plausible box placements using greedy grid packing.
+
+    Returns list of dicts with keys: dims (after yaw), target_xyz, yaw,
+    color_rgb.
     """
     rng = np.random.default_rng(seed)
-    placements = []
+    placements: list[dict] = []
 
     # Split into 2 layers
     layer0_count = min(num_boxes, num_boxes // 2 + num_boxes % 2)
     layer1_count = num_boxes - layer0_count
 
-    # Track placed footprints per layer for overlap avoidance
-    layer0_tops = []  # list of (pos, dims)
+    # Track placed AABBs per layer for overlap avoidance
+    layer0_tops: list[tuple[np.ndarray, np.ndarray]] = []  # (pos3, dims3)
+
+    half_lx = 0.5 * pallet_lx
+    half_ly = 0.5 * pallet_ly
 
     for layer_idx in range(2):
         count = layer0_count if layer_idx == 0 else layer1_count
@@ -228,20 +256,18 @@ def generate_placements(num_boxes: int, pallet_lx: float, pallet_ly: float,
         if layer_idx == 0:
             layer_base_z = pallet_top_z
         else:
-            # Second layer starts at max top of first layer
             if layer0_tops:
                 layer_base_z = max(p[2] + 0.5 * d[2] for p, d in layer0_tops)
             else:
                 layer_base_z = pallet_top_z + 0.20
 
         for bi in range(count):
-            # Random box dims
-            bx = float(rng.uniform(0.20, 0.38))
+            # Random box dims (realistic cardboard range)
+            bx = float(rng.uniform(0.22, 0.38))
             by = float(rng.uniform(0.18, 0.30))
             bz = float(rng.uniform(0.12, 0.22))
-            dims = np.array([bx, by, bz], dtype=np.float32)
 
-            # Random yaw
+            # Random yaw (0 or 90°)
             yaw = float(rng.choice([0.0, math.pi / 2.0]))
 
             # Effective footprint (after yaw)
@@ -249,22 +275,37 @@ def generate_placements(num_boxes: int, pallet_lx: float, pallet_ly: float,
                 eff_x, eff_y = by, bx
             else:
                 eff_x, eff_y = bx, by
+            dims = np.array([eff_x, eff_y, bz], dtype=np.float32)
 
-            # Random target within pallet bounds
-            margin_x = 0.5 * eff_x + 0.02
-            margin_y = 0.5 * eff_y + 0.02
-            half_lx = 0.5 * pallet_lx
-            half_ly = 0.5 * pallet_ly
+            # Greedy placement: try up to 50 random positions, pick first
+            # non-overlapping one
+            margin_x = 0.5 * eff_x + 0.01
+            margin_y = 0.5 * eff_y + 0.01
+            tz = layer_base_z + 0.5 * bz
 
-            # Try a few times to avoid obvious overlaps
             best_pos = None
-            for _ in range(30):
+            for _ in range(50):
                 tx = float(rng.uniform(-half_lx + margin_x, half_lx - margin_x))
                 ty = float(rng.uniform(-half_ly + margin_y, half_ly - margin_y))
-                tz = layer_base_z + 0.5 * bz
                 candidate = np.array([tx, ty, tz], dtype=np.float32)
-                best_pos = candidate
-                break  # keep it simple for now
+
+                # Check overlap with same-layer boxes
+                overlap = False
+                check_list = layer0_tops if layer_idx == 0 else placements[layer0_count:]
+                for prev_pos, prev_dims in (layer0_tops if layer_idx == 0 else
+                                             [(p["target_xyz"], p["dims"]) for p in placements[layer0_count:]]):
+                    if aabb_overlap(candidate, dims, prev_pos, prev_dims, margin=0.01):
+                        overlap = True
+                        break
+                if not overlap:
+                    best_pos = candidate
+                    break
+
+            if best_pos is None:
+                # Fallback: place at a random position anyway
+                tx = float(rng.uniform(-half_lx + margin_x, half_lx - margin_x))
+                ty = float(rng.uniform(-half_ly + margin_y, half_ly - margin_y))
+                best_pos = np.array([tx, ty, tz], dtype=np.float32)
 
             placements.append({
                 "dims": dims,
@@ -309,16 +350,16 @@ def main():
     print(f"\n{'='*60}")
     print(f"  Palletiser Mockup Video — Physics Mode")
     print(f"{'='*60}")
-    print(f"  Output:     {args.output_path}")
-    print(f"  FPS:        {args.fps}")
-    print(f"  Duration:   {args.duration_s}s")
-    print(f"  Boxes:      {args.num_boxes}")
-    print(f"  Seed:       {args.seed}")
-    print(f"  Substeps:   {args.sim_substeps}")
-    print(f"  Lower speed: {args.lower_speed} m/s")
-    print(f"  Release gap: {args.release_clearance} m")
-    print(f"  Settle time: {args.settle_s} s")
-    print(f"  Freeze:     {args.freeze_after_settle}")
+    print(f"  Output:       {args.output_path}")
+    print(f"  FPS:          {args.fps}")
+    print(f"  Duration:     {args.duration_s}s")
+    print(f"  Boxes:        {args.num_boxes}")
+    print(f"  Seed:         {args.seed}")
+    print(f"  Substeps:     {args.sim_substeps}")
+    print(f"  Lower speed:  {args.lower_speed} m/s")
+    print(f"  Release gap:  {args.release_clearance} m")
+    print(f"  Settle time:  {args.settle_s} s")
+    print(f"  Freeze:       {args.freeze_after_settle}")
     print(f"{'='*60}\n")
 
     # ─── Environment config ───────────────────────────────────────────
@@ -359,7 +400,7 @@ def main():
         if stage.GetPrimAtPath(bp).IsValid():
             tune_rigid_body(stage, bp,
                             lin_damp=2.0, ang_damp=3.0,
-                            max_depen_vel=1.5, max_lin_vel=2.0,
+                            max_depen_vel=0.5, max_lin_vel=2.0,
                             pos_iters=16, vel_iters=4)
             set_physics_material(stage, bp,
                                  static_friction=1.2,
@@ -424,9 +465,8 @@ def main():
     sim_dt = env.sim.get_physics_dt()
     substeps = args.sim_substeps
     frame_dt = 1.0 / args.fps
-    steps_per_frame = max(1, int(round(frame_dt / sim_dt)))
 
-    frames = []
+    frames: list[np.ndarray] = []
 
     def step_and_capture():
         """Run physics substeps, update scene, render one frame."""
@@ -453,16 +493,15 @@ def main():
     total_frames = int(args.duration_s * args.fps)
     frame_count = 0
 
-    placed_boxes = []      # list of (final_pos, dims) for validation
-    current_box_idx = 0    # which box prim to use (increments even on retry)
+    placed_boxes: list[tuple[np.ndarray, np.ndarray]] = []  # (pos, dims)
+    current_box_idx = 0    # which box prim to use
     placement_idx = 0      # which placement plan we are on
     retry_count = 0
 
     # State machine state
     state = "SPAWN"
     state_timer = 0.0
-    current_placement = None
-    current_yaw = 0.0
+    carry_start_pos = np.array([1.0, -0.8, args.carry_height], dtype=np.float32)
 
     print(f"\n[INFO] Starting animation: {total_frames} frames...")
 
@@ -477,27 +516,31 @@ def main():
 
             # ─────────────────────────────────────────
             if state == "SPAWN":
-                # Teleport box to side, kinematic, gravity off
-                spawn_pos = [1.0, -0.8, args.carry_height]
+                # Teleport box to side (far from any geometry), kinematic
+                carry_start_pos = np.array(
+                    [PALLET_LX + 0.5, -0.5, args.carry_height],
+                    dtype=np.float32,
+                )
                 set_kinematic(stage, bp, True)
                 set_disable_gravity(stage, bp, True)
-                set_box_pose(current_box_idx, spawn_pos, yaw)
+                set_box_pose(current_box_idx, carry_start_pos.tolist(), yaw)
                 state = "CARRY"
                 state_timer = 0.0
 
             # ─────────────────────────────────────────
             elif state == "CARRY":
-                # Smooth interpolation from spawn to above target
+                # Smooth ease-in-out interpolation to above target
                 state_timer += frame_dt
                 carry_dur = 0.8  # seconds
                 alpha = min(1.0, state_timer / carry_dur)
-                # ease-in-out
+                # Smooth step (ease-in-out)
                 alpha_smooth = 0.5 - 0.5 * math.cos(math.pi * alpha)
 
-                start = np.array([1.0, -0.8, args.carry_height], dtype=np.float32)
-                above = np.array([target[0], target[1], args.carry_height],
-                                 dtype=np.float32)
-                pos = (1.0 - alpha_smooth) * start + alpha_smooth * above
+                above = np.array(
+                    [target[0], target[1], args.carry_height],
+                    dtype=np.float32,
+                )
+                pos = (1.0 - alpha_smooth) * carry_start_pos + alpha_smooth * above
                 set_box_pose(current_box_idx, pos.tolist(), yaw)
 
                 if alpha >= 1.0:
@@ -506,7 +549,7 @@ def main():
 
             # ─────────────────────────────────────────
             elif state == "LOWER":
-                # Kinematic descent at controlled speed
+                # Kinematic descent at controlled speed, still kinematic
                 cur_pos = get_box_pos(current_box_idx)
                 release_z = float(target[2]) + args.release_clearance
                 new_z = max(release_z,
@@ -515,7 +558,7 @@ def main():
                 set_box_pose(current_box_idx, pos, yaw)
 
                 if abs(new_z - release_z) < 1e-4:
-                    # Switch to dynamic — let physics handle the rest
+                    # ── Release: switch to dynamic, let physics handle it ──
                     set_kinematic(stage, bp, False)
                     set_disable_gravity(stage, bp, False)
                     zero_box_vel(current_box_idx)
@@ -536,20 +579,36 @@ def main():
 
                     # ── Validate placement ──
                     valid = True
-                    # Check Z: should be above pallet top
-                    if final_pos[2] < PALLET_TOP_Z + 0.5 * dims[2] - 0.03:
+                    reason = ""
+
+                    # Check Z: box bottom should be near target plane
+                    box_bottom = final_pos[2] - 0.5 * dims[2]
+                    if box_bottom < PALLET_TOP_Z - 0.03:
                         valid = False
-                    # Check XY: within pallet bounds
+                        reason = f"Z too low ({box_bottom:.3f} < {PALLET_TOP_Z - 0.03:.3f})"
+                    # Check XY: center within pallet bounds (with tolerance)
                     if abs(final_pos[0]) > 0.5 * PALLET_LX + 0.05:
                         valid = False
+                        reason = f"X out of bounds ({final_pos[0]:.3f})"
                     if abs(final_pos[1]) > 0.5 * PALLET_LY + 0.05:
                         valid = False
-                    # Check if fell off (Z too low)
+                        reason = f"Y out of bounds ({final_pos[1]:.3f})"
+                    # Check if fell off (Z way too low)
                     if final_pos[2] < 0.0:
                         valid = False
+                        reason = f"fell off (z={final_pos[2]:.3f})"
+
+                    # AABB overlap check against all previously placed boxes
+                    if valid:
+                        for prev_pos, prev_dims in placed_boxes:
+                            if aabb_overlap(final_pos, dims, prev_pos, prev_dims,
+                                            margin=0.005):
+                                valid = False
+                                reason = "AABB overlap with placed box"
+                                break
 
                     if valid:
-                        # Freeze box as kinematic for stable stacking base
+                        # ── Success: keep box dynamic (let it sleep naturally) ──
                         if args.freeze_after_settle:
                             set_kinematic(stage, bp, True)
                             set_disable_gravity(stage, bp, True)
@@ -565,16 +624,15 @@ def main():
                               f"at ({final_pos[0]:.2f}, {final_pos[1]:.2f}, "
                               f"{final_pos[2]:.2f})")
                     else:
-                        # Failed — teleport box away and retry
+                        # ── Failed — teleport box away and retry ──
                         retry_count += 1
-                        print(f"  ✗ Placement {placement_idx+1} failed "
+                        print(f"  ✗ Placement {placement_idx+1} failed: {reason} "
                               f"(retry {retry_count}/{args.max_retries})")
                         set_kinematic(stage, bp, True)
                         set_disable_gravity(stage, bp, True)
                         set_box_pose(current_box_idx, [0, 0, -5], 0.0)
 
                         if retry_count >= args.max_retries:
-                            # Skip this placement
                             print(f"  → Skipping placement {placement_idx+1} "
                                   f"after {args.max_retries} retries")
                             placement_idx += 1
@@ -588,7 +646,7 @@ def main():
             elif state == "PAUSE":
                 # Brief pause to admire the placement
                 state_timer += frame_dt
-                if state_timer >= 0.15:  # 4-5 frames at 30fps
+                if state_timer >= 0.15:  # ~4-5 frames at 30fps
                     state = "SPAWN"
                     state_timer = 0.0
 
@@ -596,7 +654,7 @@ def main():
         step_and_capture()
         frame_count += 1
 
-    # ─── Fill remaining frames with static scene ──────────────────────
+    # ─── Summary ──────────────────────────────────────────────────────
     print(f"\n[INFO] {len(placed_boxes)} boxes placed successfully.")
     print(f"[INFO] Captured {len(frames)} frames.")
 
