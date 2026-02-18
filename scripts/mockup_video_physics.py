@@ -60,9 +60,9 @@ def parse_args():
     # motion / stability knobs
     parser.add_argument("--carry_height", type=float, default=1.2,
                         help="Z height during carry phase (m)")
-    parser.add_argument("--lower_speed", type=float, default=0.20,
+    parser.add_argument("--lower_speed", type=float, default=0.70,
                         help="Kinematic descent speed (m/s)")
-    parser.add_argument("--release_clearance", type=float, default=0.04,
+    parser.add_argument("--release_clearance", type=float, default=0.005,
                         help="Height above target where box switches to dynamic (m)")
     parser.add_argument("--settle_s", type=float, default=1.5,
                         help="Max settle time per box (seconds)")
@@ -190,7 +190,8 @@ def tune_rigid_body(stage, prim_path: str, *,
 
 def set_physics_material(stage, prim_path: str, *,
                          static_friction=1.2, dynamic_friction=0.9,
-                         restitution=0.0):
+                         restitution=0.0,
+                         restitution_combine_mode="min"):
     """Apply/update a UsdPhysics material on a prim."""
     prim = stage.GetPrimAtPath(prim_path)
     if not prim.IsValid():
@@ -199,6 +200,12 @@ def set_physics_material(stage, prim_path: str, *,
     mat_api.CreateStaticFrictionAttr().Set(float(static_friction))
     mat_api.CreateDynamicFrictionAttr().Set(float(dynamic_friction))
     mat_api.CreateRestitutionAttr().Set(float(restitution))
+    # PhysX restitution combine mode: "average", "min", "multiply", "max"
+    api = PhysxSchema.PhysxMaterialAPI.Apply(prim)
+    attr = api.GetRestitutionCombineModeAttr()
+    if not attr or not attr.IsValid():
+        attr = api.CreateRestitutionCombineModeAttr()
+    attr.Set(restitution_combine_mode)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -394,18 +401,19 @@ def main():
     stage = omni.usd.get_context().get_stage()
     boxes = env.scene["boxes"]
 
-    # ─── Tune all box prims for stable contacts ───────────────────────
+    # ─── Tune all box prims for stable, non-elastic contacts ──────────
     for i in range(cfg.max_boxes):
         bp = f"/World/envs/env_0/Boxes/box_{i}"
         if stage.GetPrimAtPath(bp).IsValid():
             tune_rigid_body(stage, bp,
                             lin_damp=2.0, ang_damp=3.0,
-                            max_depen_vel=0.5, max_lin_vel=2.0,
-                            pos_iters=16, vel_iters=4)
+                            max_depen_vel=0.3, max_lin_vel=1.5,
+                            pos_iters=32, vel_iters=8)
             set_physics_material(stage, bp,
                                  static_friction=1.2,
                                  dynamic_friction=0.9,
-                                 restitution=0.0)
+                                 restitution=0.0,
+                                 restitution_combine_mode="min")
 
     # ─── Plan placements ──────────────────────────────────────────────
     placements = generate_placements(
@@ -618,11 +626,10 @@ def main():
                                 break
 
                     if valid:
-                        # ── Success: keep box dynamic (let it sleep naturally) ──
-                        if args.freeze_after_settle:
-                            set_kinematic(stage, bp, True)
-                            set_disable_gravity(stage, bp, True)
-                            zero_box_vel(current_box_idx)
+                        # ── Success: freeze box to prevent micro-sliding ──
+                        set_kinematic(stage, bp, True)
+                        set_disable_gravity(stage, bp, True)
+                        zero_box_vel(current_box_idx)
 
                         placed_boxes.append((final_pos.copy(), dims.copy()))
                         placement_idx += 1
@@ -642,13 +649,14 @@ def main():
                                 pbp = box_prim_path(park_i)
                                 set_kinematic(stage, pbp, True)
                                 set_disable_gravity(stage, pbp, True)
+                                zero_box_vel(park_i)
                                 set_box_pose(park_i, [0, 0, -5], 0.0)
                             placed_boxes.clear()
                             placement_idx = 0
                             current_box_idx = current_box_idx + 1  # fresh prims
                             retry_count = 0
                             episode_attempt += 1
-                            state = "SPAWN"
+                            state = "RESET_PAUSE"  # visible empty pallet
                             state_timer = 0.0
                         else:
                             # ── Normal local retry (episode ≥ 1) ──────────
@@ -674,6 +682,15 @@ def main():
                 # Brief pause to admire the placement
                 state_timer += frame_dt
                 if state_timer >= 0.15:  # ~4-5 frames at 30fps
+                    state = "SPAWN"
+                    state_timer = 0.0
+
+            # ─────────────────────────────────────────
+            elif state == "RESET_PAUSE":
+                # Visible pause showing empty pallet after episode reset
+                state_timer += frame_dt
+                if state_timer >= 0.5:  # ~15 frames at 30fps
+                    print(f"  ↺ Episode {episode_attempt} starting (improved placement)")
                     state = "SPAWN"
                     state_timer = 0.0
 
