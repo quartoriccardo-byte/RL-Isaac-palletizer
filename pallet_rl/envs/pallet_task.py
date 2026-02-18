@@ -334,7 +334,7 @@ class PalletTaskCfg(DirectRLEnvCfg):
     mockup_contact_offset: float = 0.02
     mockup_rest_offset: float = 0.001
     mockup_max_depenetration_velocity: float = 0.5  # m/s, prevents popping
-    mockup_enable_ccd: bool = True  # continuous collision detection
+    mockup_enable_ccd: bool = False  # CCD disabled: incompatible with kinematic toggling
     
     # --- Mockup pallet surface friction ---
     mockup_pallet_static_friction: float = 1.0

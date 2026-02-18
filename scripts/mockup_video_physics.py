@@ -81,6 +81,12 @@ def parse_args():
     parser.add_argument("--pallet_size_y", type=float, default=0.8)
     parser.add_argument("--pallet_thickness", type=float, default=0.15)
 
+    # debug diagnostics
+    parser.add_argument("--debug_dump_frame", action="store_true", default=False,
+                        help="Save one RGB frame as PNG after each successful placement")
+    parser.add_argument("--debug_dump_path", type=str, default="runs/debug_frames",
+                        help="Directory for debug frame PNGs")
+
     return parser.parse_known_args()
 
 
@@ -132,7 +138,7 @@ simulation_app = app_launcher.app
 import torch
 import numpy as np
 
-from pxr import UsdPhysics, PhysxSchema
+from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf, Gf
 
 from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
 
@@ -142,15 +148,19 @@ from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
 # ═══════════════════════════════════════════════════════════════════════
 
 def set_kinematic(stage, prim_path: str, kinematic: bool):
-    """Toggle kinematic_enabled on a rigid body via UsdPhysics.RigidBodyAPI."""
+    """Toggle kinematic_enabled on a rigid body via UsdPhysics.RigidBodyAPI.
+
+    Robust: applies RigidBodyAPI if missing, uses Create (not Get) to ensure
+    the attribute always exists.  Prevents silent no-ops that can cause
+    invisible boxes or CCD-on-kinematic warnings.
+    """
     prim = stage.GetPrimAtPath(prim_path)
     if not prim.IsValid():
         return
-    rb = UsdPhysics.RigidBodyAPI(prim)
-    attr = rb.GetKinematicEnabledAttr()
-    if not attr or not attr.IsValid():
-        attr = rb.CreateKinematicEnabledAttr()
-    attr.Set(bool(kinematic))
+    if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+        UsdPhysics.RigidBodyAPI.Apply(prim)
+    rb = UsdPhysics.RigidBodyAPI.Get(stage, prim_path)
+    rb.CreateKinematicEnabledAttr().Set(bool(kinematic))
 
 
 def set_disable_gravity(stage, prim_path: str, disable: bool):
@@ -401,19 +411,59 @@ def main():
     stage = omni.usd.get_context().get_stage()
     boxes = env.scene["boxes"]
 
+    # ─── GPU alignment check ───────────────────────────────────────────
+    try:
+        import carb.settings
+        _settings = carb.settings.get_settings()
+        _render_gpu = _settings.get("/renderer/activeGpu")
+        _physics_gpu = _settings.get("/physics/cudaDevice")
+        print(f"[INFO] renderer/activeGpu  = {_render_gpu}")
+        print(f"[INFO] physics/cudaDevice  = {_physics_gpu}")
+        if str(_render_gpu) != str(_physics_gpu):
+            print("[WARN] renderer activeGpu != physics cudaDevice "
+                  "— this may cause instability or invisible geometry!")
+    except Exception as _e:
+        print(f"[WARN] Could not read GPU alignment settings: {_e}")
+
     # ─── Tune all box prims for stable, non-elastic contacts ──────────
+    #     Also: disable CCD (causes GPU crash with kinematic toggling)
+    #           and apply bright debug material for visibility.
+    _debug_mat_path = "/World/_DebugBoxMaterial"
+    _debug_mat_prim = stage.GetPrimAtPath(_debug_mat_path)
+    if not _debug_mat_prim.IsValid():
+        mat = UsdShade.Material.Define(stage, _debug_mat_path)
+        shader = UsdShade.Shader.Define(stage, f"{_debug_mat_path}/Shader")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
+            Gf.Vec3f(0.85, 0.25, 0.20)   # bright red — unmissable
+        )
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.7)
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    _debug_mat = UsdShade.Material.Get(stage, _debug_mat_path)
+
     for i in range(cfg.max_boxes):
         bp = f"/World/envs/env_0/Boxes/box_{i}"
-        if stage.GetPrimAtPath(bp).IsValid():
-            tune_rigid_body(stage, bp,
-                            lin_damp=2.0, ang_damp=3.0,
-                            max_depen_vel=0.3, max_lin_vel=1.5,
-                            pos_iters=32, vel_iters=8)
-            set_physics_material(stage, bp,
-                                 static_friction=1.2,
-                                 dynamic_friction=0.9,
-                                 restitution=0.0,
-                                 restitution_combine_mode="min")
+        box_prim = stage.GetPrimAtPath(bp)
+        if not box_prim.IsValid():
+            continue
+        tune_rigid_body(stage, bp,
+                        lin_damp=2.0, ang_damp=3.0,
+                        max_depen_vel=0.3, max_lin_vel=1.5,
+                        pos_iters=32, vel_iters=8)
+        set_physics_material(stage, bp,
+                             static_friction=1.2,
+                             dynamic_friction=0.9,
+                             restitution=0.0,
+                             restitution_combine_mode="min")
+        # ── Patch B: disable CCD to prevent GPU narrowphase crash ──
+        _rb_api = PhysxSchema.PhysxRigidBodyAPI.Apply(box_prim)
+        _rb_api.CreateEnableCCDAttr().Set(False)
+        # ── Patch E: bind bright debug material for visibility ──
+        UsdShade.MaterialBindingAPI.Apply(box_prim).Bind(_debug_mat)
+
+    print("[INFO] CCD disabled for all box prims (stability mode)")
+    print(f"[INFO] Applied debug material to {cfg.max_boxes} boxes (color=red)")
 
     # ─── Plan placements ──────────────────────────────────────────────
     placements = generate_placements(
@@ -681,6 +731,19 @@ def main():
             elif state == "PAUSE":
                 # Brief pause to admire the placement
                 state_timer += frame_dt
+                # ── Patch F: debug frame dump ──
+                if args.debug_dump_frame and state_timer < frame_dt * 1.5 and len(frames) > 0:
+                    os.makedirs(args.debug_dump_path, exist_ok=True)
+                    _dump_path = os.path.join(
+                        args.debug_dump_path,
+                        f"box_{placement_idx:03d}_frame_{frame_count:06d}.png",
+                    )
+                    try:
+                        import cv2 as _cv2
+                        _cv2.imwrite(_dump_path, _cv2.cvtColor(frames[-1], _cv2.COLOR_RGB2BGR))
+                        print(f"  [DEBUG] Saved debug frame to {_dump_path}")
+                    except Exception as _e:
+                        print(f"  [DEBUG] Frame dump failed: {_e}")
                 if state_timer >= 0.15:  # ~4-5 frames at 30fps
                     state = "SPAWN"
                     state_timer = 0.0
