@@ -497,6 +497,7 @@ def main():
     current_box_idx = 0    # which box prim to use
     placement_idx = 0      # which placement plan we are on
     retry_count = 0
+    episode_attempt = 0    # 0 = demo episode (BOX2 fails), 1 = success episode
 
     # State machine state
     state = "SPAWN"
@@ -513,6 +514,15 @@ def main():
             target = pl["target_xyz"]
             yaw = pl["yaw"]
             bp = box_prim_path(current_box_idx)
+
+            # ── Episode 0, BOX2: override with bad target to force failure ──
+            if episode_attempt == 0 and placement_idx == 1 and len(placed_boxes) > 0:
+                box1_pos, box1_dims = placed_boxes[0]
+                target = np.array([
+                    box1_pos[0] + 0.5 * box1_dims[0] - 0.02,  # overlap X by ~2 cm
+                    box1_pos[1],
+                    target[2] + 0.08,  # elevated → tips over on release
+                ], dtype=np.float32)
 
             # ─────────────────────────────────────────
             if state == "SPAWN":
@@ -624,23 +634,40 @@ def main():
                               f"at ({final_pos[0]:.2f}, {final_pos[1]:.2f}, "
                               f"{final_pos[2]:.2f})")
                     else:
-                        # ── Failed — teleport box away and retry ──
-                        retry_count += 1
-                        print(f"  ✗ Placement {placement_idx+1} failed: {reason} "
-                              f"(retry {retry_count}/{args.max_retries})")
-                        set_kinematic(stage, bp, True)
-                        set_disable_gravity(stage, bp, True)
-                        set_box_pose(current_box_idx, [0, 0, -5], 0.0)
-
-                        if retry_count >= args.max_retries:
-                            print(f"  → Skipping placement {placement_idx+1} "
-                                  f"after {args.max_retries} retries")
-                            placement_idx += 1
+                        if episode_attempt == 0:
+                            # ── FULL EPISODE RESET (demo failure) ──────────
+                            print(f"  ✗ Episode 0 failed on box {placement_idx+1}: {reason}")
+                            print(f"    → Full reset: parking {current_box_idx + 1} box(es), restarting episode")
+                            for park_i in range(current_box_idx + 1):
+                                pbp = box_prim_path(park_i)
+                                set_kinematic(stage, pbp, True)
+                                set_disable_gravity(stage, pbp, True)
+                                set_box_pose(park_i, [0, 0, -5], 0.0)
+                            placed_boxes.clear()
+                            placement_idx = 0
+                            current_box_idx = current_box_idx + 1  # fresh prims
                             retry_count = 0
+                            episode_attempt += 1
+                            state = "SPAWN"
+                            state_timer = 0.0
+                        else:
+                            # ── Normal local retry (episode ≥ 1) ──────────
+                            retry_count += 1
+                            print(f"  ✗ Placement {placement_idx+1} failed: {reason} "
+                                  f"(retry {retry_count}/{args.max_retries})")
+                            set_kinematic(stage, bp, True)
+                            set_disable_gravity(stage, bp, True)
+                            set_box_pose(current_box_idx, [0, 0, -5], 0.0)
 
-                        current_box_idx += 1
-                        state = "SPAWN"
-                        state_timer = 0.0
+                            if retry_count >= args.max_retries:
+                                print(f"  → Skipping placement {placement_idx+1} "
+                                      f"after {args.max_retries} retries")
+                                placement_idx += 1
+                                retry_count = 0
+
+                            current_box_idx += 1
+                            state = "SPAWN"
+                            state_timer = 0.0
 
             # ─────────────────────────────────────────
             elif state == "PAUSE":
