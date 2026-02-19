@@ -24,7 +24,7 @@ import sys
 import time
 
 import torch
-from pallet_rl.utils.device_utils import force_supported_cuda_device
+from pallet_rl.utils.device_utils import pick_supported_cuda_device
 
 # =============================================================================
 # CRITICAL: Parse args and launch Isaac BEFORE any sim imports
@@ -118,7 +118,7 @@ def inject_kit_args(args, unknown):
 args, unknown = parse_args()
 
 # Force supported GPU (RTX 6000 vs 1080 Ti)
-forced_device = force_supported_cuda_device(min_cc_major=7, min_cc_minor=5)
+_, forced_device = pick_supported_cuda_device()
 args.device = forced_device
 print(f"[INFO] Overriding CLI device with forced supported GPU: {args.device}")
 inject_kit_args(args, unknown)

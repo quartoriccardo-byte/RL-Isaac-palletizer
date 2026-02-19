@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from pallet_rl.utils.depth_heightmap import DepthHeightmapConverter, DepthHeightmapCfg
-from pallet_rl.utils.device_utils import force_supported_cuda_device
+from pallet_rl.utils.device_utils import pick_supported_cuda_device
 
 
 @pytest.fixture
@@ -34,7 +34,7 @@ def default_cfg():
 
 @pytest.fixture
 def converter(default_cfg):
-    device = force_supported_cuda_device() if torch.cuda.is_available() else "cpu"
+    device = pick_supported_cuda_device()[1] if torch.cuda.is_available() else "cpu"
     return DepthHeightmapConverter(default_cfg, device=device)
 
 
@@ -68,7 +68,7 @@ class TestNoiseModel:
 
     def test_noise_disabled(self, default_cfg):
         default_cfg.noise_enable = False
-        device = force_supported_cuda_device() if torch.cuda.is_available() else "cpu"
+        device = pick_supported_cuda_device()[1] if torch.cuda.is_available() else "cpu"
         conv = DepthHeightmapConverter(default_cfg, device=device)
         depth = torch.ones(1, 160, 240, device=device) * 2.0
         result = conv.apply_noise(depth)
@@ -82,7 +82,7 @@ class TestNoiseModel:
             noise_quantization_m=0.0,
             noise_dropout_prob=0.0,
         )
-        device = force_supported_cuda_device() if torch.cuda.is_available() else "cpu"
+        device = pick_supported_cuda_device()[1] if torch.cuda.is_available() else "cpu"
         conv = DepthHeightmapConverter(cfg, device=device)
         depth = torch.ones(1, 160, 240, device=device) * 2.0
         
@@ -102,7 +102,7 @@ class TestNoiseModel:
             noise_quantization_m=0.1,
             noise_dropout_prob=0.0,
         )
-        device = force_supported_cuda_device() if torch.cuda.is_available() else "cpu"
+        device = pick_supported_cuda_device()[1] if torch.cuda.is_available() else "cpu"
         conv = DepthHeightmapConverter(cfg, device=device)
         # Use values that don't land on half-bins to avoid banker's rounding
         # 0.12 → round(1.2) = 1 → 0.1
@@ -129,7 +129,7 @@ class TestFlatDepthGeometry:
             crop_y=(-0.45, 0.45),
             noise_enable=False,
         )
-        device = force_supported_cuda_device() if torch.cuda.is_available() else "cpu"
+        device = pick_supported_cuda_device()[1] if torch.cuda.is_available() else "cpu"
         conv = DepthHeightmapConverter(cfg, device=device)
 
         # Camera at (0, 0, 3), looking down (+Z in camera = forward)
@@ -150,7 +150,7 @@ class TestCropBounds:
     """Points outside crop bounds should not affect heightmap."""
 
     def test_points_outside_crop(self, default_cfg):
-        device = force_supported_cuda_device() if torch.cuda.is_available() else "cpu"
+        device = pick_supported_cuda_device()[1] if torch.cuda.is_available() else "cpu"
         # Very narrow crop
         default_cfg.crop_x = (-0.01, 0.01)
         default_cfg.crop_y = (-0.01, 0.01)

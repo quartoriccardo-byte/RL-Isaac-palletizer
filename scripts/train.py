@@ -19,7 +19,7 @@ import sys
 import gymnasium as gym
 import numpy as np
 import torch
-from pallet_rl.utils.device_utils import force_supported_cuda_device
+from pallet_rl.utils.device_utils import pick_supported_cuda_device
 
 # =============================================================================
 # Step 1: Parse arguments (no side effects at import time)
@@ -137,7 +137,7 @@ def main():
     args, unknown = parse_args()
     
     # Force supported GPU (RTX 6000 vs 1080 Ti)
-    forced_device = force_supported_cuda_device(min_cc_major=7, min_cc_minor=5)
+    start_idx, forced_device = pick_supported_cuda_device()
     args.device = forced_device
     print(f"[INFO] Overriding CLI device with forced supported GPU: {args.device}")
     
