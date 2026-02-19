@@ -2,28 +2,37 @@
 """
 Physically plausible palletizing mockup video generator.
 
+Two placement modes (--placement_mode):
+
+  KINEMATIC (default) — guaranteed-visible, no PhysX failures:
+    SPAWN → CARRY → LOWER → PLACE_KINEMATIC → PAUSE
+    Boxes are moved to target pose and kept kinematic (no physics drop).
+    No settle/validation/retry needed; boxes always appear.
+
+  DROP — physics-based settling:
+    SPAWN → CARRY → LOWER → SETTLE → PAUSE
+    Boxes released near target, settle under gravity.
+    Single-box retry on failure (no full-episode reset).
+
 Key architecture:
   - Pallet PHYSICS is a simple cuboid collider (kinematic, stable).
   - Pallet STL is VISUAL ONLY, auto-aligned by pallet_task.py.
   - Visible floor slab comes from PalletTaskCfg.floor_visual_enabled.
-  - Box state machine per placement:
-      1) SPAWN:   teleport to side, set kinematic, zero vel
-      2) CARRY:   kinematic ease-in-out to above target (no contacts)
-      3) LOWER:   kinematic descent at controlled speed
-      4) SETTLE:  switch to dynamic, zero vel, pure physics
-      5) PAUSE:   brief static view, advance to next box
-  - After settle, boxes stay DYNAMIC (natural sleep) by default.
-    --freeze_after_settle converts to kinematic (opt-in, may break contacts).
-  - Placement validation with AABB overlap check + retry on failure.
+  - displayColor + displayOpacity set on every box prim so they are
+    visible even when HydraStorm ignores material bindings.
   - All pallet_task.py features (floor, mesh, mockup physics) are reused.
 
 Run:
   ~/isaac-sim/python.sh scripts/mockup_video_physics.py \\
-      --headless --output_path runs/mockup_physics.mp4
+      --headless --output_path runs/mockup.mp4
+
+  ~/isaac-sim/python.sh scripts/mockup_video_physics.py \\
+      --headless --placement_mode drop --debug --output_path runs/drop.mp4
 
 CLI knobs:
-  --carry_height, --lower_speed, --release_clearance, --settle_s,
-  --freeze_after_settle, --max_retries, --num_boxes, --duration_s, etc.
+  --placement_mode, --debug, --carry_height, --lower_speed,
+  --release_clearance, --settle_s, --freeze_after_settle,
+  --max_retries, --num_boxes, --duration_s, etc.
 """
 
 from __future__ import annotations
@@ -81,7 +90,17 @@ def parse_args():
     parser.add_argument("--pallet_size_y", type=float, default=0.8)
     parser.add_argument("--pallet_thickness", type=float, default=0.15)
 
+    # placement mode
+    parser.add_argument("--placement_mode", type=str, default="kinematic",
+                        choices=["kinematic", "drop"],
+                        help="'kinematic' (default): boxes placed at target "
+                             "pose, no physics drop. 'drop': physics-based "
+                             "settling after release.")
+
     # debug diagnostics
+    parser.add_argument("--debug", action="store_true", default=False,
+                        help="Print detailed diagnostic logs (prim paths, "
+                             "poses, visibility attributes)")
     parser.add_argument("--debug_dump_frame", action="store_true", default=False,
                         help="Save one RGB frame as PNG after each successful placement")
     parser.add_argument("--debug_dump_path", type=str, default="runs/debug_frames",
@@ -138,7 +157,7 @@ simulation_app = app_launcher.app
 import torch
 import numpy as np
 
-from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf, Gf
+from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf, Gf, UsdGeom
 
 from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
 
@@ -364,19 +383,24 @@ def main():
 
     device = args.device
 
+    placement_mode = args.placement_mode
+
     print(f"\n{'='*60}")
-    print(f"  Palletiser Mockup Video — Physics Mode")
+    print(f"  Palletiser Mockup Video — {placement_mode.upper()} Mode")
     print(f"{'='*60}")
     print(f"  Output:       {args.output_path}")
     print(f"  FPS:          {args.fps}")
     print(f"  Duration:     {args.duration_s}s")
     print(f"  Boxes:        {args.num_boxes}")
     print(f"  Seed:         {args.seed}")
+    print(f"  Placement:    {placement_mode}")
     print(f"  Substeps:     {args.sim_substeps}")
-    print(f"  Lower speed:  {args.lower_speed} m/s")
-    print(f"  Release gap:  {args.release_clearance} m")
-    print(f"  Settle time:  {args.settle_s} s")
-    print(f"  Freeze:       {args.freeze_after_settle}")
+    if placement_mode == "drop":
+        print(f"  Lower speed:  {args.lower_speed} m/s")
+        print(f"  Release gap:  {args.release_clearance} m")
+        print(f"  Settle time:  {args.settle_s} s")
+        print(f"  Freeze:       {args.freeze_after_settle}")
+    print(f"  Debug:        {args.debug}")
     print(f"{'='*60}\n")
 
     # ─── Environment config ───────────────────────────────────────────
@@ -461,9 +485,31 @@ def main():
         _rb_api.CreateEnableCCDAttr().Set(False)
         # ── Patch E: bind bright debug material for visibility ──
         UsdShade.MaterialBindingAPI.Apply(box_prim).Bind(_debug_mat)
+        # ── Patch V: displayColor/Opacity fallback (Storm ignores unresolved materials) ──
+        _gprim = UsdGeom.Gprim(box_prim)
+        if _gprim:
+            _gprim.CreateDisplayColorAttr().Set(
+                [Gf.Vec3f(0.85, 0.25, 0.20)]   # bright red
+            )
+            _gprim.CreateDisplayOpacityAttr().Set([1.0])
 
     print("[INFO] CCD disabled for all box prims (stability mode)")
-    print(f"[INFO] Applied debug material to {cfg.max_boxes} boxes (color=red)")
+    print(f"[INFO] Applied debug material + displayColor to {cfg.max_boxes} boxes")
+
+    # ─── Debug diagnostics ─────────────────────────────────────────────
+    if args.debug:
+        print(f"\n[DEBUG] === Prim Diagnostics ===")
+        _max_debug = min(5, cfg.max_boxes)
+        for _di in range(_max_debug):
+            _dp = f"/World/envs/env_0/Boxes/box_{_di}"
+            _dprim = stage.GetPrimAtPath(_dp)
+            _valid = _dprim.IsValid() if _dprim else False
+            print(f"  prim[{_di}] = {_dp}  valid={_valid}")
+            if _valid:
+                _img = UsdGeom.Imageable(_dprim)
+                _vis = _img.GetVisibilityAttr().Get() if _img else "N/A"
+                print(f"           visibility = {_vis}")
+        print(f"[DEBUG] === End Prim Diagnostics ===\n")
 
     # ─── Plan placements ──────────────────────────────────────────────
     placements = generate_placements(
@@ -555,14 +601,18 @@ def main():
     current_box_idx = 0    # which box prim to use
     placement_idx = 0      # which placement plan we are on
     retry_count = 0
-    episode_attempt = 0    # 0 = demo episode (BOX2 fails), 1 = success episode
 
     # State machine state
     state = "SPAWN"
     state_timer = 0.0
     carry_start_pos = np.array([1.0, -0.8, args.carry_height], dtype=np.float32)
 
-    print(f"\n[INFO] Starting animation: {total_frames} frames...")
+    # Interpolation frame counter for PLACE_KINEMATIC
+    place_kin_frame = 0
+    PLACE_KIN_FRAMES = 15  # number of frames for smooth kinematic placement
+
+    print(f"\n[INFO] Starting animation: {total_frames} frames "
+          f"(mode={placement_mode})...")
 
     while frame_count < total_frames:
         # ── Only process if we have placements left ──
@@ -572,15 +622,6 @@ def main():
             target = pl["target_xyz"]
             yaw = pl["yaw"]
             bp = box_prim_path(current_box_idx)
-
-            # ── Episode 0, BOX2: override with bad target to force failure ──
-            if episode_attempt == 0 and placement_idx == 1 and len(placed_boxes) > 0:
-                box1_pos, box1_dims = placed_boxes[0]
-                target = np.array([
-                    box1_pos[0] + 0.5 * box1_dims[0] - 0.02,  # overlap X by ~2 cm
-                    box1_pos[1],
-                    target[2] + 0.08,  # elevated → tips over on release
-                ], dtype=np.float32)
 
             # ─────────────────────────────────────────
             if state == "SPAWN":
@@ -592,6 +633,12 @@ def main():
                 set_kinematic(stage, bp, True)
                 set_disable_gravity(stage, bp, True)
                 set_box_pose(current_box_idx, carry_start_pos.tolist(), yaw)
+
+                if args.debug:
+                    print(f"  [DEBUG] SPAWN box_idx={current_box_idx} "
+                          f"placement={placement_idx+1}/{len(placements)} "
+                          f"prim={bp}")
+
                 state = "CARRY"
                 state_timer = 0.0
 
@@ -619,21 +666,73 @@ def main():
             elif state == "LOWER":
                 # Kinematic descent at controlled speed, still kinematic
                 cur_pos = get_box_pos(current_box_idx)
-                release_z = float(target[2]) + args.release_clearance
-                new_z = max(release_z,
+
+                if placement_mode == "kinematic":
+                    # In kinematic mode, lower directly to target Z
+                    final_z = float(target[2])
+                else:
+                    # In drop mode, stop slightly above target for release
+                    final_z = float(target[2]) + args.release_clearance
+
+                new_z = max(final_z,
                             cur_pos[2] - args.lower_speed * frame_dt)
                 pos = [float(target[0]), float(target[1]), new_z]
                 set_box_pose(current_box_idx, pos, yaw)
 
-                if abs(new_z - release_z) < 1e-4:
-                    # ── Release: switch to dynamic, let physics handle it ──
-                    set_kinematic(stage, bp, False)
-                    set_disable_gravity(stage, bp, False)
-                    zero_box_vel(current_box_idx)
-                    state = "SETTLE"
-                    state_timer = 0.0
+                if abs(new_z - final_z) < 1e-4:
+                    if placement_mode == "kinematic":
+                        # ── Kinematic: place directly, no physics ──
+                        if args.debug:
+                            _pre = get_box_pos(current_box_idx)
+                            print(f"  [DEBUG] Pre-place pos: "
+                                  f"({_pre[0]:.3f}, {_pre[1]:.3f}, {_pre[2]:.3f})")
+                        set_box_pose(current_box_idx,
+                                     [float(target[0]), float(target[1]),
+                                      float(target[2])], yaw)
+                        place_kin_frame = 0
+                        state = "PLACE_KINEMATIC"
+                        state_timer = 0.0
+                    else:
+                        # ── Drop: release to dynamic physics ──
+                        set_kinematic(stage, bp, False)
+                        set_disable_gravity(stage, bp, False)
+                        zero_box_vel(current_box_idx)
+                        state = "SETTLE"
+                        state_timer = 0.0
 
             # ─────────────────────────────────────────
+            # KINEMATIC-ONLY: smooth arrival at target + immediate freeze
+            elif state == "PLACE_KINEMATIC":
+                place_kin_frame += 1
+                # Box is already at target pose & kinematic; just wait
+                # a few frames so the placement looks intentional.
+                if place_kin_frame >= PLACE_KIN_FRAMES:
+                    final_pos = get_box_pos(current_box_idx)
+                    # Keep kinematic, gravity off — box stays in place
+                    zero_box_vel(current_box_idx)
+
+                    placed_boxes.append((final_pos.copy(), dims.copy()))
+                    placement_idx += 1
+                    current_box_idx += 1
+                    retry_count = 0
+                    state = "PAUSE"
+                    state_timer = 0.0
+                    print(f"  ✓ Placed box {placement_idx}/{len(placements)} "
+                          f"at ({final_pos[0]:.2f}, {final_pos[1]:.2f}, "
+                          f"{final_pos[2]:.2f})  [kinematic]")
+
+                    if args.debug:
+                        # Print visibility of first placed box
+                        if placement_idx == 1:
+                            _check_prim = stage.GetPrimAtPath(
+                                box_prim_path(current_box_idx - 1))
+                            if _check_prim.IsValid():
+                                _img = UsdGeom.Imageable(_check_prim)
+                                _vis = _img.GetVisibilityAttr().Get()
+                                print(f"  [DEBUG] First box visibility = {_vis}")
+
+            # ─────────────────────────────────────────
+            # DROP-ONLY: physics-based settling
             elif state == "SETTLE":
                 # Pure physics — NO pose writes!
                 state_timer += frame_dt
@@ -649,11 +748,12 @@ def main():
                     valid = True
                     reason = ""
 
-                    # Check Z: box bottom should be near target plane
+                    # Check Z: box bottom near target plane (relaxed threshold)
                     box_bottom = final_pos[2] - 0.5 * dims[2]
-                    if box_bottom < PALLET_TOP_Z - 0.03:
+                    if box_bottom < PALLET_TOP_Z - 0.10:
                         valid = False
-                        reason = f"Z too low ({box_bottom:.3f} < {PALLET_TOP_Z - 0.03:.3f})"
+                        reason = (f"Z too low ({box_bottom:.3f} < "
+                                  f"{PALLET_TOP_Z - 0.10:.3f})")
                     # Check XY: center within pallet bounds (with tolerance)
                     if abs(final_pos[0]) > 0.5 * PALLET_LX + 0.05:
                         valid = False
@@ -689,43 +789,26 @@ def main():
                         state_timer = 0.0
                         print(f"  ✓ Placed box {placement_idx}/{len(placements)} "
                               f"at ({final_pos[0]:.2f}, {final_pos[1]:.2f}, "
-                              f"{final_pos[2]:.2f})")
+                              f"{final_pos[2]:.2f})  [drop]")
                     else:
-                        if episode_attempt == 0:
-                            # ── FULL EPISODE RESET (demo failure) ──────────
-                            print(f"  ✗ Episode 0 failed on box {placement_idx+1}: {reason}")
-                            print(f"    → Full reset: parking {current_box_idx + 1} box(es), restarting episode")
-                            for park_i in range(current_box_idx + 1):
-                                pbp = box_prim_path(park_i)
-                                set_kinematic(stage, pbp, True)
-                                set_disable_gravity(stage, pbp, True)
-                                zero_box_vel(park_i)
-                                set_box_pose(park_i, [0, 0, -5], 0.0)
-                            placed_boxes.clear()
-                            placement_idx = 0
-                            current_box_idx = current_box_idx + 1  # fresh prims
+                        # ── Single-box retry (never full-reset) ──
+                        retry_count += 1
+                        print(f"  ✗ Placement {placement_idx+1} failed: {reason} "
+                              f"(retry {retry_count}/{args.max_retries})")
+                        # Park only the failed box
+                        set_kinematic(stage, bp, True)
+                        set_disable_gravity(stage, bp, True)
+                        set_box_pose(current_box_idx, [0, 0, -5], 0.0)
+
+                        if retry_count >= args.max_retries:
+                            print(f"  → Skipping placement {placement_idx+1} "
+                                  f"after {args.max_retries} retries")
+                            placement_idx += 1
                             retry_count = 0
-                            episode_attempt += 1
-                            state = "RESET_PAUSE"  # visible empty pallet
-                            state_timer = 0.0
-                        else:
-                            # ── Normal local retry (episode ≥ 1) ──────────
-                            retry_count += 1
-                            print(f"  ✗ Placement {placement_idx+1} failed: {reason} "
-                                  f"(retry {retry_count}/{args.max_retries})")
-                            set_kinematic(stage, bp, True)
-                            set_disable_gravity(stage, bp, True)
-                            set_box_pose(current_box_idx, [0, 0, -5], 0.0)
 
-                            if retry_count >= args.max_retries:
-                                print(f"  → Skipping placement {placement_idx+1} "
-                                      f"after {args.max_retries} retries")
-                                placement_idx += 1
-                                retry_count = 0
-
-                            current_box_idx += 1
-                            state = "SPAWN"
-                            state_timer = 0.0
+                        current_box_idx += 1
+                        state = "SPAWN"
+                        state_timer = 0.0
 
             # ─────────────────────────────────────────
             elif state == "PAUSE":
@@ -745,15 +828,6 @@ def main():
                     except Exception as _e:
                         print(f"  [DEBUG] Frame dump failed: {_e}")
                 if state_timer >= 0.15:  # ~4-5 frames at 30fps
-                    state = "SPAWN"
-                    state_timer = 0.0
-
-            # ─────────────────────────────────────────
-            elif state == "RESET_PAUSE":
-                # Visible pause showing empty pallet after episode reset
-                state_timer += frame_dt
-                if state_timer >= 0.5:  # ~15 frames at 30fps
-                    print(f"  ↺ Episode {episode_attempt} starting (improved placement)")
                     state = "SPAWN"
                     state_timer = 0.0
 
