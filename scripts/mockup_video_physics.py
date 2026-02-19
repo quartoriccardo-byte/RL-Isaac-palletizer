@@ -43,6 +43,9 @@ import os
 import sys
 import time
 
+import torch
+from pallet_rl.utils.device_utils import force_supported_cuda_device
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 1) Parse CLI — MUST happen before AppLauncher / any isaaclab import
@@ -57,7 +60,7 @@ def parse_args():
     parser.add_argument("--output_path", type=str, default="runs/mockup_physics.mp4")
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--duration_s", type=float, default=20.0)
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--enable_cameras", action="store_true", default=True)
     parser.add_argument("--cam_width", type=int, default=1280)
     parser.add_argument("--cam_height", type=int, default=720)
@@ -137,6 +140,13 @@ def inject_kit_args(args, unknown):
 
 
 args, unknown = parse_args()
+
+# ─── Force supported GPU (RTX 6000 vs 1080 Ti) ─────────────────────────
+# MUST happen before AppLauncher (which initializes PhysX/Rendering)
+forced_device = force_supported_cuda_device(min_cc_major=7, min_cc_minor=5)
+args.device = forced_device
+print(f"[INFO] Overriding CLI device with forced supported GPU: {args.device}")
+
 inject_kit_args(args, unknown)
 
 
@@ -154,7 +164,6 @@ simulation_app = app_launcher.app
 # 3) Now safe to import Isaac Lab, pxr, torch, etc.
 # ═══════════════════════════════════════════════════════════════════════
 
-import torch
 import numpy as np
 
 from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf, Gf, UsdGeom

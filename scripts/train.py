@@ -18,6 +18,8 @@ import re
 import sys
 import gymnasium as gym
 import numpy as np
+import torch
+from pallet_rl.utils.device_utils import force_supported_cuda_device
 
 # =============================================================================
 # Step 1: Parse arguments (no side effects at import time)
@@ -35,7 +37,7 @@ def parse_args():
     # Simulation
     parser.add_argument("--headless", action="store_true", help="Run headless")
     parser.add_argument("--num_envs", type=int, default=4096, help="Number of environments")
-    parser.add_argument("--device", type=str, default="cuda:0", help="Compute device")
+    parser.add_argument("--device", type=str, default="cuda", help="Compute device")
     
     # Training
     parser.add_argument("--max_iterations", type=int, default=2000, help="Training iterations")
@@ -133,6 +135,11 @@ def main():
     # Parse arguments (inside main to avoid import-time side effects)
     # unknown contains Kit/Carb settings like --/rtx/post/dlss/execMode=0
     args, unknown = parse_args()
+    
+    # Force supported GPU (RTX 6000 vs 1080 Ti)
+    forced_device = force_supported_cuda_device(min_cc_major=7, min_cc_minor=5)
+    args.device = forced_device
+    print(f"[INFO] Overriding CLI device with forced supported GPU: {args.device}")
     
     # =========================================================================
     # CRITICAL: Inject Kit/Carb args into sys.argv BEFORE importing AppLauncher

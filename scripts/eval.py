@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import torch
+from pallet_rl.utils.device_utils import force_supported_cuda_device
 
 
 def parse_args():
@@ -22,7 +24,7 @@ def parse_args():
     # Simulation
     parser.add_argument("--headless", action="store_true", help="Run headless")
     parser.add_argument("--num_envs", type=int, default=128, help="Number of parallel environments")
-    parser.add_argument("--device", type=str, default="cuda:0", help="Compute device")
+    parser.add_argument("--device", type=str, default="cuda", help="Compute device")
     
     # Evaluation
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to RSL-RL checkpoint (.pt)")
@@ -42,6 +44,11 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Force supported GPU (RTX 6000 vs 1080 Ti)
+    forced_device = force_supported_cuda_device(min_cc_major=7, min_cc_minor=5)
+    args.device = forced_device
+    print(f"[INFO] Overriding CLI device with forced supported GPU: {args.device}")
 
     # Launch Isaac Lab app before other imports that touch simulation
     from isaaclab.app import AppLauncher

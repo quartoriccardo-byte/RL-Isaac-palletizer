@@ -23,6 +23,9 @@ import os
 import sys
 import time
 
+import torch
+from pallet_rl.utils.device_utils import force_supported_cuda_device
+
 # =============================================================================
 # CRITICAL: Parse args and launch Isaac BEFORE any sim imports
 # =============================================================================
@@ -41,7 +44,7 @@ def parse_args():
     parser.add_argument("--duration_s", type=float, default=20.0)
     parser.add_argument("--num_boxes", type=int, default=15)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--enable_cameras", action="store_true", default=True)
     parser.add_argument("--cam_width", type=int, default=1280)
     parser.add_argument("--cam_height", type=int, default=720)
@@ -113,6 +116,11 @@ def inject_kit_args(args, unknown):
 
 
 args, unknown = parse_args()
+
+# Force supported GPU (RTX 6000 vs 1080 Ti)
+forced_device = force_supported_cuda_device(min_cc_major=7, min_cc_minor=5)
+args.device = forced_device
+print(f"[INFO] Overriding CLI device with forced supported GPU: {args.device}")
 inject_kit_args(args, unknown)
 
 # Launch Isaac Sim BEFORE any isaaclab imports

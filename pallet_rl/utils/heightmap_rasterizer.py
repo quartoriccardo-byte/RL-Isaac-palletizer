@@ -128,7 +128,7 @@ class WarpHeightmapGenerator:
     No numpy arrays are used anywhere in the pipeline.
     
     Usage:
-        gen = WarpHeightmapGenerator(device="cuda:0", ...)
+        gen = WarpHeightmapGenerator(device="cuda", ...)
         heightmap = gen.forward(box_pos, box_rot, box_dims, pallet_pos)
     """
     
@@ -160,7 +160,7 @@ class WarpHeightmapGenerator:
         if isinstance(device, torch.device):
             device = str(device)
         if "cuda" in device and ":" not in device:
-            device = "cuda:0"
+            device = f"cuda:{torch.cuda.current_device()}"
         
         self.device = device
         self.num_envs = num_envs
