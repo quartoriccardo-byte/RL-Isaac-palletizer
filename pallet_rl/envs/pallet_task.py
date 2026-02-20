@@ -818,11 +818,15 @@ class PalletTask(DirectRLEnv):
         Downstream code expects `self.scene["boxes"]` and `self.scene["pallet"]`
         which are automatically available from the scene config.
         """
-        # Robust prim_utils import
-        try:
-            from isaaclab.utils import prim_utils
-        except Exception:
-            from omni.isaac.core.utils import prims as prim_utils
+        import omni.usd
+        stage = omni.usd.get_context().get_stage()
+
+        def is_prim_path_valid(path: str) -> bool:
+            try:
+                prim = stage.GetPrimAtPath(path)
+                return prim.IsValid()
+            except Exception:
+                return False
             
         # Ground plane with cement-gray appearance (collision enabled by default).
         # Version-safe: not all IsaacLab versions accept "visual_material" in
@@ -862,7 +866,8 @@ class PalletTask(DirectRLEnv):
         
         # DomeLight: high-intensity ambient fill
         light_path = "/World/DomeLight"
-        if not prim_utils.is_prim_path_valid(light_path):
+        if not is_prim_path_valid(light_path):
+            from isaacsim.core.utils import prims as prim_utils
             prim_utils.create_prim(
                 light_path,
                 "DomeLight",
@@ -875,7 +880,8 @@ class PalletTask(DirectRLEnv):
         
         # DistantLight: directional key light for shadows and depth perception
         dist_light_path = "/World/DistantLight"
-        if not prim_utils.is_prim_path_valid(dist_light_path):
+        if not is_prim_path_valid(dist_light_path):
+            from isaacsim.core.utils import prims as prim_utils
             prim_utils.create_prim(
                 dist_light_path,
                 "DistantLight",
@@ -893,7 +899,7 @@ class PalletTask(DirectRLEnv):
         # Thin visual slab placed just below z=0 to cover the default grid
         # ground plane. Collision stays on the ground plane itself.
         floor_path = "/World/FloorVisual"
-        if self.cfg.floor_visual_enabled and not prim_utils.is_prim_path_valid(floor_path):
+        if self.cfg.floor_visual_enabled and not is_prim_path_valid(floor_path):
             _fsx, _fsy = self.cfg.floor_size_xy
             _ft = self.cfg.floor_thickness
             _fc = self.cfg.floor_color
