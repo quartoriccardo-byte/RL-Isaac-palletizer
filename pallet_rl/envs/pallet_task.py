@@ -31,6 +31,8 @@ from isaaclab.sim.schemas import RigidBodyPropertiesCfg, CollisionPropertiesCfg,
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 # Visual materials for ground plane / box coloring
 from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
+# Physics materials
+from isaaclab.sim.spawners.materials.physics_materials import RigidBodyMaterialCfg
 # IsaacLab 5.0: prim utilities for creating container prims before spawning
 from isaacsim.core.utils import prims as prim_utils
 # Camera sensor for headless video recording
@@ -74,6 +76,13 @@ class PalletSceneCfg(InteractiveSceneCfg):
             rigid_props=RigidBodyPropertiesCfg(kinematic_enabled=True),
             collision_props=CollisionPropertiesCfg(),
             mass_props=MassPropertiesCfg(mass=25.0),
+            physics_material=RigidBodyMaterialCfg(
+                static_friction=1.0,
+                dynamic_friction=0.8,
+                restitution=0.02,
+                friction_combine_mode="max",
+                restitution_combine_mode="min",
+            ),
         ),
         init_state=RigidObjectCfg.InitialStateCfg(
             pos=(0.0, 0.0, 0.075),
@@ -93,13 +102,24 @@ class PalletSceneCfg(InteractiveSceneCfg):
                 spawn=CuboidCfg(
                     size=(0.4, 0.3, 0.2),
                     rigid_props=RigidBodyPropertiesCfg(
-                        max_depenetration_velocity=1.0,  # prevent contact "popping"
+                        max_depenetration_velocity=0.5,  # prevent contact "popping"
+                        solver_position_iteration_count=16,
+                        solver_velocity_iteration_count=2,
+                        linear_damping=0.1,
+                        angular_damping=0.2,
                     ),
                     collision_props=CollisionPropertiesCfg(
                         contact_offset=0.005,
                         rest_offset=0.0,
                     ),
                     mass_props=MassPropertiesCfg(density=250.0),
+                    physics_material=RigidBodyMaterialCfg(
+                        static_friction=1.0,
+                        dynamic_friction=0.8,
+                        restitution=0.02,
+                        friction_combine_mode="max",
+                        restitution_combine_mode="min",
+                    ),
                 ),
                 init_state=RigidObjectCfg.InitialStateCfg(
                     pos=(0.0, 0.0, 1.5),

@@ -74,9 +74,9 @@ def parse_args():
                         help="Z height during carry phase (m)")
     parser.add_argument("--lower_speed", type=float, default=0.70,
                         help="Kinematic descent speed (m/s)")
-    parser.add_argument("--release_clearance", type=float, default=0.005,
+    parser.add_argument("--release_clearance", type=float, default=0.02,
                         help="Height above target where box switches to dynamic (m)")
-    parser.add_argument("--settle_s", type=float, default=1.5,
+    parser.add_argument("--settle_s", type=float, default=3.0,
                         help="Max settle time per box (seconds)")
     parser.add_argument("--settle_vel_threshold", type=float, default=0.05,
                         help="Velocity norm below which box is considered settled")
@@ -85,7 +85,7 @@ def parse_args():
                              "(opt-in; may break stacking contacts)")
     parser.add_argument("--max_retries", type=int, default=3,
                         help="Max retries per box before skipping")
-    parser.add_argument("--sim_substeps", type=int, default=4,
+    parser.add_argument("--sim_substeps", type=int, default=8,
                         help="Physics substeps per rendered frame")
 
     # pallet geometry
@@ -94,11 +94,17 @@ def parse_args():
     parser.add_argument("--pallet_thickness", type=float, default=0.15)
 
     # placement mode
-    parser.add_argument("--placement_mode", type=str, default="kinematic",
+    parser.add_argument("--placement_mode", type=str, default="drop",
                         choices=["kinematic", "drop"],
-                        help="'kinematic' (default): boxes placed at target "
-                             "pose, no physics drop. 'drop': physics-based "
+                        help="'kinematic': boxes placed at target "
+                             "pose, no physics drop. 'drop' (default): physics-based "
                              "settling after release.")
+
+    # stacking guardrails
+    parser.add_argument("--support_ratio_min", type=float, default=0.6,
+                        help="Minimum area of support (0.0 to 1.0) required from the layer below")
+    parser.add_argument("--edge_margin", type=float, default=0.02,
+                        help="Allowed margin before box falls off the pallet edge")
 
     # debug diagnostics
     parser.add_argument("--debug", action="store_true", default=False,
@@ -266,6 +272,14 @@ def aabb_overlap(pos_a, dims_a, pos_b, dims_b, margin: float = 0.005) -> bool:
             return False
     return True
 
+def aabb_intersection_area(pos_a, dims_a, pos_b, dims_b) -> float:
+    """Compute the 2D intersection area (XY) of two AABBs."""
+    x_overlap = max(0.0, min(pos_a[0] + dims_a[0]/2, pos_b[0] + dims_b[0]/2) - 
+                         max(pos_a[0] - dims_a[0]/2, pos_b[0] - dims_b[0]/2))
+    y_overlap = max(0.0, min(pos_a[1] + dims_a[1]/2, pos_b[1] + dims_b[1]/2) - 
+                         max(pos_a[1] - dims_a[1]/2, pos_b[1] - dims_b[1]/2))
+    return float(x_overlap * y_overlap)
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Deterministic grid packing
@@ -334,23 +348,34 @@ def generate_placements(num_boxes: int, pallet_lx: float, pallet_ly: float,
                 ty = float(rng.uniform(-half_ly + margin_y, half_ly - margin_y))
                 candidate = np.array([tx, ty, tz], dtype=np.float32)
 
-                # Check overlap with same-layer boxes
+                # 1) Check overlap with same-layer boxes
                 overlap = False
-                check_list = layer0_tops if layer_idx == 0 else placements[layer0_count:]
                 for prev_pos, prev_dims in (layer0_tops if layer_idx == 0 else
                                              [(p["target_xyz"], p["dims"]) for p in placements[layer0_count:]]):
                     if aabb_overlap(candidate, dims, prev_pos, prev_dims, margin=0.01):
                         overlap = True
                         break
-                if not overlap:
-                    best_pos = candidate
-                    break
+                if overlap:
+                    continue
+
+                # 2) For layer > 0, check support from layer below
+                if layer_idx > 0:
+                    box_area = float(dims[0] * dims[1])
+                    supported_area = 0.0
+                    for prev_pos, prev_dims in layer0_tops:
+                        supported_area += aabb_intersection_area(
+                            candidate, dims, prev_pos, prev_dims
+                        )
+                    if supported_area / box_area < args.support_ratio_min:
+                        continue  # Not enough support
+
+                # If we made it here, placement is valid!
+                best_pos = candidate
+                break
 
             if best_pos is None:
-                # Fallback: place at a random position anyway
-                tx = float(rng.uniform(-half_lx + margin_x, half_lx - margin_x))
-                ty = float(rng.uniform(-half_ly + margin_y, half_ly - margin_y))
-                best_pos = np.array([tx, ty, tz], dtype=np.float32)
+                # Skip this box if we can't find a valid supported pos in 50 tries
+                continue
 
             placements.append({
                 "dims": dims,
@@ -763,13 +788,20 @@ def main():
                         valid = False
                         reason = (f"Z too low ({box_bottom:.3f} < "
                                   f"{PALLET_TOP_Z - 0.10:.3f})")
-                    # Check XY: center within pallet bounds (with tolerance)
-                    if abs(final_pos[0]) > 0.5 * PALLET_LX + 0.05:
+                    # Check XY: precise AABB footprint must remain on pallet
+                    # (with margin before failing)
+                    half_x = 0.5 * dims[0]
+                    half_y = 0.5 * dims[1]
+                    
+                    max_x = 0.5 * PALLET_LX - args.edge_margin
+                    max_y = 0.5 * PALLET_LY - args.edge_margin
+
+                    if abs(final_pos[0]) + half_x > max_x:
                         valid = False
-                        reason = f"X out of bounds ({final_pos[0]:.3f})"
-                    if abs(final_pos[1]) > 0.5 * PALLET_LY + 0.05:
+                        reason = f"X overhang (pos={final_pos[0]:.3f}, edge={abs(final_pos[0]) + half_x:.3f} > {max_x:.3f})"
+                    if abs(final_pos[1]) + half_y > max_y:
                         valid = False
-                        reason = f"Y out of bounds ({final_pos[1]:.3f})"
+                        reason = f"Y overhang (pos={final_pos[1]:.3f}, edge={abs(final_pos[1]) + half_y:.3f} > {max_y:.3f})"
                     # Check if fell off (Z way too low)
                     if final_pos[2] < 0.0:
                         valid = False
