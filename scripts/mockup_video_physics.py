@@ -115,6 +115,10 @@ def parse_args():
     parser.add_argument("--debug_dump_path", type=str, default="runs/debug_frames",
                         help="Directory for debug frame PNGs")
 
+    # extensions
+    parser.add_argument("--exclude_isaaclab_tasks", action="store_true", default=True,
+                        help="Exclude problematic isaaclab_tasks extension")
+
     return parser.parse_known_args()
 
 
@@ -137,6 +141,15 @@ def inject_kit_args(args, unknown):
         "--/renderer/activeGpu": f"--/renderer/activeGpu={gpu_idx}",
         "--/physics/cudaDevice": f"--/physics/cudaDevice={gpu_idx}",
     }
+    
+    if args.exclude_isaaclab_tasks:
+        # Check if the user already provided an extension exclusion override
+        exclusion_idx = 0
+        while any(p.startswith(f"--/app/extensions/excluded/{exclusion_idx}") for p in user_kit_paths):
+            exclusion_idx += 1
+        defaults[f"--/app/extensions/excluded/{exclusion_idx}"] = f"--/app/extensions/excluded/{exclusion_idx}='isaaclab_tasks'"
+        print(f"[INFO] Excluding isaaclab_tasks extension at index {exclusion_idx}")
+
     for path, arg in defaults.items():
         if path not in user_kit_paths:
             sys.argv.append(arg)

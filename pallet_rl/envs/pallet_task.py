@@ -31,10 +31,17 @@ from isaaclab.sim.schemas import RigidBodyPropertiesCfg, CollisionPropertiesCfg,
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 # Visual materials for ground plane / box coloring
 from isaaclab.sim.spawners.materials import PreviewSurfaceCfg
-# Physics materials
-from isaaclab.sim.spawners.materials.physics_materials import RigidBodyMaterialCfg
-# IsaacLab 5.0: prim utilities for creating container prims before spawning
-from isaacsim.core.utils import prims as prim_utils
+# Physics materials (Version-safe import)
+try:
+    from isaaclab.sim.spawners.materials.physics_materials_cfg import RigidBodyMaterialCfg
+    print("[INFO] Successfully imported RigidBodyMaterialCfg from physics_materials_cfg")
+except ImportError:
+    try:
+        from isaaclab.sim.spawners.materials import RigidBodyMaterialCfg
+        print("[INFO] Successfully imported RigidBodyMaterialCfg from materials")
+    except ImportError:
+        from isaaclab.sim.spawners.materials.physics_materials import RigidBodyMaterialCfg
+        print("[INFO] Successfully imported RigidBodyMaterialCfg from physics_materials")
 # Camera sensor for headless video recording
 from isaaclab.sensors import CameraCfg
 from isaaclab.sim.spawners.sensors import PinholeCameraCfg
@@ -442,6 +449,7 @@ class PalletTask(DirectRLEnv):
         # require the parent prim to exist in env_0 before InteractiveScene initializes.
         # NOTE: In current IsaacLab versions, env_ns is a property of InteractiveScene (not InteractiveSceneCfg).
         # InteractiveScene uses "/World/envs" as env namespace.
+        from isaacsim.core.utils import prims as prim_utils
         env_ns = getattr(cfg.scene, "env_ns", "/World/envs")        
         prim_utils.create_prim(
             f"{env_ns}/env_0/Boxes",
