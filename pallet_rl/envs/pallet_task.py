@@ -818,6 +818,12 @@ class PalletTask(DirectRLEnv):
         Downstream code expects `self.scene["boxes"]` and `self.scene["pallet"]`
         which are automatically available from the scene config.
         """
+        # Robust prim_utils import
+        try:
+            from isaaclab.utils import prim_utils
+        except Exception:
+            from omni.isaac.core.utils import prims as prim_utils
+            
         # Ground plane with cement-gray appearance (collision enabled by default).
         # Version-safe: not all IsaacLab versions accept "visual_material" in
         # GroundPlaneCfg.  Try it first; fall back to "color" or plain.
