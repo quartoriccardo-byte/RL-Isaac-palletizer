@@ -67,4 +67,4 @@ def pick_supported_cuda_device(min_cc=(7, 5)):
     print(f" Index: {selected_index}")
     print("=" * 41)
 
-    return f"cuda:{selected_index}"
+    return selected_index, f"cuda:{selected_index}"
