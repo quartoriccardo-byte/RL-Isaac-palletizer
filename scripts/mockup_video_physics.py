@@ -119,6 +119,20 @@ def parse_args():
     parser.add_argument("--exclude_isaaclab_tasks", action="store_true", default=True,
                         help="Exclude problematic isaaclab_tasks extension")
 
+    # physics fallback & physx gpu buffer sizes
+    parser.add_argument("--physics_device", type=str, default="cuda", choices=["cuda", "cpu"],
+                        help="Device for physics simulation (cuda or cpu)")
+    parser.add_argument("--physx_sync_launch", action="store_true", default=False,
+                        help="Enable synchronous kernel launches for debugging")
+    parser.add_argument("--gpu_found_lost_pairs_capacity", type=int, default=1048576,
+                        help="PhysX GPU found/lost pairs capacity")
+    parser.add_argument("--gpu_total_aggregate_pairs_capacity", type=int, default=1048576,
+                        help="PhysX GPU total aggregate pairs capacity")
+    parser.add_argument("--gpu_heap_capacity", type=int, default=67108864,
+                        help="PhysX GPU heap capacity (bytes)")
+    parser.add_argument("--gpu_temp_buffer_capacity", type=int, default=16777216,
+                        help="PhysX GPU temp buffer capacity (bytes)")
+
     return parser.parse_known_args()
 
 
@@ -141,6 +155,9 @@ def inject_kit_args(args, unknown):
         "--/renderer/activeGpu": f"--/renderer/activeGpu={gpu_idx}",
         "--/physics/cudaDevice": f"--/physics/cudaDevice={gpu_idx}",
     }
+    
+    if args.physx_sync_launch:
+        defaults["--/physics/enableSynchronousKernelLaunches"] = "--/physics/enableSynchronousKernelLaunches=true"
     
     if args.exclude_isaaclab_tasks:
         # Check if the user already provided an extension exclusion override
@@ -454,7 +471,20 @@ def main():
     cfg = PalletTaskCfg()
     cfg.scene.num_envs = 1
     cfg.sim.render_interval = 1
-    cfg.sim.device = device
+    
+    if args.physics_device == "cpu":
+        cfg.sim.device = "cpu"
+        print("[INFO] Running physics on CPU (--physics_device=cpu)")
+    else:
+        cfg.sim.device = device
+        print(f"[INFO] Running physics on GPU ({device})")
+        
+    # GPU buffers do not grow dynamically and can crash under heavy contact.
+    # Increasing capacities manually prevents PhysX from overflowing its buffers.
+    cfg.sim.physx.gpu_found_lost_pairs_capacity = args.gpu_found_lost_pairs_capacity
+    cfg.sim.physx.gpu_total_aggregate_pairs_capacity = args.gpu_total_aggregate_pairs_capacity
+    cfg.sim.physx.gpu_heap_capacity = args.gpu_heap_capacity
+    cfg.sim.physx.gpu_temp_buffer_capacity = args.gpu_temp_buffer_capacity
     cfg.max_boxes = max(args.num_boxes + 10, 50)  # extra for retries
     cfg.decimation = 1
 

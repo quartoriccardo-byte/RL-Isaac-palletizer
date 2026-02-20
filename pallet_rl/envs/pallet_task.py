@@ -19,7 +19,7 @@ from typing import Dict, Any
 # Isaac Lab imports (4.0+ namespace)
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
-from isaaclab.sim import SimulationCfg, RenderCfg
+from isaaclab.sim import SimulationCfg, RenderCfg, PhysxCfg
 from isaaclab.utils import configclass
 from isaaclab.assets import RigidObjectCfg, RigidObjectCollectionCfg
 from isaaclab.sim.spawners import shapes as shape_spawners
@@ -199,6 +199,12 @@ class PalletTaskCfg(DirectRLEnvCfg):
         # selects the actual GPU. Hardcoding "cuda:0" ignored the CLI flag
         # and caused PhysX to init on a non-RTX GPU (sm_61 < 7.0 required).
         device="cuda",
+        physx=PhysxCfg(
+            gpu_found_lost_pairs_capacity=1024 * 1024,
+            gpu_total_aggregate_pairs_capacity=1024 * 1024,
+            gpu_heap_capacity=64 * 1024 * 1024,
+            gpu_temp_buffer_capacity=16 * 1024 * 1024,
+        ),
         # Render settings to disable NGX/DLSS and reduce VRAM usage
         render=RenderCfg(
             dlss_mode=0,
@@ -417,6 +423,41 @@ class PalletTaskCfg(DirectRLEnvCfg):
 
 
 # =============================================================================
+# Helper Functions (Robust prim/USD operations)
+# =============================================================================
+
+def _get_stage():
+    import omni.usd
+    return omni.usd.get_context().get_stage()
+
+def _is_prim_path_valid(path: str) -> bool:
+    try:
+        stage = _get_stage()
+        if not stage: return False
+        return stage.GetPrimAtPath(path).IsValid()
+    except Exception:
+        return False
+
+def _create_prim(path: str, prim_type: str, attributes: dict = None):
+    try:
+        stage = _get_stage()
+        if not stage: return None
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid():
+            prim = stage.DefinePrim(path, prim_type)
+        if attributes:
+            from pxr import Sdf, Gf
+            for k, v in attributes.items():
+                if isinstance(v, float):
+                    prim.CreateAttribute(k, Sdf.ValueTypeNames.Float).Set(v)
+                elif isinstance(v, tuple) and len(v) == 3:
+                    prim.CreateAttribute(k, Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(*v))
+        return prim
+    except Exception as e:
+        print(f"[WARNING] Local create_prim failed for {path}: {e}")
+        return None
+
+# =============================================================================
 # Environment
 # =============================================================================
 
@@ -449,9 +490,8 @@ class PalletTask(DirectRLEnv):
         # require the parent prim to exist in env_0 before InteractiveScene initializes.
         # NOTE: In current IsaacLab versions, env_ns is a property of InteractiveScene (not InteractiveSceneCfg).
         # InteractiveScene uses "/World/envs" as env namespace.
-        from isaacsim.core.utils import prims as prim_utils
         env_ns = getattr(cfg.scene, "env_ns", "/World/envs")        
-        prim_utils.create_prim(
+        _create_prim(
             f"{env_ns}/env_0/Boxes",
             "Xform"
         )
@@ -866,9 +906,8 @@ class PalletTask(DirectRLEnv):
         
         # DomeLight: high-intensity ambient fill
         light_path = "/World/DomeLight"
-        if not is_prim_path_valid(light_path):
-            from isaacsim.core.utils import prims as prim_utils
-            prim_utils.create_prim(
+        if not _is_prim_path_valid(light_path):
+            _create_prim(
                 light_path,
                 "DomeLight",
                 attributes={
@@ -880,9 +919,8 @@ class PalletTask(DirectRLEnv):
         
         # DistantLight: directional key light for shadows and depth perception
         dist_light_path = "/World/DistantLight"
-        if not is_prim_path_valid(dist_light_path):
-            from isaacsim.core.utils import prims as prim_utils
-            prim_utils.create_prim(
+        if not _is_prim_path_valid(dist_light_path):
+            _create_prim(
                 dist_light_path,
                 "DistantLight",
                 attributes={
@@ -899,7 +937,7 @@ class PalletTask(DirectRLEnv):
         # Thin visual slab placed just below z=0 to cover the default grid
         # ground plane. Collision stays on the ground plane itself.
         floor_path = "/World/FloorVisual"
-        if self.cfg.floor_visual_enabled and not is_prim_path_valid(floor_path):
+        if self.cfg.floor_visual_enabled and not _is_prim_path_valid(floor_path):
             _fsx, _fsy = self.cfg.floor_size_xy
             _ft = self.cfg.floor_thickness
             _fc = self.cfg.floor_color
@@ -930,8 +968,8 @@ class PalletTask(DirectRLEnv):
             if not _floor_spawned:
                 try:
                     from pxr import UsdGeom, UsdShade, Sdf, Gf
-                    stage = prim_utils.get_current_stage()
-                    cube_prim = stage.DefinePrim(floor_path, "Cube")
+                    stage = _get_stage()
+                    cube_prim = _create_prim(floor_path, "Cube")
                     cube_prim.GetAttribute("size").Set(1.0)
                     xform = UsdGeom.Xformable(cube_prim)
                     xform.ClearXformOpOrder()
@@ -962,8 +1000,8 @@ class PalletTask(DirectRLEnv):
         source_env_path = self.scene.env_prim_paths[0]
         boxes_path = f"{source_env_path}/Boxes"
 
-        if not prim_utils.is_prim_path_valid(boxes_path):
-            prim_utils.create_prim(boxes_path, "Xform")
+        if not _is_prim_path_valid(boxes_path):
+            _create_prim(boxes_path, "Xform")
         
         # =====================================================================
         # Optional: Visual Pallet Mesh (STL→USD)
@@ -1075,7 +1113,7 @@ class PalletTask(DirectRLEnv):
         dx, dy, dz = 0.0, 0.0, 0.0
         try:
             from pxr import UsdGeom, Usd, Gf
-            stage = prim_utils.get_current_stage()
+            stage = _get_stage()
             
             # --- 4a. Read pallet collider pose from USD ---
             pallet_prim = stage.GetPrimAtPath(pallet_prim_path)
@@ -1145,7 +1183,7 @@ class PalletTask(DirectRLEnv):
         
         try:
             from pxr import UsdGeom, Gf
-            stage = prim_utils.get_current_stage()
+            stage = _get_stage()
             mesh_prim = stage.GetPrimAtPath(mesh_prim_path)
             if mesh_prim.IsValid():
                 xformable = UsdGeom.Xformable(mesh_prim)
@@ -1166,7 +1204,7 @@ class PalletTask(DirectRLEnv):
         # --- 6a. Apply wood material ---
         try:
             from pxr import UsdShade, Sdf, Gf
-            stage = prim_utils.get_current_stage()
+            stage = _get_stage()
             mat_path = f"{mesh_prim_path}/WoodMaterial"
             mat = UsdShade.Material.Define(stage, mat_path)
             shader = UsdShade.Shader.Define(stage, f"{mat_path}/Shader")
@@ -1188,7 +1226,7 @@ class PalletTask(DirectRLEnv):
         pallet_visual_path = f"{source_env_path}/Pallet"
         try:
             from pxr import UsdGeom
-            stage = prim_utils.get_current_stage()
+            stage = _get_stage()
             pallet_prim = stage.GetPrimAtPath(pallet_visual_path)
             if pallet_prim.IsValid():
                 imageable = UsdGeom.Imageable(pallet_prim)
@@ -1210,7 +1248,8 @@ class PalletTask(DirectRLEnv):
         """
         try:
             from pxr import UsdPhysics, PhysxSchema, Sdf
-            stage = prim_utils.get_current_stage()
+            stage = _get_stage()
+            if not stage: return
             cfg = self.cfg
             
             # --- Pallet collider verification (debug log) ---
