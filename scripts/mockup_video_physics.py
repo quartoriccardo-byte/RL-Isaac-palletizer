@@ -43,6 +43,8 @@ import os
 import sys
 import time
 
+import cv2
+
 import torch
 from pallet_rl.utils.device_utils import pick_supported_cuda_device
 
@@ -114,6 +116,23 @@ def parse_args():
                         help="Save one RGB frame as PNG after each successful placement")
     parser.add_argument("--debug_dump_path", type=str, default="runs/debug_frames",
                         help="Directory for debug frame PNGs")
+
+    # ── depth camera recording ─────────────────────────────────────────
+    parser.add_argument("--record_depth", action="store_true",
+                        help="Record depth instead of RGB")
+    parser.add_argument("--depth_near", type=float, default=0.25,
+                        help="Visualization clamp near (meters)")
+    parser.add_argument("--depth_far", type=float, default=3.5,
+                        help="Visualization clamp far (meters)")
+    parser.add_argument("--depth_vis_width", type=int, default=960,
+                        help="Output MP4 width for depth visualization")
+    parser.add_argument("--depth_vis_height", type=int, default=640,
+                        help="Output MP4 height for depth visualization")
+    parser.add_argument("--save_depth_raw", action="store_true",
+                        help="Save raw depth frames as .npy")
+    parser.add_argument("--depth_raw_dir", type=str, default="",
+                        help="Output folder for raw depth; if empty, "
+                             "use <output_path>_depth_raw")
 
     # extensions
     parser.add_argument("--exclude_isaaclab_tasks", action="store_true", default=True,
@@ -205,6 +224,32 @@ import numpy as np
 from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf, Gf, UsdGeom
 
 from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Depth visualization helper
+# ═══════════════════════════════════════════════════════════════════════
+
+def depth_to_uint8(depth_m: np.ndarray, near: float, far: float) -> np.ndarray:
+    """Convert a float-meters depth map to uint8 (near=black, far=white).
+
+    Args:
+        depth_m: float depth in meters, shape (H, W) or broadcastable.
+        near: near clamp distance (meters).
+        far:  far  clamp distance (meters).
+
+    Returns:
+        uint8 array of shape (H, W), 0 = near, 255 = far.
+    """
+    d = depth_m.copy().astype(np.float64)
+    # Treat invalid pixels (non-finite or <= 0) as far
+    invalid = ~np.isfinite(d) | (d <= 0.0)
+    d[invalid] = far
+    # Clamp to [near, far]
+    d = np.clip(d, near, far)
+    # Normalize to [0, 1]
+    norm = (d - near) / max(far - near, 1e-8)
+    return (norm * 255.0).astype(np.uint8)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -510,6 +555,39 @@ def main():
     env = PalletTask(cfg, render_mode="rgb_array")
 
     stage = omni.usd.get_context().get_stage()
+
+    # ─── Depth camera access (robust, with fallbacks) ─────────────────
+    depth_cam = None
+    if args.record_depth:
+        # Try 1: env.scene["depth_camera"]
+        try:
+            depth_cam = env.scene["depth_camera"]
+            print("[INFO] Depth camera found via env.scene['depth_camera']")
+        except (KeyError, AttributeError):
+            pass
+        # Try 2: env.scene.sensors["depth_camera"]
+        if depth_cam is None:
+            try:
+                depth_cam = env.scene.sensors["depth_camera"]
+                print("[INFO] Depth camera found via env.scene.sensors['depth_camera']")
+            except (KeyError, AttributeError):
+                pass
+        # Fail with diagnostics
+        if depth_cam is None:
+            _keys = []
+            try:
+                _keys.extend(list(env.scene.keys()))
+            except Exception:
+                pass
+            try:
+                _keys.extend([f"sensors.{k}" for k in env.scene.sensors.keys()])
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"'depth_camera' was not found in the scene. "
+                f"Available keys: {_keys}"
+            )
+        print(f"[INFO] Depth camera type: {type(depth_cam).__name__}")
     boxes = env.scene["boxes"]
 
     # ─── GPU alignment check ───────────────────────────────────────────
@@ -648,15 +726,60 @@ def main():
     frame_dt = 1.0 / args.fps
 
     frames: list[np.ndarray] = []
+    depth_frame_idx = 0  # counter for raw depth dump filenames
+
+    # Optional raw depth output directory
+    raw_dir: str | None = None
+    if args.record_depth and args.save_depth_raw:
+        if args.depth_raw_dir != "":
+            raw_dir = args.depth_raw_dir
+        else:
+            raw_dir = os.path.splitext(args.output_path)[0] + "_depth_raw"
+        os.makedirs(raw_dir, exist_ok=True)
+        print(f"[INFO] Raw depth frames will be saved to: {raw_dir}")
 
     def step_and_capture():
         """Run physics substeps, update scene, render one frame."""
+        nonlocal depth_frame_idx
         for _ in range(substeps):
             env.sim.step()
         env.scene.update(dt=sim_dt * substeps)
-        fr = env.render()
-        if fr is not None:
-            frames.append(fr)
+
+        if args.record_depth:
+            # ── Depth capture (AFTER stepping) ──
+            depth_raw = depth_cam.data.output["distance_to_image_plane"]
+            # Convert to numpy safely
+            if hasattr(depth_raw, 'detach'):  # torch tensor
+                depth_np = depth_raw.detach().cpu().numpy()
+            else:
+                depth_np = np.asarray(depth_raw)
+            # Squeeze to (H, W)
+            depth_np = depth_np.squeeze()
+
+            # Optional raw .npy dump (native sensor resolution)
+            if raw_dir is not None:
+                np.save(
+                    os.path.join(raw_dir, f"depth_{depth_frame_idx:06d}.npy"),
+                    depth_np.astype(np.float32),
+                )
+
+            # Visualize: near=black, far=white
+            gray = depth_to_uint8(depth_np, args.depth_near, args.depth_far)
+            # Resize to output MP4 resolution
+            gray_resized = cv2.resize(
+                gray,
+                (args.depth_vis_width, args.depth_vis_height),
+                interpolation=cv2.INTER_NEAREST,
+            )
+            # Convert grayscale → BGR for VideoWriter
+            bgr = cv2.cvtColor(gray_resized, cv2.COLOR_GRAY2BGR)
+            frames.append(bgr)
+            depth_frame_idx += 1
+        else:
+            # ── RGB capture (original behaviour) ──
+            fr = env.render()
+            if fr is not None:
+                frames.append(fr)
 
     # ─── Park all boxes out of view at start ──────────────────────────
     park_pos = [0.0, 0.0, -5.0]
@@ -926,25 +1049,30 @@ def main():
     # ─── Write video ──────────────────────────────────────────────────
     print(f"\n[INFO] Writing video to {args.output_path}...")
 
-    try:
-        import cv2
-        os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
 
-        if len(frames) > 0:
+    if len(frames) > 0:
+        if args.record_depth:
+            # Depth frames are already BGR at (depth_vis_width, depth_vis_height)
+            w, h = args.depth_vis_width, args.depth_vis_height
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(args.output_path, fourcc, args.fps, (w, h))
+            for frame in frames:
+                writer.write(frame)
+            writer.release()
+        else:
+            # RGB frames — original pipeline
             h, w = frames[0].shape[:2]
             fourcc = cv2.VideoWriter_fourcc(*"mp4v")
             writer = cv2.VideoWriter(args.output_path, fourcc, args.fps, (w, h))
-
             for frame in frames:
                 bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
                 writer.write(bgr)
             writer.release()
-            print(f"[SUCCESS] Video: {args.output_path} "
-                  f"({len(frames)} frames, {len(frames)/args.fps:.1f}s)")
-        else:
-            print("[WARNING] No frames captured!")
-    except ImportError:
-        print("[ERROR] cv2 not available. Install: pip install opencv-python")
+        print(f"[SUCCESS] Video: {args.output_path} "
+              f"({len(frames)} frames, {len(frames)/args.fps:.1f}s)")
+    else:
+        print("[WARNING] No frames captured!")
 
     # ─── Cleanup ──────────────────────────────────────────────────────
     env.close()
@@ -953,3 +1081,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# Example: depth recording command
+# python scripts/mockup_video_physics.py --headless --output_path runs/depth.mp4 \
+#     --record_depth --save_depth_raw --depth_near 0.25 --depth_far 3.5 \
+#     --depth_vis_width 960 --depth_vis_height 640
