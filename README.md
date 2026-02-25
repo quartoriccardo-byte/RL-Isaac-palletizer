@@ -264,6 +264,42 @@ Features:
 - Euro pallet mesh visual + cement floor
 - Cinematic camera angle
 
+### Agent-View Video (Heightmap Recording)
+
+Record the agent's top-down heightmap view as an MP4, or see it side-by-side with the RGB camera:
+
+```bash
+# RGB-only (default, unchanged)
+python scripts/mockup_video_physics.py \
+  --headless --output_path runs/mockup.mp4
+
+# Heightmap-only (depth camera → heightmap in meters → inferno colormap)
+python scripts/mockup_video_physics.py \
+  --headless --output_path runs/heightmap.mp4 \
+  --record_mode heightmap
+
+# Side-by-side RGB + heightmap
+python scripts/mockup_video_physics.py \
+  --headless --output_path runs/both.mp4 \
+  --record_mode both
+
+# Custom colormap and range
+python scripts/mockup_video_physics.py \
+  --headless --output_path runs/custom.mp4 \
+  --record_mode heightmap --hmap_colormap jet --hmap_vmax 1.5
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--record_mode` | `rgb` | `rgb`, `heightmap`, or `both` (side-by-side) |
+| `--hmap_vmin` | 0.0 | Height clamp floor (meters) |
+| `--hmap_vmax` | 0 (auto) | Height clamp ceiling (0 = `cfg.max_height`) |
+| `--hmap_colormap` | `inferno` | OpenCV colormap name |
+| `--hmap_invert` | off | Invert colormap direction |
+| `--disable_depth_noise` | on | Disable sensor noise for clean recordings |
+
+> **Note**: Depth noise is disabled by default when recording heightmaps to avoid flicker. The heightmap uses real meters `[0, max_height]`, not the normalized `[0, 1]` fed to the policy.
+
 ---
 
 ## Multi-GPU Setup

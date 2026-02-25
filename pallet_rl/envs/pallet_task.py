@@ -697,6 +697,33 @@ class PalletTask(DirectRLEnv):
             traceback.print_exc()
             return None
 
+    # =========================================================================
+    # Public heightmap accessors (for external scripts / recording)
+    # =========================================================================
+
+    def get_last_heightmap_meters(self) -> torch.Tensor | None:
+        """Return the last-computed heightmap in real meters, shape (N, H, W).
+
+        This is the raw (unnormalized) heightmap cached during
+        ``_get_observations()``.  Values represent physical height above
+        ground in meters.
+
+        Returns ``None`` if no observation step has been executed yet.
+        """
+        return self._last_heightmap
+
+    def get_last_heightmap_normalized(self) -> torch.Tensor | None:
+        """Return the last-computed heightmap normalized to [0, 1], shape (N, H, W).
+
+        Normalization uses ``cfg.max_height`` — identical to what the RL
+        policy receives as observation input.
+
+        Returns ``None`` if no observation step has been executed yet.
+        """
+        if self._last_heightmap is None:
+            return None
+        return self._last_heightmap / self.cfg.max_height
+
     def _init_state_tensors(self):
         """Initialize all state tensors on GPU."""
         device = self._device

@@ -29,9 +29,23 @@ Run:
   ~/isaac-sim/python.sh scripts/mockup_video_physics.py \\
       --headless --placement_mode drop --debug --output_path runs/drop.mp4
 
+  ~/isaac-sim/python.sh scripts/mockup_video_physics.py \\
+      --headless --output_path runs/heightmap.mp4 --record_mode heightmap
+
+  ~/isaac-sim/python.sh scripts/mockup_video_physics.py \\
+      --headless --output_path runs/both.mp4 --record_mode both
+
+Three recording modes (--record_mode):
+
+  rgb (default)     - Cinematic oblique RGB camera (unchanged behaviour).
+  heightmap         - Agent's top-down heightmap (depth camera -> heightmap
+                      in meters -> colormap). Noise disabled by default.
+  both              - Side-by-side: RGB left, heightmap right.
+
 CLI knobs:
-  --placement_mode, --debug, --carry_height, --lower_speed,
-  --release_clearance, --settle_s, --freeze_after_settle,
+  --record_mode, --hmap_vmin, --hmap_vmax, --hmap_colormap, --hmap_invert,
+  --disable_depth_noise, --placement_mode, --debug, --carry_height,
+  --lower_speed, --release_clearance, --settle_s, --freeze_after_settle,
   --max_retries, --num_boxes, --duration_s, etc.
 """
 
@@ -117,17 +131,30 @@ def parse_args():
     parser.add_argument("--debug_dump_path", type=str, default="runs/debug_frames",
                         help="Directory for debug frame PNGs")
 
-    # ── depth camera recording ─────────────────────────────────────────
-    parser.add_argument("--record_depth", action="store_true",
-                        help="Record depth instead of RGB")
-    parser.add_argument("--depth_near", type=float, default=0.25,
-                        help="Visualization clamp near (meters)")
-    parser.add_argument("--depth_far", type=float, default=3.5,
-                        help="Visualization clamp far (meters)")
-    parser.add_argument("--depth_vis_width", type=int, default=960,
-                        help="Output MP4 width for depth visualization")
-    parser.add_argument("--depth_vis_height", type=int, default=640,
-                        help="Output MP4 height for depth visualization")
+    # ── recording mode ──────────────────────────────────────────────────
+    parser.add_argument("--record_mode", type=str, default="rgb",
+                        choices=["rgb", "heightmap", "both"],
+                        help="What to record: 'rgb' (default, existing behaviour), "
+                             "'heightmap' (agent top-down heightmap), "
+                             "'both' (side-by-side RGB + heightmap)")
+
+    # ── heightmap visualization ────────────────────────────────────────
+    parser.add_argument("--hmap_vmin", type=float, default=0.0,
+                        help="Heightmap visualization min clamp (meters)")
+    parser.add_argument("--hmap_vmax", type=float, default=0.0,
+                        help="Heightmap visualization max clamp (meters). "
+                             "0 = auto from PalletTaskCfg.max_height")
+    parser.add_argument("--hmap_colormap", type=str, default="inferno",
+                        help="OpenCV colormap name for heightmap "
+                             "(inferno, jet, turbo, viridis, magma, etc.)")
+    parser.add_argument("--hmap_invert", action="store_true", default=False,
+                        help="Invert colormap so high=dark")
+    parser.add_argument("--disable_depth_noise", action="store_true",
+                        default=True,
+                        help="Disable depth sensor noise for recording "
+                             "(default: True when recording heightmap)")
+
+    # ── raw depth dump (works with --record_mode heightmap) ────────────
     parser.add_argument("--save_depth_raw", action="store_true",
                         help="Save raw depth frames as .npy")
     parser.add_argument("--depth_raw_dir", type=str, default="",
@@ -220,36 +247,67 @@ simulation_app = app_launcher.app
 # ═══════════════════════════════════════════════════════════════════════
 
 import numpy as np
+import torch
 
 from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf, Gf, UsdGeom
 
 from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
+from pallet_rl.utils.depth_heightmap import DepthHeightmapConverter, DepthHeightmapCfg
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Depth visualization helper
+# Heightmap visualization helpers
 # ═══════════════════════════════════════════════════════════════════════
 
-def depth_to_uint8(depth_m: np.ndarray, near: float, far: float) -> np.ndarray:
-    """Convert a float-meters depth map to uint8 (near=black, far=white).
+_CV2_COLORMAP_TABLE = {
+    "autumn": cv2.COLORMAP_AUTUMN, "bone": cv2.COLORMAP_BONE,
+    "jet": cv2.COLORMAP_JET, "winter": cv2.COLORMAP_WINTER,
+    "rainbow": cv2.COLORMAP_RAINBOW, "ocean": cv2.COLORMAP_OCEAN,
+    "summer": cv2.COLORMAP_SUMMER, "spring": cv2.COLORMAP_SPRING,
+    "cool": cv2.COLORMAP_COOL, "hot": cv2.COLORMAP_HOT,
+    "pink": cv2.COLORMAP_PINK, "hsv": cv2.COLORMAP_HSV,
+    "parula": cv2.COLORMAP_PARULA, "magma": cv2.COLORMAP_MAGMA,
+    "inferno": cv2.COLORMAP_INFERNO, "plasma": cv2.COLORMAP_PLASMA,
+    "viridis": cv2.COLORMAP_VIRIDIS, "cividis": cv2.COLORMAP_CIVIDIS,
+    "turbo": cv2.COLORMAP_TURBO, "twilight": cv2.COLORMAP_TWILIGHT,
+    "deepgreen": cv2.COLORMAP_DEEPGREEN,
+}
+
+
+def resolve_cv2_colormap(name: str) -> int:
+    """Resolve a colormap name to an OpenCV constant."""
+    key = name.lower().strip()
+    if key in _CV2_COLORMAP_TABLE:
+        return _CV2_COLORMAP_TABLE[key]
+    print(f"[WARN] Unknown colormap '{name}', falling back to INFERNO. "
+          f"Available: {sorted(_CV2_COLORMAP_TABLE.keys())}")
+    return cv2.COLORMAP_INFERNO
+
+
+def heightmap_to_bgr(
+    hmap_m: np.ndarray,
+    vmin: float,
+    vmax: float,
+    colormap_id: int,
+    invert: bool = False,
+) -> np.ndarray:
+    """Convert a (H, W) heightmap in meters to (H, W, 3) uint8 BGR.
 
     Args:
-        depth_m: float depth in meters, shape (H, W) or broadcastable.
-        near: near clamp distance (meters).
-        far:  far  clamp distance (meters).
+        hmap_m:  float32 heightmap (meters), shape (H, W).
+        vmin:    clamp floor (meters).
+        vmax:    clamp ceiling (meters).
+        colormap_id: cv2.COLORMAP_* constant.
+        invert:  if True, high heights map to dark colours.
 
     Returns:
-        uint8 array of shape (H, W), 0 = near, 255 = far.
+        BGR uint8 image (H, W, 3).
     """
-    d = depth_m.copy().astype(np.float64)
-    # Treat invalid pixels (non-finite or <= 0) as far
-    invalid = ~np.isfinite(d) | (d <= 0.0)
-    d[invalid] = far
-    # Clamp to [near, far]
-    d = np.clip(d, near, far)
-    # Normalize to [0, 1]
-    norm = (d - near) / max(far - near, 1e-8)
-    return (norm * 255.0).astype(np.uint8)
+    d = np.clip(hmap_m.astype(np.float64), vmin, vmax)
+    norm = ((d - vmin) / max(vmax - vmin, 1e-8) * 255.0).astype(np.uint8)
+    if invert:
+        norm = 255 - norm
+    return cv2.applyColorMap(norm, colormap_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -510,6 +568,12 @@ def main():
         print(f"  Settle time:  {args.settle_s} s")
         print(f"  Freeze:       {args.freeze_after_settle}")
     print(f"  Debug:        {args.debug}")
+    print(f"  Record mode:  {args.record_mode}")
+    if args.record_mode in ("heightmap", "both"):
+        _v = args.hmap_vmax if args.hmap_vmax > 0 else "auto"
+        print(f"  Hmap range:   [{args.hmap_vmin}, {_v}] m")
+        print(f"  Hmap cmap:    {args.hmap_colormap}")
+        print(f"  Noise off:    {args.disable_depth_noise}")
     print(f"{'='*60}\n")
 
     # ─── Environment config ───────────────────────────────────────────
@@ -557,8 +621,10 @@ def main():
     stage = omni.usd.get_context().get_stage()
 
     # ─── Depth camera access (robust, with fallbacks) ─────────────────
+    needs_depth = args.record_mode in ("heightmap", "both")
     depth_cam = None
-    if args.record_depth:
+    hmap_converter = None
+    if needs_depth:
         # Try 1: env.scene["depth_camera"]
         try:
             depth_cam = env.scene["depth_camera"]
@@ -588,6 +654,26 @@ def main():
                 f"Available keys: {_keys}"
             )
         print(f"[INFO] Depth camera type: {type(depth_cam).__name__}")
+
+        # ─── DepthHeightmapConverter (recording-only, noise off) ──────
+        _noise_off = args.disable_depth_noise
+        depth_hmap_cfg = DepthHeightmapCfg(
+            cam_height=cfg.depth_cam_resolution[0],
+            cam_width=cfg.depth_cam_resolution[1],
+            fov_deg=cfg.depth_cam_fov_deg,
+            sensor_height_m=cfg.depth_cam_height_m,
+            map_h=cfg.map_shape[0],
+            map_w=cfg.map_shape[1],
+            crop_x=cfg.depth_crop_x,
+            crop_y=cfg.depth_crop_y,
+            noise_enable=not _noise_off,
+            noise_sigma_m=cfg.depth_noise_sigma_m,
+            noise_scale=cfg.depth_noise_scale,
+            noise_quantization_m=cfg.depth_noise_quantization_m,
+            noise_dropout_prob=cfg.depth_noise_dropout_prob,
+        )
+        hmap_converter = DepthHeightmapConverter(depth_hmap_cfg, device=device)
+        print(f"[INFO] Heightmap converter created (noise_enable={not _noise_off})")
     boxes = env.scene["boxes"]
 
     # ─── GPU alignment check ───────────────────────────────────────────
@@ -730,7 +816,7 @@ def main():
 
     # Optional raw depth output directory
     raw_dir: str | None = None
-    if args.record_depth and args.save_depth_raw:
+    if needs_depth and args.save_depth_raw:
         if args.depth_raw_dir != "":
             raw_dir = args.depth_raw_dir
         else:
@@ -738,49 +824,87 @@ def main():
         os.makedirs(raw_dir, exist_ok=True)
         print(f"[INFO] Raw depth frames will be saved to: {raw_dir}")
 
+    # Resolve heightmap visualization parameters
+    hmap_vmin = args.hmap_vmin
+    hmap_vmax = args.hmap_vmax if args.hmap_vmax > 0 else cfg.max_height
+    hmap_cmap_id = resolve_cv2_colormap(args.hmap_colormap)
+    hmap_invert = args.hmap_invert
+
+    def _capture_heightmap_bgr() -> np.ndarray | None:
+        """Read depth camera, convert to heightmap, return BGR frame."""
+        nonlocal depth_frame_idx
+        depth_raw = depth_cam.data.output["distance_to_image_plane"]
+        # To torch tensor (N, H, W)
+        if hasattr(depth_raw, 'detach'):
+            depth_t = depth_raw.detach()
+        else:
+            depth_t = torch.as_tensor(depth_raw, device=device)
+        if depth_t.dim() == 4 and depth_t.shape[-1] == 1:
+            depth_t = depth_t.squeeze(-1)
+        if depth_t.dim() == 2:
+            depth_t = depth_t.unsqueeze(0)  # add batch dim
+
+        # Camera pose
+        cam_pos = depth_cam.data.pos_w       # (N, 3)
+        cam_quat = depth_cam.data.quat_w_world  # (N, 4) wxyz
+
+        # Depth → heightmap via converter
+        hmap_t = hmap_converter.depth_to_heightmap(depth_t, cam_pos, cam_quat)
+        hmap_np = hmap_t[0].cpu().numpy()  # (H, W) meters
+
+        # Optional raw depth dump
+        if raw_dir is not None:
+            depth_np = depth_t[0].cpu().numpy()
+            np.save(
+                os.path.join(raw_dir, f"depth_{depth_frame_idx:06d}.npy"),
+                depth_np.astype(np.float32),
+            )
+        depth_frame_idx += 1
+
+        # Heightmap → colormapped BGR
+        bgr = heightmap_to_bgr(hmap_np, hmap_vmin, hmap_vmax,
+                               hmap_cmap_id, hmap_invert)
+        return bgr
+
     def step_and_capture():
         """Run physics substeps, update scene, render one frame."""
-        nonlocal depth_frame_idx
         for _ in range(substeps):
             env.sim.step()
         env.scene.update(dt=sim_dt * substeps)
 
-        if args.record_depth:
-            # ── Depth capture (AFTER stepping) ──
-            depth_raw = depth_cam.data.output["distance_to_image_plane"]
-            # Convert to numpy safely
-            if hasattr(depth_raw, 'detach'):  # torch tensor
-                depth_np = depth_raw.detach().cpu().numpy()
-            else:
-                depth_np = np.asarray(depth_raw)
-            # Squeeze to (H, W)
-            depth_np = depth_np.squeeze()
+        record_mode = args.record_mode
 
-            # Optional raw .npy dump (native sensor resolution)
-            if raw_dir is not None:
-                np.save(
-                    os.path.join(raw_dir, f"depth_{depth_frame_idx:06d}.npy"),
-                    depth_np.astype(np.float32),
-                )
-
-            # Visualize: near=black, far=white
-            gray = depth_to_uint8(depth_np, args.depth_near, args.depth_far)
-            # Resize to output MP4 resolution
-            gray_resized = cv2.resize(
-                gray,
-                (args.depth_vis_width, args.depth_vis_height),
-                interpolation=cv2.INTER_NEAREST,
-            )
-            # Convert grayscale → BGR for VideoWriter
-            bgr = cv2.cvtColor(gray_resized, cv2.COLOR_GRAY2BGR)
-            frames.append(bgr)
-            depth_frame_idx += 1
-        else:
-            # ── RGB capture (original behaviour) ──
+        if record_mode == "rgb":
+            # ── RGB only (original behaviour) ──
             fr = env.render()
             if fr is not None:
                 frames.append(fr)
 
+        elif record_mode == "heightmap":
+            # ── Heightmap only ──
+            bgr = _capture_heightmap_bgr()
+            if bgr is not None:
+                frames.append(bgr)
+
+        elif record_mode == "both":
+            # ── Side-by-side: RGB (left) + heightmap (right) ──
+            rgb_frame = env.render()
+            hmap_bgr = _capture_heightmap_bgr()
+            if rgb_frame is not None and hmap_bgr is not None:
+                # Convert RGB to BGR for consistency
+                rgb_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+                rgb_h, rgb_w = rgb_bgr.shape[:2]
+                hm_h, hm_w = hmap_bgr.shape[:2]
+                # Resize heightmap to match RGB height, preserving aspect ratio
+                if hm_h != rgb_h:
+                    scale = rgb_h / hm_h
+                    new_w = int(hm_w * scale)
+                    hmap_bgr = cv2.resize(hmap_bgr, (new_w, rgb_h),
+                                          interpolation=cv2.INTER_LINEAR)
+                composite = np.concatenate([rgb_bgr, hmap_bgr], axis=1)
+                frames.append(composite)
+            elif rgb_frame is not None:
+                frames.append(cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR))
     # ─── Park all boxes out of view at start ──────────────────────────
     park_pos = [0.0, 0.0, -5.0]
     for i in range(cfg.max_boxes):
@@ -1030,7 +1154,11 @@ def main():
                     )
                     try:
                         import cv2 as _cv2
-                        _cv2.imwrite(_dump_path, _cv2.cvtColor(frames[-1], _cv2.COLOR_RGB2BGR))
+                        _dump_frame = frames[-1]
+                        # In rgb mode, frames are RGB; convert. Otherwise already BGR.
+                        if args.record_mode == "rgb":
+                            _dump_frame = _cv2.cvtColor(_dump_frame, _cv2.COLOR_RGB2BGR)
+                        _cv2.imwrite(_dump_path, _dump_frame)
                         print(f"  [DEBUG] Saved debug frame to {_dump_path}")
                     except Exception as _e:
                         print(f"  [DEBUG] Frame dump failed: {_e}")
@@ -1052,29 +1180,28 @@ def main():
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
 
     if len(frames) > 0:
-        if args.record_depth:
-            # Depth frames are already BGR at (depth_vis_width, depth_vis_height)
-            w, h = args.depth_vis_width, args.depth_vis_height
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(args.output_path, fourcc, args.fps, (w, h))
-            for frame in frames:
-                writer.write(frame)
-            writer.release()
+        h, w = frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(args.output_path, fourcc, args.fps, (w, h))
+        if not writer.isOpened():
+            print(f"[ERROR] Could not open VideoWriter for {args.output_path} "
+                  f"(size={w}x{h}, codec=mp4v)")
         else:
-            # RGB frames — original pipeline
-            h, w = frames[0].shape[:2]
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(args.output_path, fourcc, args.fps, (w, h))
             for frame in frames:
-                bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                writer.write(bgr)
+                if args.record_mode == "rgb":
+                    # RGB frames need conversion to BGR for cv2
+                    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    writer.write(bgr)
+                else:
+                    # heightmap / both modes already produce BGR frames
+                    writer.write(frame)
             writer.release()
         print(f"[SUCCESS] Video: {args.output_path} "
               f"({len(frames)} frames, {len(frames)/args.fps:.1f}s)")
     else:
         print("[WARNING] No frames captured!")
 
-    # ─── Cleanup ──────────────────────────────────────────────────────
+    # ─── Cleanup ──────────────────────────────────────────────────────────
     env.close()
     simulation_app.close()
 
@@ -1082,7 +1209,28 @@ def main():
 if __name__ == "__main__":
     main()
 
-# Example: depth recording command
-# python scripts/mockup_video_physics.py --headless --output_path runs/depth.mp4 \
-#     --record_depth --save_depth_raw --depth_near 0.25 --depth_far 3.5 \
-#     --depth_vis_width 960 --depth_vis_height 640
+# ======================================================================
+# Example commands
+# ======================================================================
+#
+# RGB-only (default, unchanged behaviour):
+#   python scripts/mockup_video_physics.py --headless \
+#       --output_path runs/mockup.mp4
+#
+# Heightmap-only (agent’s top-down view, inferno colormap, no noise):
+#   python scripts/mockup_video_physics.py --headless \
+#       --output_path runs/heightmap.mp4 --record_mode heightmap
+#
+# Side-by-side RGB + heightmap:
+#   python scripts/mockup_video_physics.py --headless \
+#       --output_path runs/both.mp4 --record_mode both
+#
+# Custom colormap and range:
+#   python scripts/mockup_video_physics.py --headless \
+#       --output_path runs/custom.mp4 --record_mode heightmap \
+#       --hmap_colormap jet --hmap_vmax 1.5
+#
+# Heightmap with raw depth dump:
+#   python scripts/mockup_video_physics.py --headless \
+#       --output_path runs/heightmap.mp4 --record_mode heightmap \
+#       --save_depth_raw
