@@ -627,6 +627,19 @@ def main():
     # ─── Create environment ───────────────────────────────────────────
     env = PalletTask(cfg, render_mode="rgb_array")
 
+    # FIX: reset env so that PhysX views, scene buffers, and sensors are
+    # fully initialised before we attempt to write box poses.
+    print("[INFO] Calling env.reset() to initialise PhysX views ...")
+    env.reset()
+
+    # Warmup: step + update a few times so that PhysX GPU broadphase,
+    # render products, and depth-camera buffers are all fully active.
+    _warmup_dt = env.sim.get_physics_dt()
+    for _wi in range(3):
+        env.sim.step()
+        env.scene.update(dt=_warmup_dt)
+    print("[INFO] Warmup complete (3 sim steps).")
+
     stage = omni.usd.get_context().get_stage()
 
     # ─── Depth camera access (robust, with fallbacks) ─────────────────
@@ -796,6 +809,17 @@ def main():
 
         object_ids = torch.tensor([idx], dtype=torch.long, device=device)
         boxes.write_object_state_to_sim(state, _env_ids_0, object_ids)
+
+        # --debug_box_sync: readback verification after every write
+        if args.debug_box_sync:
+            env.sim.step()
+            env.scene.update(dt=env.sim.get_physics_dt())
+            rb_pos = boxes.data.object_pos_w[0, idx].cpu()
+            all_z = boxes.data.object_pos_w[0, :args.num_boxes, 2].cpu()
+            print(f"  [BOX_SYNC] set_box_pose({idx}) "
+                  f"target=({px:.3f},{py:.3f},{pz:.3f})  "
+                  f"readback=({rb_pos[0]:.3f},{rb_pos[1]:.3f},{rb_pos[2]:.3f})  "
+                  f"all_z: min={all_z.min():.2f} max={all_z.max():.2f}")
 
     def zero_box_vel(idx: int):
         """Zero velocities for box `idx` by re-writing its full state.
@@ -1077,14 +1101,20 @@ def main():
                     print(f"  ✓ Placed box {placement_idx}/{len(placements)} "
                           f"at ({final_pos[0]:.2f}, {final_pos[1]:.2f}, "
                           f"{final_pos[2]:.2f})  [kinematic]")
-                    # --debug_box_sync: verify the box actually reached sim
+                    # --debug_box_sync: verify the placed box reached sim
                     if args.debug_box_sync:
+                        # The placed box is current_box_idx - 1
+                        # (current_box_idx was already incremented above)
+                        _placed_idx = current_box_idx - 1
                         env.sim.step()
                         env.scene.update(dt=sim_dt)
-                        sync_z = float(boxes.data.object_pos_w[0, current_box_idx - 1, 2].cpu())
-                        tag = "OK" if sync_z > -1.0 else "STUCK at parking z!"
-                        print(f"  [BOX_SYNC] box {current_box_idx - 1} "
-                              f"sim z = {sync_z:.4f}  ({tag})")
+                        rb = boxes.data.object_pos_w[0, _placed_idx].cpu()
+                        target_z = final_pos[2]
+                        tag = "OK" if rb[2] > -1.0 else "STUCK at parking z!"
+                        print(f"  [BOX_SYNC] box {_placed_idx} "
+                              f"target_z={target_z:.4f}  "
+                              f"readback=({rb[0]:.3f},{rb[1]:.3f},{rb[2]:.3f})  "
+                              f"({tag})")
 
                     if args.debug:
                         # Print visibility of first placed box
@@ -1162,14 +1192,18 @@ def main():
                         print(f"  ✓ Placed box {placement_idx}/{len(placements)} "
                               f"at ({final_pos[0]:.2f}, {final_pos[1]:.2f}, "
                               f"{final_pos[2]:.2f})  [drop]")
-                        # --debug_box_sync: verify the box actually reached sim
+                        # --debug_box_sync: verify the placed box reached sim
                         if args.debug_box_sync:
+                            _placed_idx = current_box_idx - 1
                             env.sim.step()
                             env.scene.update(dt=sim_dt)
-                            sync_z = float(boxes.data.object_pos_w[0, current_box_idx - 1, 2].cpu())
-                            tag = "OK" if sync_z > -1.0 else "STUCK at parking z!"
-                            print(f"  [BOX_SYNC] box {current_box_idx - 1} "
-                                  f"sim z = {sync_z:.4f}  ({tag})")
+                            rb = boxes.data.object_pos_w[0, _placed_idx].cpu()
+                            target_z = final_pos[2]
+                            tag = "OK" if rb[2] > -1.0 else "STUCK at parking z!"
+                            print(f"  [BOX_SYNC] box {_placed_idx} "
+                                  f"target_z={target_z:.4f}  "
+                                  f"readback=({rb[0]:.3f},{rb[1]:.3f},{rb[2]:.3f})  "
+                                  f"({tag})")
                     else:
                         # ── Single-box retry (never full-reset) ──
                         retry_count += 1
