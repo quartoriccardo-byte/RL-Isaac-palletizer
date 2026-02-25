@@ -1073,6 +1073,76 @@ def main():
     for _ in range(10):
         step_and_capture()
 
+    # ─── CRITICAL: Re-orient cameras AFTER warmup + parking ───────────
+    # The camera look-at set in PalletTask.__init__() may not persist
+    # after warmup/parking steps.  The legacy mockup_video.py explicitly
+    # re-sets the camera AFTER warmup — we do the same here.
+    try:
+        render_cam = env.scene["render_camera"]
+        _cam_eye = torch.tensor([[2.5, 2.5, 2.5]], dtype=torch.float32,
+                                device=device)
+        _cam_target = torch.tensor([[0.0, 0.0, 0.3]], dtype=torch.float32,
+                                   device=device)
+        render_cam.set_world_poses_from_view(eyes=_cam_eye, targets=_cam_target)
+        print("[CAMERA] Re-oriented render camera after warmup: "
+              f"eye=(2.5,2.5,2.5) target=(0,0,0.3)")
+    except Exception as _e:
+        print(f"[CAMERA WARN] Could not re-orient render camera: {_e}")
+
+    if needs_depth and depth_cam is not None:
+        try:
+            _dc_eye = torch.tensor([[0.0, 0.0, cfg.depth_cam_height_m]],
+                                   dtype=torch.float32, device=device)
+            _dc_tgt = torch.tensor([[0.0, 0.0, 0.0]],
+                                   dtype=torch.float32, device=device)
+            depth_cam.set_world_poses_from_view(eyes=_dc_eye, targets=_dc_tgt)
+            print(f"[CAMERA] Re-oriented depth camera after warmup: "
+                  f"eye=(0,0,{cfg.depth_cam_height_m}) target=(0,0,0)")
+        except Exception as _e:
+            print(f"[CAMERA WARN] Could not re-orient depth camera: {_e}")
+
+    # Pump a few more render frames to let the camera re-orientation take effect
+    for _ in range(3):
+        simulation_app.update()
+
+    # ─── World-frame diagnostics ──────────────────────────────────────
+    print("\n[DIAG] === World-Frame Diagnostics ===")
+    # Pallet position
+    try:
+        _pallet = env.scene["pallet"]
+        _pallet_pos = _pallet.data.root_pos_w[0].cpu().numpy()
+        print(f"  Pallet world pos  : ({_pallet_pos[0]:.3f}, {_pallet_pos[1]:.3f}, {_pallet_pos[2]:.3f})")
+    except Exception as _e:
+        print(f"  Pallet world pos  : [error: {_e}]")
+
+    # Render camera pose
+    try:
+        _rc_pos = render_cam.data.pos_w[0].cpu().numpy()
+        print(f"  Render cam pos    : ({_rc_pos[0]:.3f}, {_rc_pos[1]:.3f}, {_rc_pos[2]:.3f})")
+        _rc_quat = render_cam.data.quat_w_world[0].cpu().numpy()
+        print(f"  Render cam quat   : ({_rc_quat[0]:.3f}, {_rc_quat[1]:.3f}, {_rc_quat[2]:.3f}, {_rc_quat[3]:.3f})")
+    except Exception as _e:
+        print(f"  Render cam pose   : [error: {_e}]")
+
+    # Depth camera pose
+    if needs_depth and depth_cam is not None:
+        try:
+            _dc_pos = depth_cam.data.pos_w[0].cpu().numpy()
+            _dc_quat = depth_cam.data.quat_w_world[0].cpu().numpy()
+            print(f"  Depth cam pos     : ({_dc_pos[0]:.3f}, {_dc_pos[1]:.3f}, {_dc_pos[2]:.3f})")
+            print(f"  Depth cam quat    : ({_dc_quat[0]:.3f}, {_dc_quat[1]:.3f}, {_dc_quat[2]:.3f}, {_dc_quat[3]:.3f})")
+        except Exception as _e:
+            print(f"  Depth cam pose    : [error: {_e}]")
+
+    # Env origin (with num_envs=1, should be (0,0,0))
+    try:
+        _env_orig = env.scene.env_origins[0].cpu().numpy()
+        print(f"  Env 0 origin      : ({_env_orig[0]:.3f}, {_env_orig[1]:.3f}, {_env_orig[2]:.3f})")
+    except Exception as _e:
+        print(f"  Env 0 origin      : [error: {_e}]")
+
+    print("[DIAG] === End Diagnostics ===\n")
+
     # ─── Diagnostic frame dump (always, not gated) ─────────────────────
     # Saves exactly 1 RGB + 1 heightmap PNG after the first placement
     # to the output directory for quick visual verification.
@@ -1357,6 +1427,14 @@ def main():
                 # ── Auto-diagnostic: save 1 RGB + 1 heightmap PNG (once) ──
                 if not _diag_saved and placement_idx >= 1 and state_timer < frame_dt * 1.5:
                     _diag_saved = True
+                    # Print placed box world position for coordinate frame verification
+                    try:
+                        _box0_pos = boxes.data.object_pos_w[0, 0].cpu().numpy()
+                        _rcam_pos = render_cam.data.pos_w[0].cpu().numpy()
+                        print(f"  [DIAG] Box 0 world pos : ({_box0_pos[0]:.3f}, {_box0_pos[1]:.3f}, {_box0_pos[2]:.3f})")
+                        print(f"  [DIAG] Render cam pos  : ({_rcam_pos[0]:.3f}, {_rcam_pos[1]:.3f}, {_rcam_pos[2]:.3f})")
+                    except Exception:
+                        pass
                     # RGB diagnostic
                     try:
                         _rgb_diag = env.render()
