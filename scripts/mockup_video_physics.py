@@ -165,6 +165,11 @@ def parse_args():
                         help="Output folder for raw depth; if empty, "
                              "use <output_path>_depth_raw")
 
+    # ── debug: box sync verification ──────────────────────────────────
+    parser.add_argument("--debug_box_sync", action="store_true", default=False,
+                        help="After each placement, step once and print the "
+                             "box world z to verify it left the parking pose")
+
     # extensions
     parser.add_argument("--exclude_isaaclab_tasks", action="store_true", default=True,
                         help="Exclude problematic isaaclab_tasks extension")
@@ -763,40 +768,31 @@ def main():
     )
     print(f"[INFO] Planned {len(placements)} placements")
 
-    # ─── Helpers: pose & velocity ─────────────────────────────────────
+    # ─── Helpers: pose & velocity ───────────────────────────────────
     def set_box_pose(idx: int, pos_xyz, yaw_rad: float):
-        """Write pose for box `idx` in env 0 using torch tensors."""
+        """Write pose for box `idx` in env 0, then flush to sim."""
         pos_t = torch.tensor(pos_xyz, dtype=torch.float32, device=device)
         cy = math.cos(0.5 * yaw_rad)
         sy = math.sin(0.5 * yaw_rad)
         quat_t = torch.tensor([cy, 0.0, 0.0, sy], dtype=torch.float32, device=device)
 
+        # Update internal data buffers
         boxes.data.object_pos_w[0, idx] = pos_t
         boxes.data.object_quat_w[0, idx] = quat_t
         boxes.data.object_lin_vel_w[0, idx] = 0.0
         boxes.data.object_ang_vel_w[0, idx] = 0.0
 
-        # Write full buffers to sim
-        all_pos = boxes.data.object_pos_w.reshape(-1, 3)
-        all_quat = boxes.data.object_quat_w.reshape(-1, 4)
-        boxes.write_object_pose_to_sim(
-            torch.cat([all_pos, all_quat], dim=-1)
-        )
-        all_lin = boxes.data.object_lin_vel_w.reshape(-1, 3)
-        all_ang = boxes.data.object_ang_vel_w.reshape(-1, 3)
-        boxes.write_object_velocity_to_sim(
-            torch.cat([all_lin, all_ang], dim=-1)
-        )
+        # FIX: push ALL data buffers to PhysX in one call.
+        # Previous code used write_object_pose_to_sim(cat([pos, quat]))
+        # with flat-reshaped tensors — wrong API shape, poses never reached sim.
+        boxes.write_data_to_sim()
 
     def zero_box_vel(idx: int):
-        """Zero velocities for box `idx`."""
+        """Zero velocities for box `idx`, then flush to sim."""
         boxes.data.object_lin_vel_w[0, idx] = 0.0
         boxes.data.object_ang_vel_w[0, idx] = 0.0
-        all_lin = boxes.data.object_lin_vel_w.reshape(-1, 3)
-        all_ang = boxes.data.object_ang_vel_w.reshape(-1, 3)
-        boxes.write_object_velocity_to_sim(
-            torch.cat([all_lin, all_ang], dim=-1)
-        )
+        # FIX: use write_data_to_sim() instead of write_object_velocity_to_sim()
+        boxes.write_data_to_sim()
 
     def get_box_pos(idx: int) -> np.ndarray:
         """Read current position of box `idx`."""
@@ -1060,6 +1056,14 @@ def main():
                     print(f"  ✓ Placed box {placement_idx}/{len(placements)} "
                           f"at ({final_pos[0]:.2f}, {final_pos[1]:.2f}, "
                           f"{final_pos[2]:.2f})  [kinematic]")
+                    # --debug_box_sync: verify the box actually reached sim
+                    if args.debug_box_sync:
+                        env.sim.step()
+                        env.scene.update(dt=sim_dt)
+                        sync_z = float(boxes.data.object_pos_w[0, current_box_idx - 1, 2].cpu())
+                        tag = "OK" if sync_z > -1.0 else "STUCK at parking z!"
+                        print(f"  [BOX_SYNC] box {current_box_idx - 1} "
+                              f"sim z = {sync_z:.4f}  ({tag})")
 
                     if args.debug:
                         # Print visibility of first placed box
@@ -1137,6 +1141,14 @@ def main():
                         print(f"  ✓ Placed box {placement_idx}/{len(placements)} "
                               f"at ({final_pos[0]:.2f}, {final_pos[1]:.2f}, "
                               f"{final_pos[2]:.2f})  [drop]")
+                        # --debug_box_sync: verify the box actually reached sim
+                        if args.debug_box_sync:
+                            env.sim.step()
+                            env.scene.update(dt=sim_dt)
+                            sync_z = float(boxes.data.object_pos_w[0, current_box_idx - 1, 2].cpu())
+                            tag = "OK" if sync_z > -1.0 else "STUCK at parking z!"
+                            print(f"  [BOX_SYNC] box {current_box_idx - 1} "
+                                  f"sim z = {sync_z:.4f}  ({tag})")
                     else:
                         # ── Single-box retry (never full-reset) ──
                         retry_count += 1
