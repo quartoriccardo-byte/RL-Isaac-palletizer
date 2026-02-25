@@ -888,11 +888,27 @@ def main():
         if args.debug_box_sync:
             env.sim.step()
             env.scene.update(dt=env.sim.get_physics_dt())
+            # Flush PhysX → USD prim transforms
+            simulation_app.update()
+
             rb_pos = boxes.data.object_pos_w[0, idx].cpu()
             all_z = boxes.data.object_pos_w[0, :args.num_boxes, 2].cpu()
+
+            # === USD prim transform readback (renderer's view) ===
+            _bp = box_prim_path(idx)
+            _prim = stage.GetPrimAtPath(_bp)
+            _usd_z = float("nan")
+            if _prim.IsValid():
+                _xf = UsdGeom.Xformable(_prim)
+                _world_mtx = _xf.ComputeLocalToWorldTransform(0.0)
+                _usd_pos = _world_mtx.ExtractTranslation()
+                _usd_z = _usd_pos[2]
+
+            _match = "OK" if abs(rb_pos[2].item() - _usd_z) < 0.01 else "MISMATCH!"
             print(f"  [BOX_SYNC] set_box_pose({idx}) "
                   f"target=({px:.3f},{py:.3f},{pz:.3f})  "
-                  f"readback=({rb_pos[0]:.3f},{rb_pos[1]:.3f},{rb_pos[2]:.3f})  "
+                  f"tensor_z={rb_pos[2]:.3f}  "
+                  f"usd_z={_usd_z:.3f}  [{_match}]  "
                   f"all_z: min={all_z.min():.2f} max={all_z.max():.2f}")
 
     def zero_box_vel(idx: int):
@@ -1107,13 +1123,53 @@ def main():
 
     # ─── World-frame diagnostics ──────────────────────────────────────
     print("\n[DIAG] === World-Frame Diagnostics ===")
-    # Pallet position
+
+    # PhysX CUDA device actually used
+    try:
+        import carb.settings as _csettings
+        _csdev = _csettings.get_settings().get("/physics/cudaDevice")
+        _agpu  = _csettings.get_settings().get("/renderer/activeGpu")
+        print(f"  PhysX cudaDevice  : {_csdev}  (CUDA ordinal)")
+        print(f"  Renderer activeGpu: {_agpu}  (Vulkan ordinal)")
+    except Exception as _e:
+        print(f"  GPU settings      : [error: {_e}]")
+
+    # Pallet position: tensor readback vs USD prim
     try:
         _pallet = env.scene["pallet"]
         _pallet_pos = _pallet.data.root_pos_w[0].cpu().numpy()
-        print(f"  Pallet world pos  : ({_pallet_pos[0]:.3f}, {_pallet_pos[1]:.3f}, {_pallet_pos[2]:.3f})")
+        print(f"  Pallet tensor pos : ({_pallet_pos[0]:.3f}, {_pallet_pos[1]:.3f}, {_pallet_pos[2]:.3f})")
     except Exception as _e:
-        print(f"  Pallet world pos  : [error: {_e}]")
+        print(f"  Pallet tensor pos : [error: {_e}]")
+    try:
+        _pallet_prim = stage.GetPrimAtPath("/World/envs/env_0/Pallet")
+        if _pallet_prim.IsValid():
+            _pxf = UsdGeom.Xformable(_pallet_prim)
+            _pmtx = _pxf.ComputeLocalToWorldTransform(0.0)
+            _ptrans = _pmtx.ExtractTranslation()
+            print(f"  Pallet USD pos    : ({_ptrans[0]:.3f}, {_ptrans[1]:.3f}, {_ptrans[2]:.3f})")
+        else:
+            print(f"  Pallet USD prim   : INVALID")
+    except Exception as _e:
+        print(f"  Pallet USD pos    : [error: {_e}]")
+
+    # Box 0 position (should be parked at z=-5): tensor vs USD
+    try:
+        _b0_tensor = boxes.data.object_pos_w[0, 0].cpu().numpy()
+        print(f"  Box 0 tensor pos  : ({_b0_tensor[0]:.3f}, {_b0_tensor[1]:.3f}, {_b0_tensor[2]:.3f})")
+    except Exception as _e:
+        print(f"  Box 0 tensor pos  : [error: {_e}]")
+    try:
+        _b0_prim = stage.GetPrimAtPath("/World/envs/env_0/Boxes/box_0")
+        if _b0_prim.IsValid():
+            _b0xf = UsdGeom.Xformable(_b0_prim)
+            _b0mtx = _b0xf.ComputeLocalToWorldTransform(0.0)
+            _b0trans = _b0mtx.ExtractTranslation()
+            print(f"  Box 0 USD pos     : ({_b0trans[0]:.3f}, {_b0trans[1]:.3f}, {_b0trans[2]:.3f})")
+        else:
+            print(f"  Box 0 USD prim    : INVALID")
+    except Exception as _e:
+        print(f"  Box 0 USD pos     : [error: {_e}]")
 
     # Render camera pose
     try:
