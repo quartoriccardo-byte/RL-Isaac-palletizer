@@ -196,11 +196,12 @@ def inject_kit_args(args, unknown):
     if not args.enable_cameras:
         args.enable_cameras = True
 
-    # ── RTX 6000 is at Vulkan index 2 on this machine ──────────────
-    # CUDA index (from PyTorch) ≠ Vulkan index (used by Kit renderer
-    # and PhysX).  We hardcode the Vulkan index here; the CUDA device
-    # for PyTorch tensors is handled separately by pick_supported_cuda_device().
-    gpu_idx = "2"
+    # ── GPU ordinal mapping for this machine ───────────────────────
+    # /renderer/activeGpu  uses *Vulkan* ordinals → RTX 6000 = 2
+    # /physics/cudaDevice   uses *CUDA*   ordinals → RTX 6000 = 0
+    # These numbers intentionally differ; they are separate namespaces.
+    vulkan_idx = "2"   # RTX 6000 in Vulkan device list
+    cuda_idx   = "0"   # RTX 6000 in CUDA device list
 
     user_kit_args = [a for a in unknown if a.startswith("--/")]
     user_kit_paths = {a.split("=")[0] for a in user_kit_args}
@@ -209,8 +210,8 @@ def inject_kit_args(args, unknown):
         "--/ngx/enabled": "--/ngx/enabled=false",
         "--/rtx/post/dlss/enabled": "--/rtx/post/dlss/enabled=false",
         "--/renderer/multiGpu/enabled": "--/renderer/multiGpu/enabled=false",
-        "--/renderer/activeGpu": f"--/renderer/activeGpu={gpu_idx}",
-        "--/physics/cudaDevice": f"--/physics/cudaDevice={gpu_idx}",
+        "--/renderer/activeGpu": f"--/renderer/activeGpu={vulkan_idx}",
+        "--/physics/cudaDevice": f"--/physics/cudaDevice={cuda_idx}",
     }
     
     if args.physx_sync_launch:
@@ -236,12 +237,12 @@ args, unknown = parse_args()
 
 # ─── Force supported GPU (RTX 6000 vs 1080 Ti) ─────────────────────────
 # pick_supported_cuda_device() selects the correct *CUDA* device for
-# PyTorch tensors.  We intentionally do NOT propagate its CUDA index
-# into Kit settings — Kit uses *Vulkan* indices (handled in inject_kit_args).
-cuda_idx, forced_device = pick_supported_cuda_device()
+# PyTorch tensors.  Kit settings (Vulkan + CUDA ordinals) are handled
+# separately in inject_kit_args().
+_cuda_idx, forced_device = pick_supported_cuda_device()
 args.device = forced_device
-print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {cuda_idx})")
-print(f"[INFO] Kit Vulkan GPU index: 2  (hardcoded for RTX 6000)")
+print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {_cuda_idx})")
+print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX CUDA device: 0")
 
 inject_kit_args(args, unknown)
 
@@ -256,16 +257,16 @@ app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
 # ── Force Kit settings AFTER AppLauncher, BEFORE env creation ──────────
-# AppLauncher may overwrite /physics/cudaDevice during init.  We set them
-# again here so both renderer and PhysX target the RTX 6000 at Vulkan idx 2.
+# AppLauncher may overwrite /physics/cudaDevice during init.  We re-apply
+# the correct values: renderer=Vulkan idx 2, PhysX=CUDA idx 0.
 try:
     import carb.settings
     _s = carb.settings.get_settings()
-    _s.set("/renderer/activeGpu", 2)
-    _s.set("/physics/cudaDevice", 2)
+    _s.set("/renderer/activeGpu", 2)       # Vulkan ordinal
+    _s.set("/physics/cudaDevice", 0)       # CUDA ordinal
     _s.set("/renderer/multiGpu/enabled", False)
     print("[INFO] Post-launch Kit settings forced: "
-          "activeGpu=2, cudaDevice=2, multiGpu=false")
+          "activeGpu=2 (Vulkan), cudaDevice=0 (CUDA), multiGpu=false")
 except Exception as _e:
     print(f"[WARN] Could not force post-launch Kit settings: {_e}")
 
@@ -690,10 +691,12 @@ def main():
     # Warmup: step + update a few times so that PhysX GPU broadphase,
     # render products, and depth-camera buffers are all fully active.
     _warmup_dt = env.sim.get_physics_dt()
-    for _wi in range(3):
+    for _wi in range(5):
         env.sim.step()
         env.scene.update(dt=_warmup_dt)
-    print("[INFO] Warmup complete (3 sim steps).")
+        # CRITICAL: pump the Kit renderer so render products are initialized
+        simulation_app.update()
+    print("[INFO] Warmup complete (5 sim steps + render pumps).")
 
     stage = omni.usd.get_context().get_stage()
 
@@ -752,6 +755,20 @@ def main():
         )
         hmap_converter = DepthHeightmapConverter(depth_hmap_cfg, device=device)
         print(f"[INFO] Heightmap converter created (noise_enable={_noise_on})")
+
+        # ── Set depth camera look-at: top-down over pallet center ──
+        try:
+            _dc_device = torch.device(device)
+            _dc_eyes = torch.tensor([[0.0, 0.0, cfg.depth_cam_height_m]],
+                                    device=_dc_device).repeat(cfg.scene.num_envs, 1)
+            _dc_targets = torch.tensor([[0.0, 0.0, 0.0]],
+                                       device=_dc_device).repeat(cfg.scene.num_envs, 1)
+            depth_cam.set_world_poses_from_view(eyes=_dc_eyes, targets=_dc_targets)
+            print(f"[INFO] Depth camera look-at set: eye=(0,0,{cfg.depth_cam_height_m}), "
+                  f"target=(0,0,0) [top-down]")
+        except Exception as _e:
+            print(f"[WARN] Could not set depth camera look-at: {_e}")
+
     boxes = env.scene["boxes"]
 
     # ─── GPU alignment check ───────────────────────────────────────────
@@ -760,11 +777,13 @@ def main():
         _settings = carb.settings.get_settings()
         _render_gpu = _settings.get("/renderer/activeGpu")
         _physics_gpu = _settings.get("/physics/cudaDevice")
-        print(f"[INFO] renderer/activeGpu  = {_render_gpu}")
-        print(f"[INFO] physics/cudaDevice  = {_physics_gpu}")
-        if str(_render_gpu) != str(_physics_gpu):
-            print("[WARN] renderer activeGpu != physics cudaDevice "
-                  "— this may cause instability or invisible geometry!")
+        print(f"[INFO] renderer/activeGpu  = {_render_gpu}  (Vulkan ordinal)")
+        print(f"[INFO] physics/cudaDevice  = {_physics_gpu}  (CUDA ordinal)")
+        # NOTE: These use different ordinal namespaces and are expected to
+        #       differ when Vulkan and CUDA enumerate GPUs in different order.
+        if _physics_gpu != 0:
+            print("[WARN] physics/cudaDevice is not 0 — RTX 6000 should be "
+                  "CUDA device 0. PhysX may target an unsupported GPU!")
     except Exception as _e:
         print(f"[WARN] Could not read GPU alignment settings: {_e}")
 
@@ -934,6 +953,10 @@ def main():
     def _capture_heightmap_bgr() -> np.ndarray | None:
         """Read depth camera, convert to heightmap, return BGR frame."""
         nonlocal depth_frame_idx
+
+        # CRITICAL: explicitly update depth camera so it reads fresh data
+        depth_cam.update(dt=sim_dt * substeps)
+
         depth_raw = depth_cam.data.output["distance_to_image_plane"]
         # To torch tensor (N, H, W)
         if hasattr(depth_raw, 'detach'):
@@ -944,6 +967,22 @@ def main():
             depth_t = depth_t.squeeze(-1)
         if depth_t.dim() == 2:
             depth_t = depth_t.unsqueeze(0)  # add batch dim
+
+        # ── Depth diagnostics (every 50 frames) ──
+        if depth_frame_idx % 50 == 0:
+            _d0 = depth_t[0].cpu().numpy()
+            _valid_mask = _d0 > 0.01
+            _valid_count = int(_valid_mask.sum())
+            _total = _d0.size
+            if _valid_count > 0:
+                _d_min = float(_d0[_valid_mask].min())
+                _d_max = float(_d0[_valid_mask].max())
+                _d_mean = float(_d0[_valid_mask].mean())
+            else:
+                _d_min = _d_max = _d_mean = 0.0
+            print(f"  [DEPTH DBG] frame={depth_frame_idx} "
+                  f"valid={_valid_count}/{_total} "
+                  f"min={_d_min:.3f} max={_d_max:.3f} mean={_d_mean:.3f}")
 
         # Camera pose
         cam_pos = depth_cam.data.pos_w       # (N, 3)
@@ -972,6 +1011,11 @@ def main():
         for _ in range(substeps):
             env.sim.step()
         env.scene.update(dt=sim_dt * substeps)
+
+        # CRITICAL: Flush USD transforms into the renderer.  In headless mode,
+        # without this call camera render products never see the updated
+        # prim transforms — resulting in invisible/stale geometry.
+        simulation_app.update()
 
         record_mode = args.record_mode
 
@@ -1028,6 +1072,13 @@ def main():
     # Let the scene settle for a few frames
     for _ in range(10):
         step_and_capture()
+
+    # ─── Diagnostic frame dump (always, not gated) ─────────────────────
+    # Saves exactly 1 RGB + 1 heightmap PNG after the first placement
+    # to the output directory for quick visual verification.
+    _diag_dir = os.path.dirname(args.output_path) or "."
+    os.makedirs(_diag_dir, exist_ok=True)
+    _diag_saved = False  # only dump once
 
     # ─── State machine ────────────────────────────────────────────────
     total_frames = int(args.duration_s * args.fps)
@@ -1302,6 +1353,31 @@ def main():
                         print(f"  [DEBUG] Saved debug frame to {_dump_path}")
                     except Exception as _e:
                         print(f"  [DEBUG] Frame dump failed: {_e}")
+
+                # ── Auto-diagnostic: save 1 RGB + 1 heightmap PNG (once) ──
+                if not _diag_saved and placement_idx >= 1 and state_timer < frame_dt * 1.5:
+                    _diag_saved = True
+                    # RGB diagnostic
+                    try:
+                        _rgb_diag = env.render()
+                        if _rgb_diag is not None:
+                            _rgb_path = os.path.join(_diag_dir, "diag_rgb.png")
+                            _rgb_bgr = cv2.cvtColor(_rgb_diag, cv2.COLOR_RGB2BGR)
+                            cv2.imwrite(_rgb_path, _rgb_bgr)
+                            print(f"  [DIAG] Saved diagnostic RGB to {_rgb_path}")
+                    except Exception as _e:
+                        print(f"  [DIAG] RGB dump failed: {_e}")
+                    # Heightmap diagnostic
+                    if needs_depth:
+                        try:
+                            _hmap_bgr = _capture_heightmap_bgr()
+                            if _hmap_bgr is not None:
+                                _hmap_path = os.path.join(_diag_dir, "diag_heightmap.png")
+                                cv2.imwrite(_hmap_path, _hmap_bgr)
+                                print(f"  [DIAG] Saved diagnostic heightmap to {_hmap_path}")
+                        except Exception as _e:
+                            print(f"  [DIAG] Heightmap dump failed: {_e}")
+
                 if state_timer >= 0.15:  # ~4-5 frames at 30fps
                     state = "SPAWN"
                     state_timer = 0.0
