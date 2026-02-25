@@ -769,30 +769,51 @@ def main():
     print(f"[INFO] Planned {len(placements)} placements")
 
     # ─── Helpers: pose & velocity ───────────────────────────────────
+    # Cached env_ids tensor for single-env mockup (env 0 only)
+    _env_ids_0 = torch.tensor([0], dtype=torch.long, device=device)
+
     def set_box_pose(idx: int, pos_xyz, yaw_rad: float):
-        """Write pose for box `idx` in env 0, then flush to sim."""
-        pos_t = torch.tensor(pos_xyz, dtype=torch.float32, device=device)
+        """Write full state for box `idx` in env 0 directly to PhysX.
+
+        Uses write_object_state_to_sim() which is the only API that
+        reliably pushes transforms into the simulation.  write_data_to_sim()
+        only flushes external wrenches and does NOT update poses.
+        """
+        px, py, pz = float(pos_xyz[0]), float(pos_xyz[1]), float(pos_xyz[2])
         cy = math.cos(0.5 * yaw_rad)
         sy = math.sin(0.5 * yaw_rad)
-        quat_t = torch.tensor([cy, 0.0, 0.0, sy], dtype=torch.float32, device=device)
 
-        # Update internal data buffers
-        boxes.data.object_pos_w[0, idx] = pos_t
-        boxes.data.object_quat_w[0, idx] = quat_t
-        boxes.data.object_lin_vel_w[0, idx] = 0.0
-        boxes.data.object_ang_vel_w[0, idx] = 0.0
+        # State: [pos(3), quat_wxyz(4), lin_vel(3), ang_vel(3)] = 13
+        state = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
+        state[0, 0, 0] = px
+        state[0, 0, 1] = py
+        state[0, 0, 2] = pz
+        state[0, 0, 3] = cy   # qw
+        state[0, 0, 4] = 0.0  # qx
+        state[0, 0, 5] = 0.0  # qy
+        state[0, 0, 6] = sy   # qz
+        # lin_vel and ang_vel are already zero
 
-        # FIX: push ALL data buffers to PhysX in one call.
-        # Previous code used write_object_pose_to_sim(cat([pos, quat]))
-        # with flat-reshaped tensors — wrong API shape, poses never reached sim.
-        boxes.write_data_to_sim()
+        object_ids = torch.tensor([idx], dtype=torch.long, device=device)
+        boxes.write_object_state_to_sim(state, _env_ids_0, object_ids)
 
     def zero_box_vel(idx: int):
-        """Zero velocities for box `idx`, then flush to sim."""
-        boxes.data.object_lin_vel_w[0, idx] = 0.0
-        boxes.data.object_ang_vel_w[0, idx] = 0.0
-        # FIX: use write_data_to_sim() instead of write_object_velocity_to_sim()
-        boxes.write_data_to_sim()
+        """Zero velocities for box `idx` by re-writing its full state.
+
+        Reads back the current pose from boxes.data.* (which the sim
+        updated on the last scene.update()) and writes the same pose
+        with zero velocities.
+        """
+        cur_pos = boxes.data.object_pos_w[0, idx]    # (3,)
+        cur_quat = boxes.data.object_quat_w[0, idx]  # (4,) wxyz
+
+        state = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
+        state[0, 0, :3] = cur_pos
+        state[0, 0, 3:7] = cur_quat
+        # vel fields are already zero
+
+        object_ids = torch.tensor([idx], dtype=torch.long, device=device)
+        boxes.write_object_state_to_sim(state, _env_ids_0, object_ids)
 
     def get_box_pos(idx: int) -> np.ndarray:
         """Read current position of box `idx`."""
