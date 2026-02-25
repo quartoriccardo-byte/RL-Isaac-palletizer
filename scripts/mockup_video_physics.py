@@ -149,10 +149,14 @@ def parse_args():
                              "(inferno, jet, turbo, viridis, magma, etc.)")
     parser.add_argument("--hmap_invert", action="store_true", default=False,
                         help="Invert colormap so high=dark")
-    parser.add_argument("--disable_depth_noise", action="store_true",
-                        default=True,
-                        help="Disable depth sensor noise for recording "
-                             "(default: True when recording heightmap)")
+    # FIX: use --enable_depth_noise (opt-in) instead of --disable_depth_noise
+    # (store_true + default=True was impossible to toggle off)
+    parser.add_argument("--enable_depth_noise", action="store_true",
+                        default=False,
+                        help="Enable depth sensor noise during heightmap "
+                             "recording. By default noise is OFF for clean "
+                             "video output. Pass this flag to simulate "
+                             "realistic sensor noise.")
 
     # ── raw depth dump (works with --record_mode heightmap) ────────────
     parser.add_argument("--save_depth_raw", action="store_true",
@@ -573,7 +577,7 @@ def main():
         _v = args.hmap_vmax if args.hmap_vmax > 0 else "auto"
         print(f"  Hmap range:   [{args.hmap_vmin}, {_v}] m")
         print(f"  Hmap cmap:    {args.hmap_colormap}")
-        print(f"  Noise off:    {args.disable_depth_noise}")
+        print(f"  Noise off:    {not args.enable_depth_noise}")
     print(f"{'='*60}\n")
 
     # ─── Environment config ───────────────────────────────────────────
@@ -655,8 +659,9 @@ def main():
             )
         print(f"[INFO] Depth camera type: {type(depth_cam).__name__}")
 
-        # ─── DepthHeightmapConverter (recording-only, noise off) ──────
-        _noise_off = args.disable_depth_noise
+        # ─── DepthHeightmapConverter (recording-only, noise off by default) ─
+        # Noise is disabled unless user explicitly passes --enable_depth_noise
+        _noise_on = args.enable_depth_noise
         depth_hmap_cfg = DepthHeightmapCfg(
             cam_height=cfg.depth_cam_resolution[0],
             cam_width=cfg.depth_cam_resolution[1],
@@ -666,14 +671,14 @@ def main():
             map_w=cfg.map_shape[1],
             crop_x=cfg.depth_crop_x,
             crop_y=cfg.depth_crop_y,
-            noise_enable=not _noise_off,
+            noise_enable=_noise_on,
             noise_sigma_m=cfg.depth_noise_sigma_m,
             noise_scale=cfg.depth_noise_scale,
             noise_quantization_m=cfg.depth_noise_quantization_m,
             noise_dropout_prob=cfg.depth_noise_dropout_prob,
         )
         hmap_converter = DepthHeightmapConverter(depth_hmap_cfg, device=device)
-        print(f"[INFO] Heightmap converter created (noise_enable={not _noise_off})")
+        print(f"[INFO] Heightmap converter created (noise_enable={_noise_on})")
     boxes = env.scene["boxes"]
 
     # ─── GPU alignment check ───────────────────────────────────────────
@@ -904,7 +909,18 @@ def main():
                 composite = np.concatenate([rgb_bgr, hmap_bgr], axis=1)
                 frames.append(composite)
             elif rgb_frame is not None:
-                frames.append(cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR))
+                # FIX: heightmap capture failed — use a black placeholder
+                # of the expected heightmap size so every frame has
+                # identical dimensions (prevents VideoWriter crash).
+                rgb_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+                rgb_h, rgb_w = rgb_bgr.shape[:2]
+                # Compute expected heightmap width after scaling to RGB height
+                raw_hm_h, raw_hm_w = cfg.map_shape  # (H, W)
+                scale = rgb_h / raw_hm_h
+                placeholder_w = int(raw_hm_w * scale)
+                placeholder = np.zeros((rgb_h, placeholder_w, 3), dtype=np.uint8)
+                composite = np.concatenate([rgb_bgr, placeholder], axis=1)
+                frames.append(composite)
     # ─── Park all boxes out of view at start ──────────────────────────
     park_pos = [0.0, 0.0, -5.0]
     for i in range(cfg.max_boxes):
