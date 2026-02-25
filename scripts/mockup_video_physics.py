@@ -196,9 +196,11 @@ def inject_kit_args(args, unknown):
     if not args.enable_cameras:
         args.enable_cameras = True
 
-    gpu_idx = "0"
-    if hasattr(args, "device") and ":" in args.device:
-        gpu_idx = args.device.split(":")[-1]
+    # ── RTX 6000 is at Vulkan index 2 on this machine ──────────────
+    # CUDA index (from PyTorch) ≠ Vulkan index (used by Kit renderer
+    # and PhysX).  We hardcode the Vulkan index here; the CUDA device
+    # for PyTorch tensors is handled separately by pick_supported_cuda_device().
+    gpu_idx = "2"
 
     user_kit_args = [a for a in unknown if a.startswith("--/")]
     user_kit_paths = {a.split("=")[0] for a in user_kit_args}
@@ -233,10 +235,13 @@ def inject_kit_args(args, unknown):
 args, unknown = parse_args()
 
 # ─── Force supported GPU (RTX 6000 vs 1080 Ti) ─────────────────────────
-# MUST happen before AppLauncher (which initializes PhysX/Rendering)
-_, forced_device = pick_supported_cuda_device()
+# pick_supported_cuda_device() selects the correct *CUDA* device for
+# PyTorch tensors.  We intentionally do NOT propagate its CUDA index
+# into Kit settings — Kit uses *Vulkan* indices (handled in inject_kit_args).
+cuda_idx, forced_device = pick_supported_cuda_device()
 args.device = forced_device
-print(f"[INFO] Overriding CLI device with forced supported GPU: {args.device}")
+print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {cuda_idx})")
+print(f"[INFO] Kit Vulkan GPU index: 2  (hardcoded for RTX 6000)")
 
 inject_kit_args(args, unknown)
 
@@ -249,6 +254,20 @@ from isaaclab.app import AppLauncher
 
 app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
+
+# ── Force Kit settings AFTER AppLauncher, BEFORE env creation ──────────
+# AppLauncher may overwrite /physics/cudaDevice during init.  We set them
+# again here so both renderer and PhysX target the RTX 6000 at Vulkan idx 2.
+try:
+    import carb.settings
+    _s = carb.settings.get_settings()
+    _s.set("/renderer/activeGpu", 2)
+    _s.set("/physics/cudaDevice", 2)
+    _s.set("/renderer/multiGpu/enabled", False)
+    print("[INFO] Post-launch Kit settings forced: "
+          "activeGpu=2, cudaDevice=2, multiGpu=false")
+except Exception as _e:
+    print(f"[WARN] Could not force post-launch Kit settings: {_e}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -322,6 +341,42 @@ def heightmap_to_bgr(
 # ═══════════════════════════════════════════════════════════════════════
 # USD helpers
 # ═══════════════════════════════════════════════════════════════════════
+
+def debug_box_sync_prims(stage, prim_path: str):
+    """Inspect and fix visibility/purpose on a box prim and its children.
+
+    Guarded by --debug_box_sync at call sites.  If an Imageable prim
+    has purpose != 'default' or visibility == 'invisible', it is force-
+    fixed so the box is guaranteed to render.
+    """
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim.IsValid():
+        print(f"  [BOX_SYNC_DBG] prim {prim_path} is INVALID")
+        return
+
+    for child_prim in [prim] + list(prim.GetAllChildren()):
+        p = child_prim.GetPath().pathString
+        img = UsdGeom.Imageable(child_prim)
+        if not img:
+            continue
+        purpose_attr = img.GetPurposeAttr()
+        purpose = purpose_attr.Get() if purpose_attr else None
+        vis_attr = img.GetVisibilityAttr()
+        vis = vis_attr.Get() if vis_attr else None
+        print(f"  [BOX_SYNC_DBG]   {p}  purpose={purpose}  visibility={vis}")
+
+        needs_fix = False
+        if purpose is not None and purpose != UsdGeom.Tokens.default_:
+            print(f"  [BOX_SYNC_DBG]     → fixing purpose to 'default'")
+            purpose_attr.Set(UsdGeom.Tokens.default_)
+            needs_fix = True
+        if vis is not None and vis == UsdGeom.Tokens.invisible:
+            print(f"  [BOX_SYNC_DBG]     → calling MakeVisible()")
+            img.MakeVisible()
+            needs_fix = True
+        if needs_fix:
+            print(f"  [BOX_SYNC_DBG]     FIXED: {p}")
+
 
 def set_kinematic(stage, prim_path: str, kinematic: bool):
     """Toggle kinematic_enabled on a rigid body via UsdPhysics.RigidBodyAPI.
@@ -1115,6 +1170,7 @@ def main():
                               f"target_z={target_z:.4f}  "
                               f"readback=({rb[0]:.3f},{rb[1]:.3f},{rb[2]:.3f})  "
                               f"({tag})")
+                        debug_box_sync_prims(stage, box_prim_path(_placed_idx))
 
                     if args.debug:
                         # Print visibility of first placed box
@@ -1204,6 +1260,7 @@ def main():
                                   f"target_z={target_z:.4f}  "
                                   f"readback=({rb[0]:.3f},{rb[1]:.3f},{rb[2]:.3f})  "
                                   f"({tag})")
+                            debug_box_sync_prims(stage, box_prim_path(_placed_idx))
                     else:
                         # ── Single-box retry (never full-reset) ──
                         retry_count += 1
