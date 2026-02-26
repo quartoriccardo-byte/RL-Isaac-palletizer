@@ -693,7 +693,10 @@ def main():
     cfg.sim.physx.gpu_total_aggregate_pairs_capacity = args.gpu_total_aggregate_pairs_capacity
     cfg.sim.physx.gpu_heap_capacity = args.gpu_heap_capacity
     cfg.sim.physx.gpu_temp_buffer_capacity = args.gpu_temp_buffer_capacity
-    cfg.max_boxes = max(args.num_boxes + 10, 50)  # extra for retries
+    # FIX(A): Spawn exactly num_boxes prims — excess prims cause PhysX GPU
+    # narrowphase overflow (error 700) because uninitialized rigid bodies
+    # participate in broadphase with sentinel positions.
+    cfg.max_boxes = args.num_boxes
     cfg.decimation = 1
 
     # Enable visual features
@@ -722,9 +725,50 @@ def main():
     print("[INFO] Calling env.reset() to initialise PhysX views ...")
     env.reset()
 
+    boxes = env.scene["boxes"]
+    _warmup_dt = env.sim.get_physics_dt()
+
+    # FIX(B): Park ALL boxes to a safe position BEFORE any sim step.
+    # Default init_state is pos=(0,0,1.5) — all N boxes overlap on the pallet
+    # surface and generate massive contact pairs, overflowing PhysX GPU
+    # narrowphase buffers (error 700).  We must move them underground and
+    # make them kinematic BEFORE the first physics step.
+    _park_pos_safe = [0.0, 0.0, -5.0]
+    _env_ids_pre = torch.tensor([0], dtype=torch.long, device=device)
+    print(f"[INFO] Parking {cfg.max_boxes} boxes to z=-5 BEFORE warmup ...")
+    for _pi in range(cfg.max_boxes):
+        _bp = f"/World/envs/env_0/Boxes/box_{_pi}"
+        # Build state tensor: [pos(3), quat_wxyz(4), lin_vel(3), ang_vel(3)]
+        _st = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
+        _st[0, 0, 0] = _park_pos_safe[0]
+        _st[0, 0, 1] = _park_pos_safe[1]
+        _st[0, 0, 2] = _park_pos_safe[2]
+        _st[0, 0, 3] = 1.0   # qw (identity)
+        _obj_ids = torch.tensor([_pi], dtype=torch.long, device=device)
+        boxes.write_object_state_to_sim(_st, _env_ids_pre, _obj_ids)
+
+    # FIX(E): Flush parking writes into PhysX with one sim step
+    env.sim.step()
+    env.scene.update(dt=_warmup_dt)
+    simulation_app.update()
+
+    # FIX(C): Position sanity check — assert no sentinel/NaN positions
+    _all_pos = boxes.data.object_pos_w[0, :cfg.max_boxes].cpu()  # (N, 3)
+    _pos_finite = torch.isfinite(_all_pos).all()
+    _pos_absmax = _all_pos.abs().max().item()
+    print(f"[INFO] Post-park position check: finite={_pos_finite.item()}, "
+          f"absmax={_pos_absmax:.2f}, "
+          f"z_min={_all_pos[:, 2].min():.2f}, z_max={_all_pos[:, 2].max():.2f}")
+    if not _pos_finite or _pos_absmax > 1000.0:
+        raise RuntimeError(
+            f"Box positions invalid after parking! "
+            f"finite={_pos_finite.item()}, absmax={_pos_absmax:.2f}.  "
+            f"Sample z values: {_all_pos[:min(5, cfg.max_boxes), 2].tolist()}"
+        )
+
     # Warmup: step + update a few times so that PhysX GPU broadphase,
     # render products, and depth-camera buffers are all fully active.
-    _warmup_dt = env.sim.get_physics_dt()
+    # Boxes are already parked at z=-5 (kinematic), so no contact explosion.
     for _wi in range(5):
         env.sim.step()
         env.scene.update(dt=_warmup_dt)
@@ -803,7 +847,7 @@ def main():
         except Exception as _e:
             print(f"[WARN] Could not set depth camera look-at: {_e}")
 
-    boxes = env.scene["boxes"]
+    # boxes already assigned above (before parking)
 
     # ─── GPU alignment check ───────────────────────────────────────────
     try:
@@ -1127,13 +1171,20 @@ def main():
                 placeholder = np.zeros((rgb_h, placeholder_w, 3), dtype=np.uint8)
                 composite = np.concatenate([rgb_bgr, placeholder], axis=1)
                 frames.append(composite)
-    # ─── Park all boxes out of view at start ──────────────────────────
-    park_pos = [0.0, 0.0, -5.0]
+    # ─── Park all boxes + set kinematic (USD-level) ────────────────────
+    # NOTE(B): Pose parking was already done BEFORE warmup (via tensor API).
+    # Here we additionally set kinematic + disable gravity via USD APIs,
+    # which must happen after `stage` is available.
     for i in range(cfg.max_boxes):
-        set_box_pose(i, park_pos, 0.0)
         bp = box_prim_path(i)
         set_kinematic(stage, bp, True)
         set_disable_gravity(stage, bp, True)
+
+    # FIX(G): Diagnostic — verify positions after full parking
+    if args.debug or args.debug_box_sync:
+        _post_park_pos = boxes.data.object_pos_w[0, :cfg.max_boxes, 2].cpu()
+        print(f"  [PARK DBG] all_z after parking: "
+              f"min={_post_park_pos.min():.2f} max={_post_park_pos.max():.2f}")
 
     # Let the scene settle for a few frames
     for _ in range(10):
@@ -1504,7 +1555,8 @@ def main():
                             placement_idx += 1
                             retry_count = 0
 
-                        current_box_idx += 1
+                        # FIX(F): Wrap index to recycle prims (max_boxes = num_boxes)
+                        current_box_idx = (current_box_idx + 1) % cfg.max_boxes
                         state = "SPAWN"
                         state_timer = 0.0
 
