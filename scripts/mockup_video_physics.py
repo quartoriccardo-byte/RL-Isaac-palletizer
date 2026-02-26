@@ -450,6 +450,40 @@ def set_physics_material(stage, prim_path: str, *,
     attr.Set(restitution_combine_mode)
 
 
+def get_render_mesh_prim(stage, box_root_prim):
+    """Return the first renderable UsdGeom.Gprim under a box root Xform.
+
+    Isaac Lab spawns shape assets with a hierarchy:
+      {prim_path}                  — Xform root (rigid body APIs)
+      {prim_path}/geometry/mesh    — actual UsdGeom Gprim (renderable)
+
+    Material bindings and displayColor/displayOpacity must be applied to
+    the Gprim, NOT the Xform root, otherwise boxes are invisible in the
+    rendered output.
+
+    Strategy:
+      1. Try the well-known child path: {root}/geometry/mesh
+      2. Fallback: DFS over all descendants, return first valid Gprim.
+      3. Return None if nothing found.
+    """
+    root_path = box_root_prim.GetPath().pathString
+
+    # 1) Try well-known Isaac Lab hierarchy
+    mesh_path = f"{root_path}/geometry/mesh"
+    mesh_prim = stage.GetPrimAtPath(mesh_path)
+    if mesh_prim and mesh_prim.IsValid():
+        gprim = UsdGeom.Gprim(mesh_prim)
+        if gprim:
+            return mesh_prim
+
+    # 2) DFS fallback: first valid Gprim descendant
+    for desc in box_root_prim.GetAllDescendants():
+        if desc.IsValid() and UsdGeom.Gprim(desc):
+            return desc
+
+    return None
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # AABB overlap check
 # ═══════════════════════════════════════════════════════════════════════
@@ -822,20 +856,28 @@ def main():
         _rb_api = PhysxSchema.PhysxRigidBodyAPI.Apply(box_prim)
         _rb_api.CreateEnableCCDAttr().Set(False)
         # ── Patch E: bind bright debug material for visibility ──
-        UsdShade.MaterialBindingAPI.Apply(box_prim).Bind(_debug_mat)
-        # ── Patch V: displayColor/Opacity fallback (Storm ignores unresolved materials) ──
-        _gprim = UsdGeom.Gprim(box_prim)
-        if _gprim:
-            _gprim.CreateDisplayColorAttr().Set(
-                [Gf.Vec3f(0.85, 0.25, 0.20)]   # bright red
-            )
-            _gprim.CreateDisplayOpacityAttr().Set([1.0])
+        # Visual properties MUST target the renderable Gprim mesh,
+        # NOT the Xform root — otherwise boxes are invisible.
+        _mesh_prim = get_render_mesh_prim(stage, box_prim)
+        if _mesh_prim is not None:
+            UsdShade.MaterialBindingAPI.Apply(_mesh_prim).Bind(_debug_mat)
+            # ── Patch V: displayColor/Opacity fallback (Storm ignores unresolved materials) ──
+            _gprim = UsdGeom.Gprim(_mesh_prim)
+            if _gprim:
+                _gprim.CreateDisplayColorAttr().Set(
+                    [Gf.Vec3f(0.85, 0.25, 0.20)]   # bright red
+                )
+                _gprim.CreateDisplayOpacityAttr().Set([1.0])
+        else:
+            # Fallback: apply to root (should not happen with Isaac Lab assets)
+            UsdShade.MaterialBindingAPI.Apply(box_prim).Bind(_debug_mat)
+            print(f"[WARN] No Gprim mesh found under {bp}, binding material to Xform root")
 
     print("[INFO] CCD disabled for all box prims (stability mode)")
-    print(f"[INFO] Applied debug material + displayColor to {cfg.max_boxes} boxes")
+    print(f"[INFO] Applied debug material + displayColor to {cfg.max_boxes} box meshes")
 
     # ─── Debug diagnostics ─────────────────────────────────────────────
-    if args.debug:
+    if args.debug or args.debug_box_sync:
         print(f"\n[DEBUG] === Prim Diagnostics ===")
         _max_debug = min(5, cfg.max_boxes)
         for _di in range(_max_debug):
@@ -847,6 +889,14 @@ def main():
                 _img = UsdGeom.Imageable(_dprim)
                 _vis = _img.GetVisibilityAttr().Get() if _img else "N/A"
                 print(f"           visibility = {_vis}")
+                # Show resolved mesh prim path for render debugging
+                _mesh = get_render_mesh_prim(stage, _dprim)
+                if _mesh is not None:
+                    _mesh_path = _mesh.GetPath().pathString
+                    _is_gprim = bool(UsdGeom.Gprim(_mesh))
+                    print(f"           render_mesh = {_mesh_path}  Gprim={_is_gprim}")
+                else:
+                    print(f"           render_mesh = NONE (⚠ box will be invisible!)")
         print(f"[DEBUG] === End Prim Diagnostics ===\n")
 
     # ─── Plan placements ──────────────────────────────────────────────
