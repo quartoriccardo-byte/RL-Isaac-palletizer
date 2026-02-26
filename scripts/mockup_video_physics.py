@@ -729,21 +729,35 @@ def main():
     boxes = env.scene["boxes"]
     _warmup_dt = env.sim.get_physics_dt()
 
-    # FIX(B): Park ALL boxes to a safe position BEFORE any sim step.
-    # Default init_state is pos=(0,0,1.5) — all N boxes overlap on the pallet
-    # surface and generate massive contact pairs, overflowing PhysX GPU
-    # narrowphase buffers (error 700).  We must move them underground and
-    # make them kinematic BEFORE the first physics step.
-    _park_pos_safe = [0.0, 0.0, -5.0]
+    # FIX(B): Park ALL boxes to safe, SEPARATED positions BEFORE any sim step.
+    # Default init_state is pos=(0,0,1.5) — all 50 boxes overlap on the pallet,
+    # causing PhysX GPU narrowphase overflow (error 700).
+    # CRITICAL: Each box must have a UNIQUE (x,y) to avoid interpenetration.
+    #   Active boxes   [0..K):  near origin, spread on a 1m grid at z=-5
+    #   Inactive boxes [K..M):  far away (base 100,100), 2m grid at z=-5
+    K = cfg.num_boxes   # active
+    M = cfg.max_boxes   # total prims (always 50)
     _env_ids_pre = torch.tensor([0], dtype=torch.long, device=device)
-    print(f"[INFO] Parking {cfg.max_boxes} boxes to z=-5 BEFORE warmup ...")
-    for _pi in range(cfg.max_boxes):
-        _bp = f"/World/envs/env_0/Boxes/box_{_pi}"
-        # Build state tensor: [pos(3), quat_wxyz(4), lin_vel(3), ang_vel(3)]
+    print(f"[INFO] Parking {M} boxes (K={K} active, {M-K} inactive) BEFORE warmup ...")
+
+    for _pi in range(M):
+        if _pi < K:
+            # Active boxes: park near origin on a small grid
+            _cols = max(5, int(K**0.5) + 1)
+            _px = -3.0 + (_pi % _cols) * 1.0
+            _py = -3.0 + (_pi // _cols) * 1.0
+        else:
+            # Inactive boxes: far-away grid to avoid any scene interaction
+            _j = _pi - K
+            _cols_inact = 10
+            _px = 100.0 + (_j % _cols_inact) * 2.0
+            _py = 100.0 + (_j // _cols_inact) * 2.0
+        _pz = -5.0
+
         _st = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
-        _st[0, 0, 0] = _park_pos_safe[0]
-        _st[0, 0, 1] = _park_pos_safe[1]
-        _st[0, 0, 2] = _park_pos_safe[2]
+        _st[0, 0, 0] = _px
+        _st[0, 0, 1] = _py
+        _st[0, 0, 2] = _pz
         _st[0, 0, 3] = 1.0   # qw (identity)
         _obj_ids = torch.tensor([_pi], dtype=torch.long, device=device)
         boxes.write_object_state_to_sim(_st, _env_ids_pre, _obj_ids)
@@ -753,18 +767,31 @@ def main():
     env.scene.update(dt=_warmup_dt)
     simulation_app.update()
 
-    # FIX(C): Position sanity check — assert no sentinel/NaN positions
-    _all_pos = boxes.data.object_pos_w[0, :cfg.max_boxes].cpu()  # (N, 3)
+    # FIX(C): Position sanity check — readback and verify
+    _all_pos = boxes.data.object_pos_w[0, :M].cpu()  # (M, 3)
     _pos_finite = torch.isfinite(_all_pos).all()
     _pos_absmax = _all_pos.abs().max().item()
-    print(f"[INFO] Post-park position check: finite={_pos_finite.item()}, "
-          f"absmax={_pos_absmax:.2f}, "
-          f"z_min={_all_pos[:, 2].min():.2f}, z_max={_all_pos[:, 2].max():.2f}")
-    if not _pos_finite or _pos_absmax > 1000.0:
+
+    # Active subset diagnostics
+    _act = _all_pos[:K]
+    print(f"[INFO] Post-park ACTIVE [0..{K}):  "
+          f"x=[{_act[:, 0].min():.1f}, {_act[:, 0].max():.1f}]  "
+          f"y=[{_act[:, 1].min():.1f}, {_act[:, 1].max():.1f}]  "
+          f"z=[{_act[:, 2].min():.1f}, {_act[:, 2].max():.1f}]")
+
+    # Inactive subset diagnostics
+    if K < M:
+        _inact = _all_pos[K:]
+        print(f"[INFO] Post-park INACTIVE [{K}..{M}):  "
+              f"x=[{_inact[:, 0].min():.1f}, {_inact[:, 0].max():.1f}]  "
+              f"y=[{_inact[:, 1].min():.1f}, {_inact[:, 1].max():.1f}]  "
+              f"z=[{_inact[:, 2].min():.1f}, {_inact[:, 2].max():.1f}]")
+
+    print(f"[INFO] Post-park ALL: finite={_pos_finite.item()}, absmax={_pos_absmax:.2f}")
+    if not _pos_finite:
         raise RuntimeError(
-            f"Box positions invalid after parking! "
-            f"finite={_pos_finite.item()}, absmax={_pos_absmax:.2f}.  "
-            f"Sample z values: {_all_pos[:min(5, cfg.max_boxes), 2].tolist()}"
+            f"Box positions contain NaN/Inf after parking! "
+            f"Sample: {_all_pos[:min(5, M)].tolist()}"
         )
 
     # Warmup: step + update a few times so that PhysX GPU broadphase,
