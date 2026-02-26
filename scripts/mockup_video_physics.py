@@ -693,10 +693,11 @@ def main():
     cfg.sim.physx.gpu_total_aggregate_pairs_capacity = args.gpu_total_aggregate_pairs_capacity
     cfg.sim.physx.gpu_heap_capacity = args.gpu_heap_capacity
     cfg.sim.physx.gpu_temp_buffer_capacity = args.gpu_temp_buffer_capacity
-    # FIX(A): Spawn exactly num_boxes prims — excess prims cause PhysX GPU
-    # narrowphase overflow (error 700) because uninitialized rigid bodies
-    # participate in broadphase with sentinel positions.
-    cfg.max_boxes = args.num_boxes
+    # NOTE: cfg.max_boxes stays at default (50) — PalletSceneCfg always
+    # spawns that many prims and PhysX views have fixed tensor sizes.
+    # num_boxes controls how many boxes are "active" for placement.
+    cfg.num_boxes = args.num_boxes
+    print(f"[INFO] max_boxes={cfg.max_boxes} (fixed), num_boxes={cfg.num_boxes} (active)")
     cfg.decimation = 1
 
     # Enable visual features
@@ -1330,7 +1331,7 @@ def main():
 
     while frame_count < total_frames:
         # ── Only process if we have placements left ──
-        if placement_idx < len(placements) and current_box_idx < cfg.max_boxes:
+        if placement_idx < len(placements) and current_box_idx < cfg.num_boxes:
             pl = placements[placement_idx]
             dims = pl["dims"]
             target = pl["target_xyz"]
@@ -1555,8 +1556,8 @@ def main():
                             placement_idx += 1
                             retry_count = 0
 
-                        # FIX(F): Wrap index to recycle prims (max_boxes = num_boxes)
-                        current_box_idx = (current_box_idx + 1) % cfg.max_boxes
+                        # FIX(F): Wrap index to recycle prims within active range
+                        current_box_idx = (current_box_idx + 1) % cfg.num_boxes
                         state = "SPAWN"
                         state_timer = 0.0
 

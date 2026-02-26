@@ -278,6 +278,11 @@ class PalletTaskCfg(DirectRLEnvCfg):
     
     # Box configuration
     max_boxes: int = 50
+    # Number of *active* boxes for placement (must be <= max_boxes).
+    # Tensor sizes and observation dims are always based on max_boxes for
+    # stability.  Boxes [num_boxes..max_boxes) are parked/deactivated.
+    # Defaults to max_boxes so training code is unaffected.
+    num_boxes: int = 50
     
     # Buffer configuration
     buffer_slots: int = 10
@@ -1400,19 +1405,31 @@ class PalletTask(DirectRLEnv):
         device = torch.device(self._device)
         
         # 1. Get box poses from scene (GPU tensors)
+        M = self.cfg.max_boxes   # always 50, fixed tensor size
+        K = self.cfg.num_boxes   # active boxes (<= M)
         if "boxes" in self.scene.keys():
             boxes_data = self.scene["boxes"].data
             all_pos = boxes_data.object_pos_w.reshape(-1, 3)   # (num_envs*num_boxes, 3)
             all_rot_wxyz = boxes_data.object_quat_w.reshape(-1, 4)  # (num_envs*num_boxes, 4) (w,x,y,z)
             
-            box_pos = all_pos.view(n, self.cfg.max_boxes, 3)
+            box_pos = all_pos.view(n, M, 3)
             # Convert Isaac (w,x,y,z) → Warp (x,y,z,w) before rasterization
-            box_rot = wxyz_to_xyzw(all_rot_wxyz).view(n, self.cfg.max_boxes, 4)
+            box_rot = wxyz_to_xyzw(all_rot_wxyz).view(n, M, 4)
         else:
             # Fallback for testing
-            box_pos = torch.zeros(n, self.cfg.max_boxes, 3, device=device)
-            box_rot = torch.zeros(n, self.cfg.max_boxes, 4, device=device)
+            box_pos = torch.zeros(n, M, 3, device=device)
+            box_rot = torch.zeros(n, M, 4, device=device)
             box_rot[:, :, 0] = 1.0  # Identity quat w=1
+        
+        # Debug: log tensor dimensions (once every 200 obs steps)
+        if not hasattr(self, '_obs_dbg_count'):
+            self._obs_dbg_count = 0
+        self._obs_dbg_count += 1
+        if self._obs_dbg_count <= 1 or self._obs_dbg_count % 200 == 0:
+            _active_k = min(K, self.box_idx.max().item() + 1) if K < M else M
+            print(f"  [OBS DBG] M={M} K={K} all_pos.numel={all_pos.numel()} "
+                  f"box_pos.shape={list(box_pos.shape)} "
+                  f"active_placed~{_active_k} step={self._obs_dbg_count}")
         
         # Pallet positions (centered at origin per env)
         pallet_pos = torch.zeros(n, 3, device=device)
