@@ -499,9 +499,10 @@ class PalletTask(DirectRLEnv):
     
     def __init__(self, cfg: PalletTaskCfg, render_mode: str | None = None, **kwargs):
         # Pre-init setup
-        # tensor_device overrides sim.device for RL tensors/Warp when physics
-        # runs on CPU but observations/heightmaps need CUDA.
-        self._device = cfg.tensor_device if cfg.tensor_device else cfg.sim.device
+        # NOTE: cfg.sim.device stays on CUDA even when PhysX runs on CPU.
+        # GPU PhysX is disabled via Kit-level /physics/simulationDevice=cpu,
+        # not by changing sim.device.  This keeps all tensors on GPU.
+        self._device = cfg.sim.device
         
         # IsaacLab 4.x+ fix: Create container prims BEFORE scene construction.
         # Spawners using regex-based prim_path (e.g. {ENV_REGEX_NS}/Boxes/box)

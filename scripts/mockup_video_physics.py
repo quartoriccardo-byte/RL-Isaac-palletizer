@@ -695,26 +695,32 @@ def main():
     cfg = PalletTaskCfg()
     cfg.scene.num_envs = 1
     cfg.sim.render_interval = 1
+
+    # ─── Device configuration ─────────────────────────────────────────
+    # CRITICAL: cfg.sim.device MUST remain on CUDA so that DirectRLEnv,
+    # SimulationContext, and all tensors (including Warp heightmaps) stay
+    # on the GPU.  GPU PhysX is disabled separately via the Kit-level
+    # setting /physics/simulationDevice=cpu (injected by inject_kit_args).
+    cfg.sim.device = device   # always CUDA (e.g. "cuda:0" or "cuda:2")
     
     if args.physics_device == "cpu":
-        cfg.sim.device = "cpu"
-        cfg.tensor_device = device   # keep RL tensors / Warp on CUDA
-        # Zero GPU buffer sizes to prevent any PhysX GPU memory allocation
+        # Zero GPU buffer sizes → PhysX allocates no GPU memory.
+        # Broadphase/narrowphase run on CPU via /physics/simulationDevice=cpu.
         cfg.sim.physx.gpu_found_lost_pairs_capacity = 0
         cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 0
         cfg.sim.physx.gpu_heap_capacity = 0
         cfg.sim.physx.gpu_temp_buffer_capacity = 0
-        print(f"[INFO] Physics: CPU | Tensors/Warp: {device}")
+        print(f"[INFO] Physics: CPU (Kit simulationDevice=cpu)")
+        print(f"[INFO] Tensors/Warp/Env: {device}")
         print("[INFO] PhysX GPU buffers zeroed (no GPU dynamics)")
     else:
-        cfg.sim.device = device
         # GPU buffers do not grow dynamically and can crash under heavy contact.
         # Increasing capacities manually prevents PhysX from overflowing its buffers.
         cfg.sim.physx.gpu_found_lost_pairs_capacity = args.gpu_found_lost_pairs_capacity
         cfg.sim.physx.gpu_total_aggregate_pairs_capacity = args.gpu_total_aggregate_pairs_capacity
         cfg.sim.physx.gpu_heap_capacity = args.gpu_heap_capacity
         cfg.sim.physx.gpu_temp_buffer_capacity = args.gpu_temp_buffer_capacity
-        print(f"[INFO] Running physics on GPU ({device})")
+        print(f"[INFO] Physics: GPU ({device})")
     # NOTE: cfg.max_boxes stays at default (50) — PalletSceneCfg always
     # spawns that many prims and PhysX views have fixed tensor sizes.
     # num_boxes controls how many boxes are "active" for placement.
