@@ -175,7 +175,7 @@ def parse_args():
                         help="Exclude problematic isaaclab_tasks extension")
 
     # physics fallback & physx gpu buffer sizes
-    parser.add_argument("--physics_device", type=str, default="cuda", choices=["cuda", "cpu"],
+    parser.add_argument("--physics_device", type=str, default="cpu", choices=["cuda", "cpu"],
                         help="Device for physics simulation (cuda or cpu)")
     parser.add_argument("--physx_sync_launch", action="store_true", default=False,
                         help="Enable synchronous kernel launches for debugging")
@@ -198,21 +198,29 @@ def inject_kit_args(args, unknown):
 
     # ── GPU ordinal mapping for this machine ───────────────────────
     # /renderer/activeGpu  uses *Vulkan* ordinals → RTX 6000 = 2
-    # /physics/cudaDevice   uses *CUDA*   ordinals → RTX 6000 = 0
-    # These numbers intentionally differ; they are separate namespaces.
+    # /physics/cudaDevice   is NOT set when physics runs on CPU.
     vulkan_idx = "2"   # RTX 6000 in Vulkan device list
-    cuda_idx   = "0"   # RTX 6000 in CUDA device list
 
     user_kit_args = [a for a in unknown if a.startswith("--/")]
     user_kit_paths = {a.split("=")[0] for a in user_kit_args}
+
+    # Strip any user-supplied --/physics/cudaDevice to prevent PhysX GPU init
+    user_kit_args = [a for a in user_kit_args
+                     if not a.startswith("--/physics/cudaDevice")]
 
     defaults = {
         "--/ngx/enabled": "--/ngx/enabled=false",
         "--/rtx/post/dlss/enabled": "--/rtx/post/dlss/enabled=false",
         "--/renderer/multiGpu/enabled": "--/renderer/multiGpu/enabled=false",
         "--/renderer/activeGpu": f"--/renderer/activeGpu={vulkan_idx}",
-        "--/physics/cudaDevice": f"--/physics/cudaDevice={cuda_idx}",
     }
+
+    # Force CPU physics via Kit setting (prevents PhysX CUDA context creation)
+    if args.physics_device == "cpu":
+        defaults["--/physics/simulationDevice"] = "--/physics/simulationDevice=cpu"
+    else:
+        # GPU physics: route PhysX to RTX 6000 (CUDA idx 0)
+        defaults["--/physics/cudaDevice"] = "--/physics/cudaDevice=0"
     
     if args.physx_sync_launch:
         defaults["--/physics/enableSynchronousKernelLaunches"] = "--/physics/enableSynchronousKernelLaunches=true"
@@ -242,7 +250,10 @@ args, unknown = parse_args()
 _cuda_idx, forced_device = pick_supported_cuda_device()
 args.device = forced_device
 print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {_cuda_idx})")
-print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX CUDA device: 0")
+if args.physics_device == "cpu":
+    print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX: CPU (no CUDA context)")
+else:
+    print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX CUDA device: 0")
 
 inject_kit_args(args, unknown)
 
@@ -257,16 +268,21 @@ app_launcher = AppLauncher(args)
 simulation_app = app_launcher.app
 
 # ── Force Kit settings AFTER AppLauncher, BEFORE env creation ──────────
-# AppLauncher may overwrite /physics/cudaDevice during init.  We re-apply
-# the correct values: renderer=Vulkan idx 2, PhysX=CUDA idx 0.
+# AppLauncher may overwrite settings during init.  We re-apply the correct
+# values: renderer=Vulkan idx 2, physics=CPU (or GPU if opted in).
 try:
     import carb.settings
     _s = carb.settings.get_settings()
-    _s.set("/renderer/activeGpu", 2)       # Vulkan ordinal
-    _s.set("/physics/cudaDevice", 0)       # CUDA ordinal
+    _s.set("/renderer/activeGpu", 2)       # Vulkan ordinal (RTX 6000)
     _s.set("/renderer/multiGpu/enabled", False)
-    print("[INFO] Post-launch Kit settings forced: "
-          "activeGpu=2 (Vulkan), cudaDevice=0 (CUDA), multiGpu=false")
+    if args.physics_device == "cpu":
+        _s.set("/physics/simulationDevice", "cpu")
+        print("[INFO] Post-launch Kit settings forced: "
+              "activeGpu=2 (Vulkan), simulationDevice=cpu, multiGpu=false")
+    else:
+        _s.set("/physics/cudaDevice", 0)   # CUDA ordinal (RTX 6000)
+        print("[INFO] Post-launch Kit settings forced: "
+              "activeGpu=2 (Vulkan), cudaDevice=0 (CUDA), multiGpu=false")
 except Exception as _e:
     print(f"[WARN] Could not force post-launch Kit settings: {_e}")
 
@@ -682,17 +698,22 @@ def main():
     
     if args.physics_device == "cpu":
         cfg.sim.device = "cpu"
+        # Zero GPU buffer sizes to prevent any PhysX GPU memory allocation
+        cfg.sim.physx.gpu_found_lost_pairs_capacity = 0
+        cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 0
+        cfg.sim.physx.gpu_heap_capacity = 0
+        cfg.sim.physx.gpu_temp_buffer_capacity = 0
         print("[INFO] Running physics on CPU (--physics_device=cpu)")
+        print("[INFO] PhysX GPU buffers zeroed (no GPU dynamics)")
     else:
         cfg.sim.device = device
+        # GPU buffers do not grow dynamically and can crash under heavy contact.
+        # Increasing capacities manually prevents PhysX from overflowing its buffers.
+        cfg.sim.physx.gpu_found_lost_pairs_capacity = args.gpu_found_lost_pairs_capacity
+        cfg.sim.physx.gpu_total_aggregate_pairs_capacity = args.gpu_total_aggregate_pairs_capacity
+        cfg.sim.physx.gpu_heap_capacity = args.gpu_heap_capacity
+        cfg.sim.physx.gpu_temp_buffer_capacity = args.gpu_temp_buffer_capacity
         print(f"[INFO] Running physics on GPU ({device})")
-        
-    # GPU buffers do not grow dynamically and can crash under heavy contact.
-    # Increasing capacities manually prevents PhysX from overflowing its buffers.
-    cfg.sim.physx.gpu_found_lost_pairs_capacity = args.gpu_found_lost_pairs_capacity
-    cfg.sim.physx.gpu_total_aggregate_pairs_capacity = args.gpu_total_aggregate_pairs_capacity
-    cfg.sim.physx.gpu_heap_capacity = args.gpu_heap_capacity
-    cfg.sim.physx.gpu_temp_buffer_capacity = args.gpu_temp_buffer_capacity
     # NOTE: cfg.max_boxes stays at default (50) — PalletSceneCfg always
     # spawns that many prims and PhysX views have fixed tensor sizes.
     # num_boxes controls how many boxes are "active" for placement.
@@ -877,21 +898,26 @@ def main():
 
     # boxes already assigned above (before parking)
 
-    # ─── GPU alignment check ───────────────────────────────────────────
+    # ─── Physics / Renderer backend banner ──────────────────────────────
     try:
         import carb.settings
         _settings = carb.settings.get_settings()
         _render_gpu = _settings.get("/renderer/activeGpu")
+        _sim_device = _settings.get("/physics/simulationDevice")
         _physics_gpu = _settings.get("/physics/cudaDevice")
-        print(f"[INFO] renderer/activeGpu  = {_render_gpu}  (Vulkan ordinal)")
-        print(f"[INFO] physics/cudaDevice  = {_physics_gpu}  (CUDA ordinal)")
-        # NOTE: These use different ordinal namespaces and are expected to
-        #       differ when Vulkan and CUDA enumerate GPUs in different order.
-        if _physics_gpu != 0:
-            print("[WARN] physics/cudaDevice is not 0 — RTX 6000 should be "
-                  "CUDA device 0. PhysX may target an unsupported GPU!")
+        print("")
+        print("═" * 52)
+        if args.physics_device == "cpu" or _sim_device == "cpu":
+            print("  Physics backend : CPU")
+            print("  GPU dynamics    : OFF")
+        else:
+            print(f"  Physics backend : GPU (CUDA device {_physics_gpu})")
+            print("  GPU dynamics    : ON")
+        print(f"  Renderer        : Vulkan, activeGpu = {_render_gpu}")
+        print("═" * 52)
+        print("")
     except Exception as _e:
-        print(f"[WARN] Could not read GPU alignment settings: {_e}")
+        print(f"[WARN] Could not read GPU/physics settings: {_e}")
 
     # ─── Tune all box prims for stable, non-elastic contacts ──────────
     #     Also: disable CCD (causes GPU crash with kinematic toggling)
@@ -1253,12 +1279,16 @@ def main():
     # ─── World-frame diagnostics ──────────────────────────────────────
     print("\n[DIAG] === World-Frame Diagnostics ===")
 
-    # PhysX CUDA device actually used
+    # Physics backend actually used
     try:
         import carb.settings as _csettings
-        _csdev = _csettings.get_settings().get("/physics/cudaDevice")
-        _agpu  = _csettings.get_settings().get("/renderer/activeGpu")
-        print(f"  PhysX cudaDevice  : {_csdev}  (CUDA ordinal)")
+        _sim_dev  = _csettings.get_settings().get("/physics/simulationDevice")
+        _csdev    = _csettings.get_settings().get("/physics/cudaDevice")
+        _agpu     = _csettings.get_settings().get("/renderer/activeGpu")
+        if _sim_dev == "cpu" or args.physics_device == "cpu":
+            print(f"  Physics backend   : CPU")
+        else:
+            print(f"  PhysX cudaDevice  : {_csdev}  (CUDA ordinal)")
         print(f"  Renderer activeGpu: {_agpu}  (Vulkan ordinal)")
     except Exception as _e:
         print(f"  GPU settings      : [error: {_e}]")

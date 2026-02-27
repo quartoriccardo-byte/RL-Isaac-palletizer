@@ -99,9 +99,9 @@ def inject_kit_args(args, unknown):
         '--/rtx/translucency/enabled': '--/rtx/translucency/enabled=false',
         '--/rtx/reflections/enabled': '--/rtx/reflections/enabled=false',
         '--/rtx/indirectDiffuse/enabled': '--/rtx/indirectDiffuse/enabled=false',
-        # GPU pinning: force renderer and PhysX onto the correct GPU
+        # GPU pinning: force renderer onto the correct GPU, physics on CPU
         '--/renderer/activeGpu': f'--/renderer/activeGpu={gpu_idx}',
-        '--/physics/cudaDevice': f'--/physics/cudaDevice={gpu_idx}',
+        '--/physics/simulationDevice': '--/physics/simulationDevice=cpu',
     }
     default_kit_args = []
     for kit_path, kit_arg in defaults_map.items():
