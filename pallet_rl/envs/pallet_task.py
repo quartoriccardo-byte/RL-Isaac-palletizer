@@ -225,6 +225,17 @@ class PalletTaskCfg(DirectRLEnvCfg):
         ),
     )
     
+    # =========================================================================
+    # Tensor / Observation Device
+    # =========================================================================
+    # When physics runs on CPU (sim.device="cpu"), RL tensors, Warp heightmaps,
+    # and observation buffers still need a CUDA device.  Set this to the desired
+    # GPU string (e.g. "cuda:0").  Defaults to "cuda" → resolved at runtime by
+    # pick_supported_cuda_device().
+    # For GPU physics (sim.device="cuda:N"), leave as None and pallet_task.py
+    # will fall back to sim.device automatically.
+    tensor_device: str | None = None
+    
     # Scene configuration (IsaacLab 5.0: assets defined in PalletSceneCfg)
     scene: PalletSceneCfg = PalletSceneCfg(
         num_envs=4096,
@@ -488,7 +499,9 @@ class PalletTask(DirectRLEnv):
     
     def __init__(self, cfg: PalletTaskCfg, render_mode: str | None = None, **kwargs):
         # Pre-init setup
-        self._device = cfg.sim.device
+        # tensor_device overrides sim.device for RL tensors/Warp when physics
+        # runs on CPU but observations/heightmaps need CUDA.
+        self._device = cfg.tensor_device if cfg.tensor_device else cfg.sim.device
         
         # IsaacLab 4.x+ fix: Create container prims BEFORE scene construction.
         # Spawners using regex-based prim_path (e.g. {ENV_REGEX_NS}/Boxes/box)

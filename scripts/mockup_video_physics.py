@@ -698,12 +698,13 @@ def main():
     
     if args.physics_device == "cpu":
         cfg.sim.device = "cpu"
+        cfg.tensor_device = device   # keep RL tensors / Warp on CUDA
         # Zero GPU buffer sizes to prevent any PhysX GPU memory allocation
         cfg.sim.physx.gpu_found_lost_pairs_capacity = 0
         cfg.sim.physx.gpu_total_aggregate_pairs_capacity = 0
         cfg.sim.physx.gpu_heap_capacity = 0
         cfg.sim.physx.gpu_temp_buffer_capacity = 0
-        print("[INFO] Running physics on CPU (--physics_device=cpu)")
+        print(f"[INFO] Physics: CPU | Tensors/Warp: {device}")
         print("[INFO] PhysX GPU buffers zeroed (no GPU dynamics)")
     else:
         cfg.sim.device = device
@@ -913,6 +914,7 @@ def main():
         else:
             print(f"  Physics backend : GPU (CUDA device {_physics_gpu})")
             print("  GPU dynamics    : ON")
+        print(f"  Tensor/Obs dev  : {device}")
         print(f"  Renderer        : Vulkan, activeGpu = {_render_gpu}")
         print("═" * 52)
         print("")
