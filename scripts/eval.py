@@ -73,8 +73,11 @@ def main():
                 f"Original error: {e}"
             ) from e
 
-        # Isaac Lab imports
-        from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
+        # Isaac Lab imports (version-resilient)
+        try:
+            from isaaclab.envs.wrappers.rsl_rl import RslRlVecEnvWrapper
+        except ModuleNotFoundError:
+            from isaaclab_rl.rsl_rl import RslRlVecEnvWrapper
 
         # Project imports
         from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
@@ -109,14 +112,18 @@ def main():
                 "resume": True,
                 "load_run": -1,
                 "checkpoint": args.checkpoint,
+                "obs_groups": {"policy": ["policy"], "critic": ["critic"]},
             },
+            "obs_groups": {"policy": ["policy"], "critic": ["critic"]},
             "policy": {
+                "class_name": "ActorCritic",
                 "init_noise_std": 0.0,
                 "actor_hidden_dims": [256, 128],
                 "critic_hidden_dims": [256, 128],
                 "activation": "elu",
             },
             "algorithm": {
+                "class_name": "PPO",
                 "value_loss_coef": 1.0,
                 "use_clipped_value_loss": True,
                 "clip_param": 0.2,
@@ -132,7 +139,8 @@ def main():
             },
         }
 
-        # Inject our custom policy class
+        # Register custom policy class with RSL-RL
+        # (Standard integration pattern — RSL-RL resolves via getattr)
         import rsl_rl.modules
 
         rsl_rl.modules.ActorCritic = PalletizerActorCritic

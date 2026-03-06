@@ -537,10 +537,12 @@ def main():
         env = RslRlVecEnvWrapper(env)
         
         # ---------------------------------------------------------------------
-        # Step 6: Inject custom policy class
+        # Step 6: Register custom policy class with RSL-RL
         # ---------------------------------------------------------------------
-        # RSL-RL uses module-level lookup for policy class
-        # We monkey-patch to use our custom CNN-based policy
+        # RSL-RL resolves policy_class_name via getattr(rsl_rl.modules, name).
+        # This is the standard integration pattern used by Isaac Lab itself.
+        # By assigning our CNN-based policy to the "ActorCritic" name, the
+        # OnPolicyRunner will instantiate PalletizerActorCritic automatically.
         import rsl_rl.modules
         rsl_rl.modules.ActorCritic = PalletizerActorCritic
         
