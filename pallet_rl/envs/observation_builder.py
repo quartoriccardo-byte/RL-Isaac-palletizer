@@ -136,17 +136,26 @@ def _generate_heightmap(
     n: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Generate a heightmap using the configured backend (Warp or depth camera)."""
+    """Generate a heightmap using the configured backend.
+
+    Prefers the new ``BaseHeightmapBackend`` abstraction (``env._heightmap_backend``)
+    when available.  Falls back to inline Warp/depth selection for backward
+    compatibility if the backend hasn't been wired up yet.
+    """
+    # New abstraction path
+    if hasattr(env, "_heightmap_backend") and env._heightmap_backend is not None:
+        return env._heightmap_backend.generate(env)
+
+    # Legacy fallback (inline selection)
     cfg = env.cfg
-
     if cfg.heightmap_source == "depth_camera" and env._depth_converter is not None:
-        return _heightmap_from_depth(env, n)
+        return _heightmap_from_depth_legacy(env, n)
     else:
-        return _heightmap_from_warp(env, box_pos, box_rot, pallet_pos, n, device)
+        return _heightmap_from_warp_legacy(env, box_pos, box_rot, pallet_pos, n, device)
 
 
-def _heightmap_from_depth(env: PalletTask, n: int) -> torch.Tensor:
-    """Depth-camera pipeline: read sensor → convert → heightmap."""
+def _heightmap_from_depth_legacy(env: PalletTask, n: int) -> torch.Tensor:
+    """Depth-camera pipeline (legacy inline path)."""
     depth_cam = env.scene["depth_camera"]
     depth_data = depth_cam.data
 
@@ -166,7 +175,6 @@ def _heightmap_from_depth(env: PalletTask, n: int) -> torch.Tensor:
     heightmap = env._depth_converter.depth_to_heightmap(depth_img, cam_pos, cam_quat_wxyz)
     env._cached_depth_heightmap = heightmap
 
-    # Optional debug frame saving
     if env.cfg.depth_debug_save_frames:
         import os
         os.makedirs(env.cfg.depth_debug_save_dir, exist_ok=True)
@@ -179,7 +187,7 @@ def _heightmap_from_depth(env: PalletTask, n: int) -> torch.Tensor:
     return heightmap
 
 
-def _heightmap_from_warp(
+def _heightmap_from_warp_legacy(
     env: PalletTask,
     box_pos: torch.Tensor,
     box_rot: torch.Tensor,
@@ -187,7 +195,7 @@ def _heightmap_from_warp(
     n: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Warp analytical rasterization pipeline."""
+    """Warp analytical rasterization pipeline (legacy inline path)."""
     cfg = env.cfg
     box_indices = torch.arange(cfg.max_boxes, device=device).view(1, -1)
     active_mask = box_indices < env.box_idx.view(-1, 1)
