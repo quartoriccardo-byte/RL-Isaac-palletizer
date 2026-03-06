@@ -78,8 +78,8 @@ Action (5-dim) ──┐
 The environment relies on a strict separation between the trainer-facing API and the semantic action interpretation:
 
 1. **Trainer-Facing Interface**: A continuous `gym.spaces.Box(low=-1.0, high=1.0, shape=(5,))` exposed for RSL-RL compatibility.
-2. **Decoding Layer**: `pallet_rl.envs.action_adapter` decodes the continuous `[-1, 1]` float tensor into a `DecodedAction` named tuple.
-3. **Semantic Action Space**: Internal logic consumes the factured discrete 5-tuple:
+2. **Decoding Layer**: `pallet_rl.envs.action_adapter` decodes the continuous `[-1, 1]` float tensor into a `DecodedAction` dataclass.
+3. **Semantic Action Space**: Internal logic consumes the factored discrete 5-tuple:
 
 | Index | Name      | Values     | Semantic                |
 |-------|-----------|------------|-------------------------|
@@ -124,6 +124,6 @@ This is a conscious, contained compatibility measure. It is not an ideal long-te
 
 3. **Perception abstraction**: `BaseHeightmapBackend` ABC enables swapping heightmap sources without modifying observation construction.
 
-4. **RSL-RL policy registration**: Standard `getattr(rsl_rl.modules, name)` pattern used by Isaac Lab itself — documented as intentional, not a hack.
+4. **RSL-RL policy registration**: Centralized compatibility workaround — documented and contained, rather than a native dependency injection framework.
 
 5. **GPU-only data flow**: All tensors, heightmaps, and observations stay on CUDA. No CPU copies in the training loop.
