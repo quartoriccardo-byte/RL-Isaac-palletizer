@@ -52,6 +52,7 @@ CLI knobs:
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import sys
@@ -133,37 +134,29 @@ def parse_args():
 
     # ── recording mode ──────────────────────────────────────────────────
     parser.add_argument("--record_mode", type=str, default="rgb",
-                        choices=["rgb", "heightmap", "both"],
+                        choices=["rgb", "heightmap", "both", "diagnostic"],
                         help="What to record: 'rgb' (default, existing behaviour), "
                              "'heightmap' (agent top-down heightmap), "
-                             "'both' (side-by-side RGB + heightmap)")
+                             "'both' (side-by-side RGB + heightmap), "
+                             "'diagnostic' (composite video + optional raw dumps)")
 
-    # ── heightmap visualization ────────────────────────────────────────
-    parser.add_argument("--hmap_vmin", type=float, default=0.0,
-                        help="Heightmap visualization min clamp (meters)")
-    parser.add_argument("--hmap_vmax", type=float, default=0.0,
-                        help="Heightmap visualization max clamp (meters). "
-                             "0 = auto from PalletTaskCfg.max_height")
-    parser.add_argument("--hmap_colormap", type=str, default="inferno",
-                        help="OpenCV colormap name for heightmap "
-                             "(inferno, jet, turbo, viridis, magma, etc.)")
-    parser.add_argument("--hmap_invert", action="store_true", default=False,
-                        help="Invert colormap so high=dark")
-    # FIX: use --enable_depth_noise (opt-in) instead of --disable_depth_noise
-    # (store_true + default=True was impossible to toggle off)
-    parser.add_argument("--enable_depth_noise", action="store_true",
-                        default=False,
-                        help="Enable depth sensor noise during heightmap "
-                             "recording. By default noise is OFF for clean "
-                             "video output. Pass this flag to simulate "
-                             "realistic sensor noise.")
-
-    # ── raw depth dump (works with --record_mode heightmap) ────────────
+    # ── diagnostic and raw dumps ─────────────────────────────────────────
+    parser.add_argument("--diag_dir", type=str, default="",
+                        help="Root directory for diagnostics (default: <output_path>_diagnostics)")
+    parser.add_argument("--log_file", type=str, default="run.log",
+                        help="Log filename inside diag_dir")
+    parser.add_argument("--diag_every_n_frames", type=int, default=50,
+                        help="Interval for logging stats and saving raw/vis arrays")
+    parser.add_argument("--save_diag_frames", action="store_true",
+                        help="Save full composite frames as PNGs at diagnostic interval")
     parser.add_argument("--save_depth_raw", action="store_true",
-                        help="Save raw depth frames as .npy")
-    parser.add_argument("--depth_raw_dir", type=str, default="",
-                        help="Output folder for raw depth; if empty, "
-                             "use <output_path>_depth_raw")
+                        help="Save raw depth frames as .npy at diagnostic interval")
+    parser.add_argument("--save_heightmap_raw", action="store_true",
+                        help="Save raw heightmap frames as .npy at diagnostic interval")
+    parser.add_argument("--save_depth_vis", action="store_true",
+                        help="Save depth visualization PNGs at diagnostic interval")
+    parser.add_argument("--save_heightmap_vis", action="store_true",
+                        help="Save heightmap visualization PNGs at diagnostic interval")
 
     # ── debug: box sync verification ──────────────────────────────────
     parser.add_argument("--debug_box_sync", action="store_true", default=False,
@@ -353,6 +346,55 @@ def heightmap_to_bgr(
     if invert:
         norm = 255 - norm
     return cv2.applyColorMap(norm, colormap_id)
+
+
+def depth_to_bgr(
+    depth_m: np.ndarray,
+    vmin: float,
+    vmax: float,
+    colormap_id: int,
+    invert: bool = False,
+) -> np.ndarray:
+    """Convert a (H, W) depth map in meters to (H, W, 3) uint8 BGR.
+    Invalid depth readings (<= 0.01) are mapped to black.
+    """
+    valid_mask = depth_m > 0.01
+    d = np.clip(depth_m.astype(np.float64), vmin, vmax)
+    norm = ((d - vmin) / max(vmax - vmin, 1e-8) * 255.0).astype(np.uint8)
+    if invert:
+        norm = 255 - norm
+    
+    bgr = cv2.applyColorMap(norm, colormap_id)
+    # Mask invalid pixels as black
+    bgr[~valid_mask] = [0, 0, 0]
+    return bgr
+
+
+def setup_logging(log_path: str, debug: bool) -> logging.Logger:
+    """Setup structured file logging for diagnostics."""
+    logger = logging.getLogger("mockup_diag")
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
+    logger.propagate = False
+    
+    # Avoid duplicate handlers if called multiple times
+    if not logger.handlers:
+        os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+        
+        # File handler
+        fh = logging.FileHandler(log_path, mode='w')
+        fh.setLevel(logging.DEBUG if debug else logging.INFO)
+        fh_fmt = logging.Formatter('[%(asctime)s] %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+        fh.setFormatter(fh_fmt)
+        logger.addHandler(fh)
+        
+        # Console handler (errors/warnings only to stdout, info goes to file to avoid spam)
+        ch = logging.StreamHandler(sys.stdout)
+        ch.setLevel(logging.WARNING) 
+        ch_fmt = logging.Formatter('%(levelname)s [DIAG]: %(message)s')
+        ch.setFormatter(ch_fmt)
+        logger.addHandler(ch)
+        
+    return logger
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -941,23 +983,54 @@ def main():
     def box_prim_path(idx: int) -> str:
         return f"/World/envs/env_0/Boxes/box_{idx}"
 
+    # ─── Setup Diagnostic Logging ────────────────────────────────────
+    diag_dir = args.diag_dir if args.diag_dir else os.path.join(os.path.dirname(args.output_path) or ".", "mockup_diagnostics")
+    if args.record_mode == "diagnostic":
+        os.makedirs(diag_dir, exist_ok=True)
+        log_path = os.path.join(diag_dir, args.log_file)
+        diag_logger = setup_logging(log_path, args.debug)
+        diag_logger.info("Started mockup diagnostic recording")
+        diag_logger.info(f"Target FPS: {args.fps}, Duration: {args.duration_s}s, Mode: {placement_mode}")
+    else:
+        diag_logger = None
+
     # ─── Sim stepping + capture ───────────────────────────────────────
     sim_dt = env.sim.get_physics_dt()
     substeps = args.sim_substeps
     frame_dt = 1.0 / args.fps
 
-    frames: list[np.ndarray] = []
-    depth_frame_idx = 0  # counter for raw depth dump filenames
+    video_writer = None
+    depth_frame_idx = 0  # counter for frames
 
-    # Optional raw depth output directory
-    raw_dir: str | None = None
+    # Directories for raw and vis dumps
+    raw_depth_dir: str | None = None
     if needs_depth and args.save_depth_raw:
-        if args.depth_raw_dir != "":
-            raw_dir = args.depth_raw_dir
+        if args.record_mode == "diagnostic":
+            raw_depth_dir = os.path.join(diag_dir, "depth_raw")
         else:
-            raw_dir = os.path.splitext(args.output_path)[0] + "_depth_raw"
-        os.makedirs(raw_dir, exist_ok=True)
-        print(f"[INFO] Raw depth frames will be saved to: {raw_dir}")
+            raw_depth_dir = args.depth_raw_dir if hasattr(args, 'depth_raw_dir') and args.depth_raw_dir else os.path.splitext(args.output_path)[0] + "_depth_raw"
+        os.makedirs(raw_depth_dir, exist_ok=True)
+        print(f"[INFO] Raw depth frames will be saved to: {raw_depth_dir}")
+        
+    raw_hmap_dir: str | None = None
+    if needs_depth and getattr(args, 'save_heightmap_raw', False):
+        raw_hmap_dir = os.path.join(diag_dir, "heightmap_raw")
+        os.makedirs(raw_hmap_dir, exist_ok=True)
+        
+    vis_depth_dir: str | None = None
+    if needs_depth and getattr(args, 'save_depth_vis', False):
+        vis_depth_dir = os.path.join(diag_dir, "depth_vis")
+        os.makedirs(vis_depth_dir, exist_ok=True)
+
+    vis_hmap_dir: str | None = None
+    if needs_depth and getattr(args, 'save_heightmap_vis', False):
+        vis_hmap_dir = os.path.join(diag_dir, "heightmap_vis")
+        os.makedirs(vis_hmap_dir, exist_ok=True)
+
+    diag_frames_dir: str | None = None
+    if args.record_mode == "diagnostic" and getattr(args, 'save_diag_frames', False):
+        diag_frames_dir = os.path.join(diag_dir, "frames")
+        os.makedirs(diag_frames_dir, exist_ok=True)
 
     # Resolve heightmap visualization parameters
     hmap_vmin = args.hmap_vmin
@@ -965,15 +1038,14 @@ def main():
     hmap_cmap_id = resolve_cv2_colormap(args.hmap_colormap)
     hmap_invert = args.hmap_invert
 
-    def _capture_heightmap_bgr() -> np.ndarray | None:
-        """Read depth camera, convert to heightmap, return BGR frame."""
+    def _capture_diagnostic_data() -> dict:
+        """Read depth camera, log stats, save raw dumps, and create BGR views."""
         nonlocal depth_frame_idx
-
+        
         # CRITICAL: explicitly update depth camera so it reads fresh data
         depth_cam.update(dt=sim_dt * substeps)
-
+        
         depth_raw = depth_cam.data.output["distance_to_image_plane"]
-        # To torch tensor (N, H, W)
         if hasattr(depth_raw, 'detach'):
             depth_t = depth_raw.detach()
         else:
@@ -981,10 +1053,12 @@ def main():
         if depth_t.dim() == 4 and depth_t.shape[-1] == 1:
             depth_t = depth_t.squeeze(-1)
         if depth_t.dim() == 2:
-            depth_t = depth_t.unsqueeze(0)  # add batch dim
-
-        # ── Depth diagnostics (every 50 frames) ──
-        if depth_frame_idx % 50 == 0:
+            depth_t = depth_t.unsqueeze(0)
+            
+        is_diag_tick = (depth_frame_idx % args.diag_every_n_frames == 0)
+        
+        # ── Depth diagnostics ──
+        if is_diag_tick:
             _d0 = depth_t[0].cpu().numpy()
             _valid_mask = _d0 > 0.01
             _valid_count = int(_valid_mask.sum())
@@ -995,87 +1069,154 @@ def main():
                 _d_mean = float(_d0[_valid_mask].mean())
             else:
                 _d_min = _d_max = _d_mean = 0.0
-            print(f"  [DEPTH DBG] frame={depth_frame_idx} "
-                  f"valid={_valid_count}/{_total} "
-                  f"min={_d_min:.3f} max={_d_max:.3f} mean={_d_mean:.3f}")
-
+                
+            msg = (f"Frame {depth_frame_idx:05d} | Depth Valid: {_valid_count}/{_total} "
+                   f"({100*_valid_count/_total:.1f}%) | "
+                   f"Min: {_d_min:.3f}m | Max: {_d_max:.3f}m | Mean: {_d_mean:.3f}m")
+            if diag_logger:
+                diag_logger.info(msg)
+            else:
+                print(f"  [DEPTH DBG] {msg}")
+                
         # Camera pose
         cam_pos = depth_cam.data.pos_w       # (N, 3)
         cam_quat = depth_cam.data.quat_w_world  # (N, 4) wxyz
 
+        if is_diag_tick and diag_logger:
+            _cx, _cy, _cz = cam_pos[0].cpu().numpy()
+            diag_logger.debug(f"Frame {depth_frame_idx:05d} | Cam Pos (world): ({_cx:.3f}, {_cy:.3f}, {_cz:.3f})")
+
         # Depth → heightmap via converter
         hmap_t = hmap_converter.depth_to_heightmap(depth_t, cam_pos, cam_quat)
-        hmap_np = hmap_t[0].cpu().numpy()  # (H, W) meters
+        
+        # Heightmap diagnostics
+        if is_diag_tick and diag_logger:
+            _h0 = hmap_t[0].cpu().numpy()
+            _valid_h_mask = np.isfinite(_h0)
+            _valid_h_count = int(_valid_h_mask.sum())
+            _t_h = _h0.size
+            if _valid_h_count > 0:
+                _h_min = float(_h0[_valid_h_mask].min())
+                _h_max = float(_h0[_valid_h_mask].max())
+                _h_mean = float(_h0[_valid_h_mask].mean())
+            else:
+                _h_min = _h_max = _h_mean = 0.0
+            diag_logger.info(
+                   f"Frame {depth_frame_idx:05d} | HMap  Valid: {_valid_h_count}/{_t_h} "
+                   f"({100*_valid_h_count/_t_h:.1f}%) | "
+                   f"Min: {_h_min:.3f}m | Max: {_h_max:.3f}m | Mean: {_h_mean:.3f}m")
 
-        # Optional raw depth dump
-        if raw_dir is not None:
-            depth_np = depth_t[0].cpu().numpy()
-            np.save(
-                os.path.join(raw_dir, f"depth_{depth_frame_idx:06d}.npy"),
-                depth_np.astype(np.float32),
-            )
+        # Visualizations
+        depth_np = depth_t[0].cpu().numpy()
+        hmap_np = hmap_t[0].cpu().numpy()
+        
+        depth_bgr = depth_to_bgr(depth_np, 0.0, float(cfg.depth_cam_height_m), hmap_cmap_id, hmap_invert)
+        hmap_bgr = heightmap_to_bgr(hmap_np, hmap_vmin, hmap_vmax, hmap_cmap_id, hmap_invert)
+
+        # Raw & Vis saving at interval
+        if is_diag_tick:
+            if raw_depth_dir:
+                np.save(os.path.join(raw_depth_dir, f"depth_{depth_frame_idx:06d}.npy"), depth_np.astype(np.float32))
+            if raw_hmap_dir:
+                np.save(os.path.join(raw_hmap_dir, f"hmap_{depth_frame_idx:06d}.npy"), hmap_np.astype(np.float32))
+            if vis_depth_dir:
+                cv2.imwrite(os.path.join(vis_depth_dir, f"depth_vis_{depth_frame_idx:06d}.png"), depth_bgr)
+            if vis_hmap_dir:
+                cv2.imwrite(os.path.join(vis_hmap_dir, f"hmap_vis_{depth_frame_idx:06d}.png"), hmap_bgr)
+
         depth_frame_idx += 1
+        
+        return {
+            "depth_bgr": depth_bgr,
+            "hmap_bgr": hmap_bgr,
+        }
 
-        # Heightmap → colormapped BGR
-        bgr = heightmap_to_bgr(hmap_np, hmap_vmin, hmap_vmax,
-                               hmap_cmap_id, hmap_invert)
-        return bgr
+    def _capture_heightmap_bgr() -> np.ndarray | None:
+        """Legacy helper for non-diagnostic mode."""
+        return _capture_diagnostic_data()["hmap_bgr"]
 
     def step_and_capture():
-        """Run physics substeps, update scene, render one frame."""
+        nonlocal video_writer
+        
         for _ in range(substeps):
             env.sim.step()
         env.scene.update(dt=sim_dt * substeps)
 
-        # CRITICAL: Flush USD transforms into the renderer.  In headless mode,
-        # without this call camera render products never see the updated
-        # prim transforms — resulting in invisible/stale geometry.
+        # CRITICAL: Flush USD transforms into the renderer.
         simulation_app.update()
 
         record_mode = args.record_mode
+        frame_to_write = None
 
         if record_mode == "rgb":
-            # ── RGB only (original behaviour) ──
-            fr = env.render()
-            if fr is not None:
-                frames.append(fr)
+            frame_to_write = env.render()
+            if frame_to_write is not None:
+                frame_to_write = cv2.cvtColor(frame_to_write, cv2.COLOR_RGB2BGR)
 
         elif record_mode == "heightmap":
-            # ── Heightmap only ──
-            bgr = _capture_heightmap_bgr()
-            if bgr is not None:
-                frames.append(bgr)
+            frame_to_write = _capture_heightmap_bgr()
 
         elif record_mode == "both":
-            # ── Side-by-side: RGB (left) + heightmap (right) ──
             rgb_frame = env.render()
             hmap_bgr = _capture_heightmap_bgr()
             if rgb_frame is not None and hmap_bgr is not None:
-                # Convert RGB to BGR for consistency
                 rgb_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
                 rgb_h, rgb_w = rgb_bgr.shape[:2]
                 hm_h, hm_w = hmap_bgr.shape[:2]
-                # Resize heightmap to match RGB height, preserving aspect ratio
                 if hm_h != rgb_h:
                     scale = rgb_h / hm_h
                     new_w = int(hm_w * scale)
-                    hmap_bgr = cv2.resize(hmap_bgr, (new_w, rgb_h),
-                                          interpolation=cv2.INTER_LINEAR)
-                composite = np.concatenate([rgb_bgr, hmap_bgr], axis=1)
-                frames.append(composite)
+                    hmap_bgr = cv2.resize(hmap_bgr, (new_w, rgb_h), interpolation=cv2.INTER_LINEAR)
+                frame_to_write = np.concatenate([rgb_bgr, hmap_bgr], axis=1)
             elif rgb_frame is not None:
-                # FIX: heightmap capture failed — use a black placeholder
-                # of the expected heightmap size so every frame has
-                # identical dimensions (prevents VideoWriter crash).
                 rgb_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
                 rgb_h, rgb_w = rgb_bgr.shape[:2]
-                # Compute expected heightmap width after scaling to RGB height
-                raw_hm_h, raw_hm_w = cfg.map_shape  # (H, W)
+                raw_hm_h, raw_hm_w = cfg.map_shape
                 scale = rgb_h / raw_hm_h
                 placeholder_w = int(raw_hm_w * scale)
                 placeholder = np.zeros((rgb_h, placeholder_w, 3), dtype=np.uint8)
-                composite = np.concatenate([rgb_bgr, placeholder], axis=1)
-                frames.append(composite)
+                frame_to_write = np.concatenate([rgb_bgr, placeholder], axis=1)
+                
+        elif record_mode == "diagnostic":
+            rgb_frame = env.render()
+            diag_data = _capture_diagnostic_data()
+            depth_bgr = diag_data["depth_bgr"]
+            hmap_bgr = diag_data["hmap_bgr"]
+            
+            if rgb_frame is not None:
+                rgb_bgr = cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR)
+                rgb_h, rgb_w = rgb_bgr.shape[:2]
+                
+                # Scale depth and heightmap to match RGB height
+                for bgr in (depth_bgr, hmap_bgr):
+                    h, w = bgr.shape[:2]
+                    if h != rgb_h:
+                        bgr_resized = cv2.resize(bgr, (int(w * (rgb_h / h)), rgb_h), interpolation=cv2.INTER_LINEAR)
+                        if bgr is depth_bgr: depth_bgr = bgr_resized
+                        if bgr is hmap_bgr: hmap_bgr = bgr_resized
+                        
+                # Add text labels (they will be written on the BGR arrays)
+                cv2.putText(rgb_bgr, "RGB", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.putText(depth_bgr, "Depth", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.putText(hmap_bgr, "Heightmap", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                
+                frame_to_write = np.concatenate([rgb_bgr, depth_bgr, hmap_bgr], axis=1)
+                
+                if diag_frames_dir and (depth_frame_idx - 1) % args.diag_every_n_frames == 0:
+                    cv2.imwrite(os.path.join(diag_frames_dir, f"diag_frame_{depth_frame_idx-1:06d}.png"), frame_to_write)
+
+        if frame_to_write is not None:
+            if video_writer is None:
+                h, w = frame_to_write.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
+                video_writer = cv2.VideoWriter(args.output_path, fourcc, args.fps, (w, h))
+                print(f"[INFO] Initialized VideoWriter: {w}x{h} @ {args.fps}fps -> {args.output_path}")
+                if not video_writer.isOpened():
+                    print(f"[ERROR] Failed to open VideoWriter for {args.output_path}")
+            
+            if video_writer.isOpened():
+                video_writer.write(frame_to_write)
     # ─── Park all boxes + set kinematic (USD-level) ────────────────────
     # NOTE(B): Pose parking was already done BEFORE warmup (via tensor API).
     # Here we additionally set kinematic + disable gravity via USD APIs,
@@ -1474,7 +1615,7 @@ def main():
                 # Brief pause to admire the placement
                 state_timer += frame_dt
                 # ── Patch F: debug frame dump ──
-                if args.debug_dump_frame and state_timer < frame_dt * 1.5 and len(frames) > 0:
+                if args.debug_dump_frame and state_timer < frame_dt * 1.5:
                     os.makedirs(args.debug_dump_path, exist_ok=True)
                     _dump_path = os.path.join(
                         args.debug_dump_path,
@@ -1482,12 +1623,11 @@ def main():
                     )
                     try:
                         import cv2 as _cv2
-                        _dump_frame = frames[-1]
-                        # In rgb mode, frames are RGB; convert. Otherwise already BGR.
-                        if args.record_mode == "rgb":
-                            _dump_frame = _cv2.cvtColor(_dump_frame, _cv2.COLOR_RGB2BGR)
-                        _cv2.imwrite(_dump_path, _dump_frame)
-                        print(f"  [DEBUG] Saved debug frame to {_dump_path}")
+                        _dump_frame = env.render()
+                        if _dump_frame is not None:
+                            _dump_bgr = _cv2.cvtColor(_dump_frame, _cv2.COLOR_RGB2BGR)
+                            _cv2.imwrite(_dump_path, _dump_bgr)
+                            print(f"  [DEBUG] Saved debug frame to {_dump_path}")
                     except Exception as _e:
                         print(f"  [DEBUG] Frame dump failed: {_e}")
 
@@ -1533,34 +1673,14 @@ def main():
 
     # ─── Summary ──────────────────────────────────────────────────────
     print(f"\n[INFO] {len(placed_boxes)} boxes placed successfully.")
-    print(f"[INFO] Captured {len(frames)} frames.")
+    print(f"[INFO] Processed {frame_count} frames.")
 
-    # ─── Write video ──────────────────────────────────────────────────
-    print(f"\n[INFO] Writing video to {args.output_path}...")
-
-    os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)
-
-    if len(frames) > 0:
-        h, w = frames[0].shape[:2]
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(args.output_path, fourcc, args.fps, (w, h))
-        if not writer.isOpened():
-            print(f"[ERROR] Could not open VideoWriter for {args.output_path} "
-                  f"(size={w}x{h}, codec=mp4v)")
-        else:
-            for frame in frames:
-                if args.record_mode == "rgb":
-                    # RGB frames need conversion to BGR for cv2
-                    bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-                    writer.write(bgr)
-                else:
-                    # heightmap / both modes already produce BGR frames
-                    writer.write(frame)
-            writer.release()
+    if video_writer is not None:
+        video_writer.release()
         print(f"[SUCCESS] Video: {args.output_path} "
-              f"({len(frames)} frames, {len(frames)/args.fps:.1f}s)")
+              f"({frame_count} frames, {frame_count/args.fps:.1f}s)")
     else:
-        print("[WARNING] No frames captured!")
+        print("[WARNING] No frames written to video (VideoWriter not opened)!")
 
     # ─── Cleanup ──────────────────────────────────────────────────────────
     env.close()
