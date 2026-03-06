@@ -720,7 +720,7 @@ def main():
     stage = omni.usd.get_context().get_stage()
 
     # ─── Depth camera access (robust, with fallbacks) ─────────────────
-    needs_depth = args.record_mode in ("heightmap", "both")
+    needs_depth = args.record_mode in ("heightmap", "both", "diagnostic")
     depth_cam = None
     hmap_converter = None
     if needs_depth:
