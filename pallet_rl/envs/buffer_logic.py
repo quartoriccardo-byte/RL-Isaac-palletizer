@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from pallet_rl.envs.pallet_task import PalletTask
 
 
-def handle_buffer_actions(env: PalletTask, action: torch.Tensor):
+def handle_buffer_actions(env: PalletTask):
     """
     Handle store and retrieve buffer operations with physical box tracking.
 
@@ -33,8 +33,9 @@ def handle_buffer_actions(env: PalletTask, action: torch.Tensor):
     n = env.num_envs
     env_idx = torch.arange(n, device=device)
 
-    slot_idx = action[:, 1].long()
-    op_type = action[:, 0]
+    dec = env.decoded_action
+    slot_idx = dec.slot_idx
+    op_type = dec.op_type
 
     # Reset last_moved_box_id; will be set appropriately below
     env.last_moved_box_id[:] = -1
@@ -58,7 +59,7 @@ def handle_buffer_actions(env: PalletTask, action: torch.Tensor):
     env.valid_retrieve = env.retrieve_mask & has_box_in_slot & retrieve_height_valid
 
     if env.valid_retrieve.any():
-        _execute_retrieve(env, action, slot_idx, device)
+        _execute_retrieve(env, slot_idx, device)
 
     # Age all buffer slots
     env.buffer_state[:, :, 4] += 1.0
@@ -66,7 +67,7 @@ def handle_buffer_actions(env: PalletTask, action: torch.Tensor):
     # ==================================================================
     # PLACE: Advance box_idx and record last_moved_box_id
     # ==================================================================
-    place_mask = (op_type == 0) & ~env._height_invalid_mask
+    place_mask = env.active_place_mask & ~env._height_invalid_mask
 
     env.last_moved_box_id = torch.where(
         place_mask, env.box_idx, env.last_moved_box_id
@@ -119,7 +120,6 @@ def _execute_store(
 
 def _execute_retrieve(
     env: PalletTask,
-    action: torch.Tensor,
     slot_idx: torch.Tensor,
     device,
 ):
@@ -145,9 +145,10 @@ def _execute_retrieve(
         half_x = pallet_x / 2.0
         half_y = pallet_y / 2.0
 
-        grid_x = action[retr_envs, 2]
-        grid_y = action[retr_envs, 3]
-        rot_idx = action[retr_envs, 4]
+        dec = env.decoded_action
+        grid_x = dec.grid_x[retr_envs]
+        grid_y = dec.grid_y[retr_envs]
+        rot_idx = dec.rot_idx[retr_envs]
 
         target_x = grid_x.float() * step_x - half_x + step_x / 2
         target_y = grid_y.float() * step_y - half_y + step_y / 2

@@ -75,6 +75,7 @@ def apply_action(env: PalletTask) -> None:
       6. Delegate buffer operations to ``buffer_logic``.
     """
     from pallet_rl.envs.buffer_logic import handle_buffer_actions
+    from pallet_rl.envs.action_adapter import decode_normalized_action
 
     n = env.num_envs
     device = env._device
@@ -82,13 +83,15 @@ def apply_action(env: PalletTask) -> None:
     action = env._actions
 
     # ------------------------------------------------------------------
-    # 1. Decode sub-actions
+    # 1. Decode sub-actions explicitly
     # ------------------------------------------------------------------
-    op_type = _to_discrete(action[:, 0], cfg.action_dims[0])
-    slot_idx = _to_discrete(action[:, 1], cfg.action_dims[1])
-    rot_idx = _to_discrete(action[:, 4], cfg.action_dims[4])
-    grid_x = _to_discrete(action[:, 2], cfg.action_dims[2])
-    grid_y = _to_discrete(action[:, 3], cfg.action_dims[3])
+    env.decoded_action = decode_normalized_action(action, cfg.action_dims)
+    dec = env.decoded_action
+    op_type = dec.op_type
+    slot_idx = dec.slot_idx
+    rot_idx = dec.rot_idx
+    grid_x = dec.grid_x
+    grid_y = dec.grid_y
 
     # ------------------------------------------------------------------
     # 2. Grid → world coordinates
@@ -146,7 +149,7 @@ def apply_action(env: PalletTask) -> None:
     # ------------------------------------------------------------------
     # 7. Buffer logic (store / retrieve)
     # ------------------------------------------------------------------
-    handle_buffer_actions(env, action)
+    handle_buffer_actions(env)
 
 
 def get_action_mask(env: PalletTask) -> torch.Tensor:
@@ -234,11 +237,6 @@ def decode_action(
 # =============================================================================
 # Internal Helpers
 # =============================================================================
-
-def _to_discrete(a: torch.Tensor, k: int) -> torch.Tensor:
-    """Map [-1, 1] → {0 .. k-1}."""
-    return torch.floor(((a + 1.0) * 0.5) * k).long().clamp(0, k - 1)
-
 
 def _validate_height_constraint(
     env: PalletTask,

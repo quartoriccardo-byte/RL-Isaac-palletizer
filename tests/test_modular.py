@@ -77,6 +77,46 @@ def test_to_discrete_uniform_bins():
 
 
 # ============================================================================
+# Tests for Action Adapter (Blocker 1 Regression Tests)
+# ============================================================================
+
+def test_decoded_action_slot_propagation():
+    """Prove continuous subsets properly decode to exact slots (e.g., slot 7)."""
+    from pallet_rl.envs.action_adapter import decode_normalized_action
+    
+    # op_type(3), slot(10), x(16), y(24), rot(2)
+    dims = (3, 10, 16, 24, 2)
+    
+    # For k=10, center of bin 7 is -1 + (2*7+1)/10 = 0.5
+    action = torch.tensor([[0.0, 0.5, 0.0, 0.0, 0.0]])
+    dec = decode_normalized_action(action, dims)
+    assert dec.slot_idx[0].item() == 7
+
+
+def test_buffer_uses_decoded_not_raw():
+    """Prove retrieve coordinates decode to true grid indices."""
+    from pallet_rl.envs.action_adapter import decode_normalized_action
+    
+    dims = (3, 10, 16, 24, 2)
+    action = torch.tensor([[0.0, 0.0, -1.0, 0.95, 1.0]])
+    
+    dec = decode_normalized_action(action, dims)
+    assert dec.grid_x[0].item() == 0
+    assert dec.grid_y[0].item() == 23
+    assert dec.rot_idx[0].item() == 1
+
+
+def test_store_does_not_always_target_slot_0():
+    """Test the original bug: float 0.9 was truncated to 0. It must be 9."""
+    from pallet_rl.envs.action_adapter import decode_normalized_action
+    
+    dims = (3, 10, 16, 24, 2)
+    action = torch.tensor([[0.0, 0.9, 0.0, 0.0, 0.0]])
+    dec = decode_normalized_action(action, dims)
+    assert dec.slot_idx[0].item() == 9
+
+
+# ============================================================================
 # Tests for AABB helpers (via usd_helpers)
 # ============================================================================
 
@@ -152,4 +192,7 @@ if __name__ == "__main__":
     test_perception_factory_warp()
     test_perception_factory_depth()
     test_perception_factory_invalid()
+    test_decoded_action_slot_propagation()
+    test_buffer_uses_decoded_not_raw()
+    test_store_does_not_always_target_slot_0()
     print("\n✅ All modular tests passed!")

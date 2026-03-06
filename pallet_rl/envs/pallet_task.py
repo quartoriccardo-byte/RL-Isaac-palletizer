@@ -310,7 +310,11 @@ class PalletTask(DirectRLEnv):
 
         super().__init__(cfg, render_mode, **kwargs)
 
-        # Heightmap generators
+        # Perception Backend Abstraction
+        from pallet_rl.envs.perception import create_backend
+        self._heightmap_backend = create_backend(self.cfg.heightmap_source)
+
+        # Legacy generator/converter direct instances (used by the backends internally)
         self.heightmap_gen = WarpHeightmapGenerator(
             device=self._device, num_envs=self.num_envs, max_boxes=self.cfg.max_boxes,
             grid_res=self.cfg.grid_res, map_shape=self.cfg.map_shape,

@@ -45,18 +45,6 @@ def build_observations(env: PalletTask) -> dict[str, torch.Tensor]:
         box_rot = torch.zeros(n, M, 4, device=device)
         box_rot[:, :, 0] = 1.0
 
-    # Debug logging
-    if not hasattr(env, "_obs_dbg_count"):
-        env._obs_dbg_count = 0
-    env._obs_dbg_count += 1
-    if env._obs_dbg_count <= 1 or env._obs_dbg_count % 200 == 0:
-        _active_k = min(K, env.box_idx.max().item() + 1) if K < M else M
-        print(
-            f"  [OBS DBG] M={M} K={K} "
-            f"box_pos.shape={list(box_pos.shape)} "
-            f"active_placed~{_active_k} step={env._obs_dbg_count}"
-        )
-
     pallet_pos = torch.zeros(n, 3, device=device)
 
     # ------------------------------------------------------------------
@@ -136,79 +124,5 @@ def _generate_heightmap(
     n: int,
     device: torch.device,
 ) -> torch.Tensor:
-    """Generate a heightmap using the configured backend.
-
-    Prefers the new ``BaseHeightmapBackend`` abstraction (``env._heightmap_backend``)
-    when available.  Falls back to inline Warp/depth selection for backward
-    compatibility if the backend hasn't been wired up yet.
-    """
-    # New abstraction path
-    if hasattr(env, "_heightmap_backend") and env._heightmap_backend is not None:
-        return env._heightmap_backend.generate(env)
-
-    # Legacy fallback (inline selection)
-    cfg = env.cfg
-    if cfg.heightmap_source == "depth_camera" and env._depth_converter is not None:
-        return _heightmap_from_depth_legacy(env, n)
-    else:
-        return _heightmap_from_warp_legacy(env, box_pos, box_rot, pallet_pos, n, device)
-
-
-def _heightmap_from_depth_legacy(env: PalletTask, n: int) -> torch.Tensor:
-    """Depth-camera pipeline (legacy inline path)."""
-    depth_cam = env.scene["depth_camera"]
-    depth_data = depth_cam.data
-
-    depth_img = depth_data.output["distance_to_image_plane"]
-    if depth_img.dim() == 4 and depth_img.shape[-1] == 1:
-        depth_img = depth_img.squeeze(-1)
-
-    cam_pos = depth_data.pos_w
-    cam_quat_wxyz = depth_data.quat_w_world
-
-    env._depth_step_count += 1
-    dec = env.cfg.depth_cam_decimation
-    if dec > 1 and env._cached_depth_heightmap is not None:
-        if (env._depth_step_count - 1) % dec != 0:
-            return env._cached_depth_heightmap
-
-    heightmap = env._depth_converter.depth_to_heightmap(depth_img, cam_pos, cam_quat_wxyz)
-    env._cached_depth_heightmap = heightmap
-
-    if env.cfg.depth_debug_save_frames:
-        import os
-        os.makedirs(env.cfg.depth_debug_save_dir, exist_ok=True)
-        step = env._depth_step_count
-        torch.save(
-            {"depth": depth_img[0].cpu(), "heightmap": heightmap[0].cpu()},
-            os.path.join(env.cfg.depth_debug_save_dir, f"frame_{step:06d}.pt"),
-        )
-
-    return heightmap
-
-
-def _heightmap_from_warp_legacy(
-    env: PalletTask,
-    box_pos: torch.Tensor,
-    box_rot: torch.Tensor,
-    pallet_pos: torch.Tensor,
-    n: int,
-    device: torch.device,
-) -> torch.Tensor:
-    """Warp analytical rasterization pipeline (legacy inline path)."""
-    cfg = env.cfg
-    box_indices = torch.arange(cfg.max_boxes, device=device).view(1, -1)
-    active_mask = box_indices < env.box_idx.view(-1, 1)
-
-    env._box_dims_for_hmap.copy_(env.box_dims)
-    env._box_dims_for_hmap[~active_mask] = 0.0
-
-    box_pos_for_hmap = box_pos.clone()
-    box_pos_for_hmap[~active_mask] = env._inactive_box_pos
-
-    return env.heightmap_gen.forward(
-        box_pos_for_hmap.reshape(-1, 3),
-        box_rot.reshape(-1, 4),
-        env._box_dims_for_hmap.reshape(-1, 3),
-        pallet_pos,
-    )
+    """Generate a heightmap using the configured backend pipeline."""
+    return env._heightmap_backend.generate(env)
