@@ -75,7 +75,11 @@ Action (5-dim) ──┐
 
 ## Action Space
 
-Factored Discrete 5-tuple:
+The environment relies on a strict separation between the trainer-facing API and the semantic action interpretation:
+
+1. **Trainer-Facing Interface**: A continuous `gym.spaces.Box(low=-1.0, high=1.0, shape=(5,))` exposed for RSL-RL compatibility.
+2. **Decoding Layer**: `pallet_rl.envs.action_adapter` decodes the continuous `[-1, 1]` float tensor into a `DecodedAction` named tuple.
+3. **Semantic Action Space**: Internal logic consumes the factured discrete 5-tuple:
 
 | Index | Name      | Values     | Semantic                |
 |-------|-----------|------------|-------------------------|
