@@ -543,8 +543,8 @@ def main():
         # This is the standard integration pattern used by Isaac Lab itself.
         # By assigning our CNN-based policy to the "ActorCritic" name, the
         # OnPolicyRunner will instantiate PalletizerActorCritic automatically.
-        import rsl_rl.modules
-        rsl_rl.modules.ActorCritic = PalletizerActorCritic
+        from pallet_rl.models.rsl_rl_wrapper import register_custom_policy
+        register_custom_policy()
         
         # ---------------------------------------------------------------------
         # Step 7: Create RSL-RL runner

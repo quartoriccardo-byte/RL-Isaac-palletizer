@@ -368,8 +368,9 @@ def main():
         env = RslRlVecEnvWrapper(env)
         
         # Inject custom policy class
-        import rsl_rl.modules
-        rsl_rl.modules.ActorCritic = PalletizerActorCritic
+        # Fix: Register custom policy via isolated registry function
+        from pallet_rl.models.rsl_rl_wrapper import register_custom_policy
+        register_custom_policy()
         
         # Build minimal RSL-RL config for evaluation
         cfg_path = os.path.join(

@@ -22,6 +22,9 @@ SKIP_REASON_PXR = (
     "Requires pxr (Omniverse USD) - run under Isaac Lab runtime or Kit environment"
 )
 
+HAS_RSL_RL = importlib.util.find_spec("rsl_rl") is not None
+SKIP_REASON_RSL_RL = "Requires optional dependency: rsl_rl"
+
 
 def test_import_package():
     """Test basic package import."""
@@ -42,7 +45,6 @@ def test_import_lightweight_utils():
 def test_import_submodules():
     """Test submodule imports (requires pxr for Isaac Lab envs)."""
     from pallet_rl.envs import pallet_task
-    from pallet_rl.models import rsl_rl_wrapper
     from pallet_rl.algo import utils
     from pallet_rl.utils import heightmap_rasterizer, quaternions
     print("✓ Env, models, algo, and utils submodules imported successfully")
@@ -52,10 +54,17 @@ def test_import_submodules():
 def test_import_classes():
     """Test key class imports (requires pxr for Isaac Lab envs)."""
     from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
-    from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
     from pallet_rl.algo.utils import decode_action, load_config
     from pallet_rl.utils.quaternions import wxyz_to_xyzw, xyzw_to_wxyz
     print("✓ All key classes imported successfully")
+
+
+@pytest.mark.skipif(not HAS_RSL_RL, reason=SKIP_REASON_RSL_RL)
+def test_import_rsl_rl_wrapper():
+    """Test RL wrapper import (requires rsl_rl optional dependency)."""
+    from pallet_rl.models import rsl_rl_wrapper
+    from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
+    print("✓ RSL-RL wrapper imported successfully")
 
 
 if __name__ == "__main__":
@@ -64,6 +73,8 @@ if __name__ == "__main__":
     if HAS_PXR:
         test_import_submodules()
         test_import_classes()
+        if HAS_RSL_RL:
+            test_import_rsl_rl_wrapper()
         print("\n✅ All import tests passed!")
     else:
         print("\n⚠ Isaac-dependent tests skipped (pxr not available)")

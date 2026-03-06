@@ -4,6 +4,7 @@ These tests encode correctness via assertions that will fail early at import tim
 if bugs are reintroduced.
 """
 import torch
+import pytest
 
 
 def test_decode_action_rectangular():
@@ -74,6 +75,10 @@ def test_terminated_truncated_types():
     print("✓ terminated/truncated type handling test passed")
 
 
+import importlib.util
+HAS_RSL_RL = importlib.util.find_spec("rsl_rl") is not None
+
+@pytest.mark.skipif(not HAS_RSL_RL, reason="Requires optional dependency: rsl_rl")
 def test_rsl_rl_wrapper_entropy():
     """Test that PalletizerActorCritic has entropy method for RSL-RL PPO."""
     from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic

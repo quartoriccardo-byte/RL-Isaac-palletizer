@@ -141,9 +141,9 @@ def main():
 
         # Register custom policy class with RSL-RL
         # (Standard integration pattern — RSL-RL resolves via getattr)
-        import rsl_rl.modules
-
-        rsl_rl.modules.ActorCritic = PalletizerActorCritic
+        # Register custom policy via our isolated adapter function
+        from pallet_rl.models.rsl_rl_wrapper import register_custom_policy
+        register_custom_policy()
 
         runner = OnPolicyRunner(env=env, train_cfg=eval_cfg, log_dir=args.log_dir, device=str(device))
 

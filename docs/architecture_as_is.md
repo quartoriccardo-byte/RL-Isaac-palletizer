@@ -1,4 +1,11 @@
-## RL-Isaac-Palletizer – Architecture (As Is)
+## RL-Isaac-# [DEPRECATED] PalletRL Architecture (As-Is State Before Refactor)
+
+> **⚠️ DEPRECATION WARNING ⚠️**
+> This document describes the architecture *before* the deep modularization refactor.
+> It is retained for historical context only.
+> For the truthful, current contract (including the semantic Action Adapter), see [architecture.md](architecture.md).
+
+---
 
 This document captures the current high‑level architecture of the `RL-Isaac-palletizer` repo as it exists in this workspace, before additional refactors.
 
@@ -202,4 +209,3 @@ This document captures the current high‑level architecture of the `RL-Isaac-pa
    - `scripts/eval.py` and `scripts/gen_mask_dataset.py` depend on missing modules and an older pipeline (U‑Net + spatial head), conflicting with the current RSL‑RL setup.
 
 These are the starting conditions that subsequent refactors will address while converging on a single, modern Isaac Lab DirectRLEnv + RSL‑RL PPO pipeline with Warp‑based heightmaps and a clean MultiDiscrete policy.
-

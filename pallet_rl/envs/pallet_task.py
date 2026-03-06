@@ -288,7 +288,7 @@ class PalletTask(DirectRLEnv):
         - Constraint norms: (2,)
         - Proprioception: (robot_state_dim,)
 
-    Actions (MultiDiscrete):
+    Actions (Continuous Box -> Factored Discrete):
         - Operation: [0=Place, 1=Store, 2=Retrieve]
         - Buffer slot: [0..9]
         - Grid X: [0..15]

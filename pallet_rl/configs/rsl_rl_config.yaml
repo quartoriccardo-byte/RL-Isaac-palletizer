@@ -112,7 +112,7 @@ env:
   # - Max stack height norm: 1 (for domain randomization)
   # - Proprio: 24
   
-  # Action space (MultiDiscrete)
+  # Action space (Continuous Box translated to Factored Discrete)
   action_dims: [3, 10, 16, 24, 2]
   # - Operation: 3 (Place, Store, Retrieve)
   # - Buffer slot: 10

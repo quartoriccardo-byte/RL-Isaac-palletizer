@@ -15,7 +15,23 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-# RSL-RL base class
+# RSL-RL base
+cnn_out_dim: int = 256
+hidden_dims: tuple[int, ...] = (128, 64)
+
+
+def register_custom_policy():
+    """
+    Registers the custom PalletizerActorCritic with RSL-RL.
+
+    Isaac Lab relies on RSL-RL for PPO generation. In RSL-RL v1/v2, the 
+    OnPolicyRunner resolves the policy class by looking up `rsl_rl.modules.PolicyName`.
+    The cleanest available workaround to inject a custom architecture is to patch 
+    this global namespace before the runner is instantiated.
+    """
+    import rsl_rl.modules
+    rsl_rl.modules.ActorCritic = PalletizerActorCritic
+
 from rsl_rl.modules import ActorCritic
 
 
