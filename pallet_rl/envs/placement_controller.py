@@ -10,7 +10,7 @@ Handles:
 
 Action Semantics
 ================
-The MultiDiscrete action space has 5 dimensions:
+The factored discrete action space has 5 dimensions:
 
   ======== =========== ======================== ============================
   Index    Name        Values                   Semantic
@@ -154,13 +154,13 @@ def apply_action(env: PalletTask) -> None:
 
 def get_action_mask(env: PalletTask) -> torch.Tensor:
     """
-    Return an action mask over the flattened MultiDiscrete logits.
+    Return an action mask over the flattened discrete logits.
 
     Shape: ``(num_envs, sum(action_dims))``, dtype=bool.
 
     Implements:
       - Height-based X/Y masking for PLACE operations.
-      - Informational (not enforced) for RETRIEVE due to MultiDiscrete coupling.
+      - Informational (not enforced) for RETRIEVE due to independent component sampling coupling.
     """
     n = env.num_envs
     device = env._device
@@ -223,7 +223,7 @@ def decode_action(
 
     This is the legacy single-index spatial decoder, kept for backward
     compatibility and test reference.  The canonical pipeline uses the
-    MultiDiscrete 5-tuple approach.
+    factored discrete 5-tuple approach.
     """
     assert width > 0 and height > 0, f"Invalid grid dimensions: {width}x{height}"
     area = width * height

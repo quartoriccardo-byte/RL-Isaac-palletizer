@@ -3,7 +3,7 @@ Action Adapter: Centralizes the semantic action space contract.
 
 This environment exposes a continuous Box([-1, 1] x 5) interface to the trainer
 (e.g., RSL-RL PPO) for compatibility. However, the true semantic action space
-is MultiDiscrete.
+is a factored discrete 5-tuple.
 
 This module provides the rigorous mapping from the trainer's normalized float
 tensor to the canonical DecodedAction representation used by all downstream

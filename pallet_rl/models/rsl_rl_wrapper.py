@@ -1,7 +1,7 @@
 """
 PalletizerActorCritic: CNN-based Actor-Critic for RSL-RL
 
-Custom policy for MultiDiscrete palletizing actions with:
+Custom policy for continuous Box actions decoded to factored discrete palletizing semantics with:
 - CNN visual encoder for heightmap
 - MLP vector encoder for buffer state
 - Fusion layer for combined features
@@ -37,7 +37,7 @@ from rsl_rl.modules import ActorCritic
 
 class PalletizerActorCritic(ActorCritic):
     """
-    CNN-based Actor-Critic for palletizing with MultiDiscrete actions.
+    CNN-based Actor-Critic mapping continuous Box outputs to factored discrete actions.
     
     Architecture:
         Observation (38491-dim) → Split → [Visual Encoder, Vector Encoder] → Fusion → [Actor, Critic]
@@ -54,7 +54,7 @@ class PalletizerActorCritic(ActorCritic):
         Concat → (N, 320)
     
     Actor Head:
-        (N, 320) → (N, 55) MultiDiscrete logits
+        (N, 320) → (N, 55) continuous action logits mapped to Factored Discrete
     
     Critic Head:
         (N, 320) → (N, 1) value
@@ -137,7 +137,7 @@ class PalletizerActorCritic(ActorCritic):
         # ---------------------------------------------------------------------
         # Actor Head
         # Input: (N, 320)
-        # Output: (N, 55) - MultiDiscrete logits
+        # Output: (N, 55) - action logits
         # ---------------------------------------------------------------------
         self.actor_head = nn.Sequential(
             nn.Linear(fusion_dim, 128),

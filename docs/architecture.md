@@ -75,7 +75,7 @@ Action (5-dim) ──┐
 
 ## Action Space
 
-MultiDiscrete 5-tuple:
+Factored Discrete 5-tuple:
 
 | Index | Name      | Values     | Semantic                |
 |-------|-----------|------------|-------------------------|
@@ -89,12 +89,28 @@ Grid → World: pallet (1.2×0.8 m) centered at origin.
 
 ## Perception Backends
 
-| Backend | Class | Usage | Noise |
-|---------|-------|-------|-------|
-| `warp` | `WarpBackend` → `WarpHeightmapGenerator` | Training (fastest) | None |
-| `depth_camera` | `DepthCameraBackend` → `DepthHeightmapConverter` | Sim-to-Real | Gaussian + quantization + dropout |
+The environment supports swappable perception backends via `envs/perception/`:
 
-Both produce identical `(N, H, W)` heightmap tensors via `BaseHeightmapBackend.generate(env)`.
+1. `WarpBackend`: Uses `heightmap_rasterizer` (analytical, exact, fast GPU raycasts).
+2. `DepthCameraBackend`: Uses Isaac Lab camera sensors + coordinate projection (realistic, noisy, handles occlusions).
+
+Both conform to `BaseHeightmapBackend`, keeping `observation_builder` clean.
+
+## RSL-RL Integration Workaround
+
+**Note to Contributors:** The integration of the CNN-based `PalletizerActorCritic` into RSL-RL is handled via a **monkey-patch workaround**, not a native dependency injection framework.
+
+RSL-RL (v1/v2) hardcodes policy lookups against its own internal `rsl_rl.modules` namespace. To inject our custom image+vector fusion network without forking the trainer, we provide a centralized hook:
+
+```python
+# pallet_rl.models.rsl_rl_wrapper
+def register_custom_policy():
+    import rsl_rl.modules
+    rsl_rl.modules.ActorCritic = PalletizerActorCritic
+```
+
+All entrypoint scripts (`train.py`, `eval.py`) must call this hook before instantiating the `OnPolicyRunner`.
+This is a conscious, contained compatibility measure. It is not an ideal long-term architecture, but it cleanly isolates the hack in a single maintainable file rather than polluting the scripts inline.
 
 ## Key Design Decisions
 

@@ -48,8 +48,8 @@ def test_action_mean_no_mutation():
 def test_mask_shape_contract():
     """Deprecated: legacy SpatialPolicyHead has been removed.
 
-    Action masking is now implemented directly in the MultiDiscrete policy
-    and env; see PalletizerActorCritic and PalletTask for details.
+    Action masking is now implemented securely downstream of the action adapter.
+    This test serves only as a historical graveyard map.lletTask for details.
     """
     pass
 
