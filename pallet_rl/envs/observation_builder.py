@@ -125,4 +125,10 @@ def _generate_heightmap(
     device: torch.device,
 ) -> torch.Tensor:
     """Generate a heightmap using the configured backend pipeline."""
+    # If the generator was intentionally skipped (e.g., mockup_mode RGB),
+    # return a safe zero tensor to satisfy observation dimensions without Warp.
+    if env.heightmap_gen is None and env.cfg.heightmap_source != "depth_camera":
+        map_h, map_w = env.cfg.map_shape
+        return torch.zeros(n, map_h, map_w, dtype=torch.float32, device=device)
+
     return env._heightmap_backend.generate(env)
