@@ -82,6 +82,10 @@ def parse_args():
     parser.add_argument("--enable_cameras", action="store_true", default=True)
     parser.add_argument("--cam_width", type=int, default=640)
     parser.add_argument("--cam_height", type=int, default=360)
+    parser.add_argument("--cuda_device", type=str, default="2",
+                        help="CUDA_VISIBLE_DEVICES value. Set to the GPU ordinal "
+                             "of the supported GPU (e.g. '2' for RTX 6000). "
+                             "Hides unsupported GPUs from PyTorch.")
 
     # box counts & seed
     parser.add_argument("--num_boxes", type=int, default=15)
@@ -244,6 +248,11 @@ def inject_kit_args(args, unknown):
         "--/rtx-transient/dldenoiser/enabled": "--/rtx-transient/dldenoiser/enabled=false",
     }
 
+    # ── Viewport / window suppression for headless mode ──
+    if args.headless:
+        defaults["--/app/window/enabled"] = "--/app/window/enabled=false"
+        defaults["--/app/extensions/registryEnabled"] = "--/app/extensions/registryEnabled=false"
+
     # Force CPU physics via Kit setting (prevents PhysX CUDA context creation)
     if args.physics_device == "cpu":
         defaults["--/physics/simulationDevice"] = "--/physics/simulationDevice=cpu"
@@ -312,19 +321,29 @@ except Exception as _e:
 #    These MUST come after SimulationApp to avoid premature CUDA init.
 # ═══════════════════════════════════════════════════════════════════════
 
+# ─── Patch 3: Restrict CUDA visibility BEFORE importing torch ──────────
+# Hides unsupported GPUs (e.g. GTX 1080 Ti) from PyTorch to avoid
+# CUDA enumeration warnings and Warp cuDeviceGetUuid mismatches.
+_cuda_vis = args.cuda_device
+os.environ["CUDA_VISIBLE_DEVICES"] = _cuda_vis
+print(f"[INFO] CUDA_VISIBLE_DEVICES={_cuda_vis} (hiding unsupported GPUs)")
+
 import cv2                # deferred from top-of-file
 import numpy as np
 import torch              # deferred from top-of-file
 
-from pallet_rl.utils.device_utils import pick_supported_cuda_device
-
-# ─── Force supported GPU (RTX 6000 vs 1080 Ti) ─────────────────────────
-# pick_supported_cuda_device() selects the correct *CUDA* device for
-# PyTorch tensors.  Kit settings (Vulkan + CUDA ordinals) are handled
-# separately in inject_kit_args().
-_cuda_idx, forced_device = pick_supported_cuda_device()
-args.device = forced_device
-print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {_cuda_idx})")
+# With CUDA_VISIBLE_DEVICES set, PyTorch sees only 1 GPU at index 0.
+_torch_gpu_count = torch.cuda.device_count()
+if _torch_gpu_count == 0:
+    raise RuntimeError(
+        f"No CUDA devices visible after CUDA_VISIBLE_DEVICES={_cuda_vis}. "
+        f"Check that the GPU ordinal is correct."
+    )
+_torch_device = "cuda:0"   # always 0 after CUDA_VISIBLE_DEVICES filtering
+torch.cuda.set_device(0)
+args.device = _torch_device
+print(f"[INFO] PyTorch sees {_torch_gpu_count} GPU(s): "
+      f"{torch.cuda.get_device_name(0)} → using {_torch_device}")
 if args.physics_device == "cpu":
     print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX: CPU (no CUDA context)")
 else:
@@ -333,7 +352,9 @@ else:
 from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf, Gf, UsdGeom
 
 from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
-from pallet_rl.utils.depth_heightmap import DepthHeightmapConverter, DepthHeightmapCfg
+
+# NOTE: DepthHeightmapConverter / DepthHeightmapCfg are imported lazily
+# inside main() only when record_mode requires depth.
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -627,6 +648,7 @@ def main():
             print(f"    Vis frames:  depth={args.save_depth_vis}, hmap={args.save_heightmap_vis}, composite={args.save_diag_frames}")
     print(f"{'='*60}\n")
 
+
     # ─── Environment config ───────────────────────────────────────────
     cfg = PalletTaskCfg()
     cfg.scene.num_envs = 1
@@ -681,6 +703,20 @@ def main():
     cfg.use_pallet_mesh_visual = args.use_pallet_mesh
     cfg.floor_visual_enabled = True
     cfg.mockup_mode = True
+
+    # ─── Startup subsystem diagnostic banner ──────────────────────────
+    _needs_depth = args.record_mode in ("heightmap", "both", "diagnostic")
+    print(f"{'─'*50}")
+    print(f"  Subsystem Status")
+    print(f"{'─'*50}")
+    print(f"  CUDA visibility     : CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}")
+    print(f"  PyTorch GPU         : {torch.cuda.get_device_name(0)} (cuda:0)")
+    print(f"  Warp backend        : SKIPPED (mockup_mode)")
+    print(f"  Depth converter     : {'active' if _needs_depth else 'SKIPPED (rgb mode)'}")
+    print(f"  Pallet mesh visual  : {'active' if cfg.use_pallet_mesh_visual else 'SKIPPED'}")
+    print(f"  Viewport suppress   : {'active' if args.headless else 'inactive (windowed)'}")
+    print(f"  Lightweight mode    : {'active' if args.lightweight else 'inactive'}")
+    print(f"{'─'*50}\n")
 
     # Camera
     cfg.scene.render_camera.width = args.cam_width
@@ -819,6 +855,8 @@ def main():
         print(f"[INFO] Depth camera type: {type(depth_cam).__name__}")
 
         # ─── DepthHeightmapConverter (recording-only, noise off by default) ─
+        # Lazy import: only loaded when record_mode actually needs depth.
+        from pallet_rl.utils.depth_heightmap import DepthHeightmapConverter, DepthHeightmapCfg
         # Noise is disabled unless user explicitly passes --enable_depth_noise
         _noise_on = args.enable_depth_noise
         depth_hmap_cfg = DepthHeightmapCfg(

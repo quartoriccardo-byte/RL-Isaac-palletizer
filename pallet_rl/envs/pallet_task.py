@@ -41,9 +41,10 @@ from isaaclab.sim.spawners.sensors import PinholeCameraCfg
 
 import gymnasium as gym
 
-from pallet_rl.utils.heightmap_rasterizer import WarpHeightmapGenerator
+# NOTE: WarpHeightmapGenerator and DepthHeightmapConverter are imported
+# lazily inside __init__ to avoid pulling in Warp/CUDA at module load time.
+# This prevents Warp driver API errors in RGB-only mockup runs.
 from pallet_rl.utils.quaternions import wxyz_to_xyzw, quat_angle_deg
-from pallet_rl.utils.depth_heightmap import DepthHeightmapConverter, DepthHeightmapCfg
 
 # Extracted modules
 from pallet_rl.envs.scene_builder import setup_scene, _create_prim
@@ -314,15 +315,23 @@ class PalletTask(DirectRLEnv):
         from pallet_rl.envs.perception import create_backend
         self._heightmap_backend = create_backend(self.cfg.heightmap_source)
 
-        # Legacy generator/converter direct instances (used by the backends internally)
-        self.heightmap_gen = WarpHeightmapGenerator(
-            device=self._device, num_envs=self.num_envs, max_boxes=self.cfg.max_boxes,
-            grid_res=self.cfg.grid_res, map_shape=self.cfg.map_shape,
-            pallet_dims=self.cfg.pallet_size,
-        )
+        # Legacy generator — only needed for training (Warp backend).
+        # In mockup_mode, heightmaps are never generated via the env pipeline,
+        # so we skip the WarpHeightmapGenerator entirely to avoid loading Warp.
+        if not cfg.mockup_mode:
+            from pallet_rl.utils.heightmap_rasterizer import WarpHeightmapGenerator
+            self.heightmap_gen = WarpHeightmapGenerator(
+                device=self._device, num_envs=self.num_envs, max_boxes=self.cfg.max_boxes,
+                grid_res=self.cfg.grid_res, map_shape=self.cfg.map_shape,
+                pallet_dims=self.cfg.pallet_size,
+            )
+        else:
+            self.heightmap_gen = None  # no Warp in mockup mode
+            print("[INFO] Mockup mode: WarpHeightmapGenerator skipped (no Warp init)")
 
-        self._depth_converter: DepthHeightmapConverter | None = None
+        self._depth_converter = None
         if self.cfg.heightmap_source == "depth_camera":
+            from pallet_rl.utils.depth_heightmap import DepthHeightmapConverter, DepthHeightmapCfg
             depth_cfg = DepthHeightmapCfg(
                 cam_height=self.cfg.depth_cam_resolution[0],
                 cam_width=self.cfg.depth_cam_resolution[1],
