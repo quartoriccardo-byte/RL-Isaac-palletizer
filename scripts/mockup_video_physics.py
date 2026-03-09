@@ -249,8 +249,7 @@ def inject_kit_args(args, unknown):
     if args.headless:
         defaults["--/app/window/enabled"] = "--/app/window/enabled=false"
         defaults["--/app/extensions/registryEnabled"] = "--/app/extensions/registryEnabled=false"
-        # Disable main viewport and grid to save VRAM and UI overhead
-        defaults["--/exts/omni.kit.window.viewport/enabled"] = "--/exts/omni.kit.window.viewport/enabled=false"
+        # Disable grid to save UI overhead (viewport extension itself MUST remain enabled for Isaac Lab cameras)
         defaults["--/app/viewport/grid/enabled"] = "--/app/viewport/grid/enabled=false"
 
     # Force CPU physics via Kit setting (prevents PhysX CUDA context creation)
