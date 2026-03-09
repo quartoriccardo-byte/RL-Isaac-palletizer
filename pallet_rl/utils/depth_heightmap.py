@@ -229,8 +229,10 @@ class DepthHeightmapConverter:
         map_h, map_w = self.cfg.map_h, self.cfg.map_w
 
         # Compute grid indices
-        gx = ((x_world - self._crop_x_min) / self._crop_x_range * map_w).long()
-        gy = ((y_world - self._crop_y_min) / self._crop_y_range * map_h).long()
+        gx_raw = ((x_world - self._crop_x_min) / self._crop_x_range * map_w)
+        gy_raw = ((y_world - self._crop_y_min) / self._crop_y_range * map_h)
+        gx = gx_raw.long()
+        gy = gy_raw.long()
 
         # Clamp to valid range
         gx = gx.clamp(0, map_w - 1)
@@ -264,45 +266,61 @@ class DepthHeightmapConverter:
         heightmap = heightmap.reshape(N, map_h, map_w)
 
         # Diagnostics Logging
-        if self.cfg.debug_stats and getattr(self, "_debug_printed_once", False) is False:
-            self._debug_printed_once = True
-            print("\n[HMAP_DEBUG] --- Depth to Heightmap Converter Diagnostics ---")
-            print(f"[HMAP_DEBUG] Input Depth | Shape: {depth.shape}, Dtype: {depth.dtype}, Device: {depth.device}")
-            print(f"[HMAP_DEBUG] Input Depth | Min: {depth_flat.min():.4f}, Max: {depth_flat.max():.4f}, Mean: {depth_flat.mean():.4f}")
+        if self.cfg.debug_stats:
+            print("\n[HMAP_DEBUG2] --- Depth to Heightmap Converter Diagnostics ---")
+            print(f"[HMAP_DEBUG2] Input Depth | Shape: {depth.shape}, Dtype: {depth.dtype}, Device: {depth.device}")
+            print(f"[HMAP_DEBUG2] Input Depth | Min: {depth_flat.min():.4f}, Max: {depth_flat.max():.4f}, Mean: {depth_flat.mean():.4f}")
             
+            print(f"[HMAP_DEBUG2] X_world     | Min: {x_world.min():.4f}, Max: {x_world.max():.4f}, Mean: {x_world.mean():.4f}")
+            print(f"[HMAP_DEBUG2] Y_world     | Min: {y_world.min():.4f}, Max: {y_world.max():.4f}, Mean: {y_world.mean():.4f}")
+
             in_crop_mask = (
                 (x_world >= self._crop_x_min) & (x_world < self._crop_x_max) & 
                 (y_world >= self._crop_y_min) & (y_world < self._crop_y_max)
             )
-            print(f"[HMAP_DEBUG] Crop Valid  | Pixels in bounds: {in_crop_mask.sum().item()} / {in_crop_mask.numel()}")
+            print(f"[HMAP_DEBUG2] Crop Valid  | Pixels in bounds: {in_crop_mask.sum().item()} / {in_crop_mask.numel()}")
             
-            finite_count = torch.isfinite(depth_flat).sum().item()
-            print(f"[HMAP_DEBUG] Finite Px   | {finite_count} / {depth_flat.numel()}")
+            finite_mask = torch.isfinite(depth_flat)
+            print(f"[HMAP_DEBUG2] Finite Px   | {finite_mask.sum().item()} / {depth_flat.numel()}")
             
-            bg_count = bg_mask.sum().item()
-            print(f"[HMAP_DEBUG] Background  | Threshold: >= {bg_thresh:.3f}m | Pixels masked: {bg_count} / {depth_flat.numel()}")
+            print(f"[HMAP_DEBUG2] Background  | Threshold: >= {bg_thresh:.3f}m | Pixels masked: {bg_mask.sum().item()} / {depth_flat.numel()}")
             
-            print(f"[HMAP_DEBUG] Final Valid | Pixels scattered: {valid_flat.sum().item()} / {valid_flat.numel()}")
+            print(f"[HMAP_DEBUG2] Final Valid | valid_flat sum: {valid_flat.sum().item()} / {valid_flat.numel()}")
             
-            print(f"[HMAP_DEBUG] Sensor Z    | {sensor_z[0,0].item():.4f}m")
-            print(f"[HMAP_DEBUG] Z PRE-clamp | Min: {z_world_unclamped.min():.4f}, Max: {z_world_unclamped.max():.4f}, Mean: {z_world_unclamped.mean():.4f}")
+            print(f"[HMAP_DEBUG2] Proj Map X  | gx_raw Min: {gx_raw.min():.1f}, Max: {gx_raw.max():.1f}")
+            print(f"[HMAP_DEBUG2] Proj Map Y  | gy_raw Min: {gy_raw.min():.1f}, Max: {gy_raw.max():.1f}")
             
-            z_neg_ratio = (z_world_unclamped < 0).sum().item() / z_world_unclamped.numel()
-            print(f"[HMAP_DEBUG] Z PRE-clamp | Ratio > 0: {(1.0 - z_neg_ratio)*100:.1f}%")
+            print(f"[HMAP_DEBUG2] Sensor Z    | {sensor_z[0,0].item():.4f}m")
             
-            print(f"[HMAP_DEBUG] Z POST-clamp| Min: {z_world.min():.4f}, Max: {z_world.max():.4f}, Mean: {z_world.mean():.4f}")
+            # Print stats only on valid pixels if any exist
+            if valid_idx.numel() > 0:
+                z_valid = z_world_unclamped.reshape(-1)[valid_idx]
+                print(f"[HMAP_DEBUG2] Z Valid Uncl| Min: {z_valid.min():.4f}, Max: {z_valid.max():.4f}, Mean: {z_valid.mean():.4f}")
+            else:
+                print(f"[HMAP_DEBUG2] Z Valid Uncl| NO VALID PIXELS TO MEASURE")
+
+            print(f"[HMAP_DEBUG2] Z PRE-clamp | Min: {z_world_unclamped.min():.4f}, Max: {z_world_unclamped.max():.4f}, Mean: {z_world_unclamped.mean():.4f}")
             
-            # Assuming worst-case max_height of 3.0m for normalization print
+            z_neg_count = (z_world_unclamped < 0).sum().item()
+            print(f"[HMAP_DEBUG2] Z Negatives | {z_neg_count} pixels clamped to 0.0")
+            print(f"[HMAP_DEBUG2] Z POST-clamp| Min: {z_world.min():.4f}, Max: {z_world.max():.4f}, Mean: {z_world.mean():.4f}")
+            
+            # Scatter stats
+            num_nonzero_hmap = (heightmap > 0).sum().item()
+            if num_nonzero_hmap > 0:
+                print(f"[HMAP_DEBUG2] Scatted Out | Non-zero cells: {num_nonzero_hmap} | Min: {(heightmap[heightmap>0]).min():.4f}, Max: {heightmap.max():.4f}")
+            else:
+                print(f"[HMAP_DEBUG2] Scatted Out | ALL CELLS ARE ZERO")
+                
             agent_norm = heightmap / 3.0 
-            print(f"[HMAP_DEBUG] Agnt Output | Min: {agent_norm.min():.4f}, Max: {agent_norm.max():.4f}, Mean: {agent_norm.mean():.4f}")
-            print("[HMAP_DEBUG] ------------------------------------------------\n")
+            print(f"[HMAP_DEBUG2] Agnt Output | Min: {agent_norm.min():.4f}, Max: {agent_norm.max():.4f}, Mean: {agent_norm.mean():.4f}")
+            print("[HMAP_DEBUG2] ------------------------------------------------\n")
             
-            # Save preclamp debug array
+            # Save preclamp debug array (overwrite or sequence depending on run mode)
             import os
             import numpy as np
             if self.cfg.debug_save_dir:
                 os.makedirs(self.cfg.debug_save_dir, exist_ok=True)
-                # Scatter the pre-clamp values directly for debugging
                 z_flat_unclamped = z_world_unclamped.reshape(-1)
                 hmap_preclamp = torch.zeros(N, map_h * map_w, device=self.device)
                 hmap_preclamp_flat = hmap_preclamp.reshape(-1)
@@ -313,7 +331,7 @@ class DepthHeightmapConverter:
                 hmap_preclamp = hmap_preclamp.reshape(N, map_h, map_w).cpu().numpy()[0]
                 save_path = os.path.join(self.cfg.debug_save_dir, f"hmap_preclamp_{self._step_count:06d}.npy")
                 np.save(save_path, hmap_preclamp.astype(np.float32))
-                print(f"[HMAP_DEBUG] Saved PRE-clamp heightmap tensor to {save_path}")
+                print(f"[HMAP_DEBUG2] Saved PRE-clamp heightmap tensor to {save_path}")
 
         return heightmap
 
