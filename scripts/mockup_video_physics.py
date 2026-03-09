@@ -59,10 +59,10 @@ import os
 import sys
 import time
 
-import cv2
-
-import torch
-from pallet_rl.utils.device_utils import pick_supported_cuda_device
+# NOTE: cv2, torch, and pick_supported_cuda_device are intentionally NOT
+# imported here.  They are deferred until AFTER SimulationApp is created
+# to avoid initialising CUDA contexts and loading heavy native libs
+# before Kit can manage GPU memory.  This is critical for OOM prevention.
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -80,8 +80,8 @@ def parse_args():
     parser.add_argument("--duration_s", type=float, default=20.0)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--enable_cameras", action="store_true", default=True)
-    parser.add_argument("--cam_width", type=int, default=1280)
-    parser.add_argument("--cam_height", type=int, default=720)
+    parser.add_argument("--cam_width", type=int, default=640)
+    parser.add_argument("--cam_height", type=int, default=360)
 
     # box counts & seed
     parser.add_argument("--num_boxes", type=int, default=15)
@@ -117,6 +117,18 @@ def parse_args():
                         help="'kinematic': boxes placed at target "
                              "pose, no physics drop. 'drop' (default): physics-based "
                              "settling after release.")
+
+    # lightweight / memory-saving
+    parser.add_argument("--lightweight", action="store_true", default=False,
+                        help="Ultra-light mode: fewer prims, small floor, "
+                             "reduced lighting. Use for smoke tests and OOM-prone systems.")
+    parser.add_argument("--use_pallet_mesh", action="store_true", default=False,
+                        help="Load the visual pallet STL mesh (disabled by default "
+                             "to save memory).")
+    parser.add_argument("--max_boxes", type=int, default=-1,
+                        help="Override max_boxes (PhysX prim count). "
+                             "Default: num_boxes + 5, capped at 50. "
+                             "Lower values reduce prim/broadphase memory.")
 
     # stacking guardrails
     parser.add_argument("--support_ratio_min", type=float, default=0.6,
@@ -221,6 +233,15 @@ def inject_kit_args(args, unknown):
         "--/rtx/post/dlss/enabled": "--/rtx/post/dlss/enabled=false",
         "--/renderer/multiGpu/enabled": "--/renderer/multiGpu/enabled=false",
         "--/renderer/activeGpu": f"--/renderer/activeGpu={vulkan_idx}",
+        # ── Extra lightweight renderer settings (safe for offscreen) ──
+        "--/rtx/shadows/enabled": "--/rtx/shadows/enabled=false",
+        "--/rtx/directLighting/sampledLighting/enabled": "--/rtx/directLighting/sampledLighting/enabled=false",
+        "--/app/livestream/enabled": "--/app/livestream/enabled=false",
+        "--/rtx/reflections/enabled": "--/rtx/reflections/enabled=false",
+        "--/rtx/indirectDiffuse/enabled": "--/rtx/indirectDiffuse/enabled=false",
+        "--/rtx/translucency/enabled": "--/rtx/translucency/enabled=false",
+        "--/rtx-transient/dlssg/enabled": "--/rtx-transient/dlssg/enabled=false",
+        "--/rtx-transient/dldenoiser/enabled": "--/rtx-transient/dldenoiser/enabled=false",
     }
 
     # Force CPU physics via Kit setting (prevents PhysX CUDA context creation)
@@ -251,17 +272,8 @@ def inject_kit_args(args, unknown):
 
 args, unknown = parse_args()
 
-# ─── Force supported GPU (RTX 6000 vs 1080 Ti) ─────────────────────────
-# pick_supported_cuda_device() selects the correct *CUDA* device for
-# PyTorch tensors.  Kit settings (Vulkan + CUDA ordinals) are handled
-# separately in inject_kit_args().
-_cuda_idx, forced_device = pick_supported_cuda_device()
-args.device = forced_device
-print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {_cuda_idx})")
-if args.physics_device == "cpu":
-    print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX: CPU (no CUDA context)")
-else:
-    print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX CUDA device: 0")
+# NOTE: torch, cv2 and pick_supported_cuda_device are NOT called here.
+# They are deferred until after SimulationApp is created (below).
 
 inject_kit_args(args, unknown)
 
@@ -296,11 +308,27 @@ except Exception as _e:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 3) Now safe to import Isaac Lab, pxr, torch, etc.
+# 3) Now safe to import Isaac Lab, pxr, torch, cv2, etc.
+#    These MUST come after SimulationApp to avoid premature CUDA init.
 # ═══════════════════════════════════════════════════════════════════════
 
+import cv2                # deferred from top-of-file
 import numpy as np
-import torch
+import torch              # deferred from top-of-file
+
+from pallet_rl.utils.device_utils import pick_supported_cuda_device
+
+# ─── Force supported GPU (RTX 6000 vs 1080 Ti) ─────────────────────────
+# pick_supported_cuda_device() selects the correct *CUDA* device for
+# PyTorch tensors.  Kit settings (Vulkan + CUDA ordinals) are handled
+# separately in inject_kit_args().
+_cuda_idx, forced_device = pick_supported_cuda_device()
+args.device = forced_device
+print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {_cuda_idx})")
+if args.physics_device == "cpu":
+    print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX: CPU (no CUDA context)")
+else:
+    print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX CUDA device: 0")
 
 from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf, Gf, UsdGeom
 
@@ -636,8 +664,21 @@ def main():
     print(f"[INFO] max_boxes={cfg.max_boxes} (fixed), num_boxes={cfg.num_boxes} (active)")
     cfg.decimation = 1
 
-    # Enable visual features
-    cfg.use_pallet_mesh_visual = True
+    # ─── Lightweight mode overrides ────────────────────────────────────
+    if args.lightweight:
+        # Reduce max_boxes to save prim/broadphase memory
+        _lw_max = min(args.num_boxes + 2, 20)
+        if args.max_boxes < 0:  # user didn't explicitly set --max_boxes
+            cfg.max_boxes = _lw_max
+        # Shrink floor visual (20×20 → 4×4 m)
+        cfg.floor_size_xy = (4.0, 4.0)
+        print(f"[INFO] Lightweight mode: max_boxes={cfg.max_boxes}, "
+              f"floor={cfg.floor_size_xy}")
+    elif args.max_boxes > 0:
+        cfg.max_boxes = args.max_boxes
+
+    # Enable visual features (pallet mesh OFF by default to save memory)
+    cfg.use_pallet_mesh_visual = args.use_pallet_mesh
     cfg.floor_visual_enabled = True
     cfg.mockup_mode = True
 
