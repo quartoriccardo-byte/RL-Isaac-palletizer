@@ -38,13 +38,10 @@ except ImportError:
     PalletTaskCfg = None
     PalletizerActorCritic = None
 
-# Attempt to import Warp components
-try:
-    from pallet_rl.utils.heightmap_rasterizer import WarpHeightmapGenerator
-    _WARP_AVAILABLE = True
-except ImportError:
-    # Warp not available - this is expected in test environments
-    WarpHeightmapGenerator = None
+# Removed Warp components import block.
+# WarpHeightmapGenerator should only be imported lazily where needed
+# to prevent `import warp as wp` and GPU context initialization 
+# from occurring on simple base package imports.
 
 
 # =============================================================================
@@ -74,5 +71,4 @@ __all__ = [
     "PalletTask",
     "PalletTaskCfg",
     "PalletizerActorCritic",
-    "WarpHeightmapGenerator",
 ]

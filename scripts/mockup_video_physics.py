@@ -82,10 +82,7 @@ def parse_args():
     parser.add_argument("--enable_cameras", action="store_true", default=True)
     parser.add_argument("--cam_width", type=int, default=640)
     parser.add_argument("--cam_height", type=int, default=360)
-    parser.add_argument("--cuda_device", type=str, default="2",
-                        help="CUDA_VISIBLE_DEVICES value. Set to the GPU ordinal "
-                             "of the supported GPU (e.g. '2' for RTX 6000). "
-                             "Hides unsupported GPUs from PyTorch.")
+
 
     # box counts & seed
     parser.add_argument("--num_boxes", type=int, default=15)
@@ -252,6 +249,9 @@ def inject_kit_args(args, unknown):
     if args.headless:
         defaults["--/app/window/enabled"] = "--/app/window/enabled=false"
         defaults["--/app/extensions/registryEnabled"] = "--/app/extensions/registryEnabled=false"
+        # Disable main viewport and grid to save VRAM and UI overhead
+        defaults["--/exts/omni.kit.window.viewport/enabled"] = "--/exts/omni.kit.window.viewport/enabled=false"
+        defaults["--/app/viewport/grid/enabled"] = "--/app/viewport/grid/enabled=false"
 
     # Force CPU physics via Kit setting (prevents PhysX CUDA context creation)
     if args.physics_device == "cpu":
@@ -321,29 +321,19 @@ except Exception as _e:
 #    These MUST come after SimulationApp to avoid premature CUDA init.
 # ═══════════════════════════════════════════════════════════════════════
 
-# ─── Patch 3: Restrict CUDA visibility BEFORE importing torch ──────────
-# Hides unsupported GPUs (e.g. GTX 1080 Ti) from PyTorch to avoid
-# CUDA enumeration warnings and Warp cuDeviceGetUuid mismatches.
-_cuda_vis = args.cuda_device
-os.environ["CUDA_VISIBLE_DEVICES"] = _cuda_vis
-print(f"[INFO] CUDA_VISIBLE_DEVICES={_cuda_vis} (hiding unsupported GPUs)")
-
+# ─── PyTorch Initialization ──────────────────────────────────────────────
 import cv2                # deferred from top-of-file
 import numpy as np
 import torch              # deferred from top-of-file
 
-# With CUDA_VISIBLE_DEVICES set, PyTorch sees only 1 GPU at index 0.
-_torch_gpu_count = torch.cuda.device_count()
-if _torch_gpu_count == 0:
-    raise RuntimeError(
-        f"No CUDA devices visible after CUDA_VISIBLE_DEVICES={_cuda_vis}. "
-        f"Check that the GPU ordinal is correct."
-    )
-_torch_device = "cuda:0"   # always 0 after CUDA_VISIBLE_DEVICES filtering
-torch.cuda.set_device(0)
-args.device = _torch_device
-print(f"[INFO] PyTorch sees {_torch_gpu_count} GPU(s): "
-      f"{torch.cuda.get_device_name(0)} → using {_torch_device}")
+from pallet_rl.utils.device_utils import pick_supported_cuda_device
+
+# DO NOT set CUDA_VISIBLE_DEVICES. It breaks Omniverse startup and Vulkan contexts.
+# We explicitly select the supported GPU device index instead.
+_cuda_idx, forced_device = pick_supported_cuda_device()
+args.device = forced_device
+torch.cuda.set_device(_cuda_idx)
+print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {_cuda_idx})")
 if args.physics_device == "cpu":
     print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX: CPU (no CUDA context)")
 else:
@@ -709,8 +699,7 @@ def main():
     print(f"{'─'*50}")
     print(f"  Subsystem Status")
     print(f"{'─'*50}")
-    print(f"  CUDA visibility     : CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}")
-    print(f"  PyTorch GPU         : {torch.cuda.get_device_name(0)} (cuda:0)")
+    print(f"  PyTorch GPU         : {torch.cuda.get_device_name(torch.cuda.current_device())} ({device})")
     print(f"  Warp backend        : SKIPPED (mockup_mode)")
     print(f"  Depth converter     : {'active' if _needs_depth else 'SKIPPED (rgb mode)'}")
     print(f"  Pallet mesh visual  : {'active' if cfg.use_pallet_mesh_visual else 'SKIPPED'}")
