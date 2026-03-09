@@ -266,9 +266,6 @@ def inject_kit_args(args, unknown):
     exclusions = []
     if args.exclude_isaaclab_tasks:
         exclusions.append('isaaclab_tasks')
-    if args.headless and args.record_mode == "rgb":
-        # Aggressively strip heavy systems not needed for simple bare-metal RGB renders
-        exclusions.extend(['omni.replicator.core', 'omni.warp.core', 'omni.warp.ui'])
 
     for ext in exclusions:
         exclusion_idx = 0
