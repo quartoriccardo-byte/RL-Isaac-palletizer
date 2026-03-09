@@ -266,6 +266,11 @@ def inject_kit_args(args, unknown):
     exclusions = []
     if args.exclude_isaaclab_tasks:
         exclusions.append('isaaclab_tasks')
+    if args.headless and args.record_mode == "rgb":
+        # Strip heavy systems not needed for simple bare-metal RGB renders.
+        # Note: omni.replicator.core is intentionally NOT excluded here because 
+        # Isaac Lab's SimulationContext inherently requires omni.kit.viewport.utility.
+        exclusions.extend(['omni.warp.core', 'omni.warp.ui'])
 
     for ext in exclusions:
         exclusion_idx = 0
@@ -765,13 +770,22 @@ def main():
             _py = 100.0 + (_j // _cols_inact) * 2.0
         _pz = -5.0
 
-        _st = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
-        _st[0, 0, 0] = _px
-        _st[0, 0, 1] = _py
-        _st[0, 0, 2] = _pz
-        _st[0, 0, 3] = 1.0   # qw (identity)
         _obj_ids = torch.tensor([_pi], dtype=torch.long, device=device)
-        boxes.write_object_state_to_sim(_st, _env_ids_pre, _obj_ids)
+
+        if placement_mode == "kinematic":
+            _pose = torch.zeros(1, 1, 7, dtype=torch.float32, device=device)
+            _pose[0, 0, 0] = _px
+            _pose[0, 0, 1] = _py
+            _pose[0, 0, 2] = _pz
+            _pose[0, 0, 3] = 1.0   # qw
+            boxes.write_object_pose_to_sim(_pose, _env_ids_pre, _obj_ids)
+        else:
+            _st = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
+            _st[0, 0, 0] = _px
+            _st[0, 0, 1] = _py
+            _st[0, 0, 2] = _pz
+            _st[0, 0, 3] = 1.0   # qw
+            boxes.write_object_state_to_sim(_st, _env_ids_pre, _obj_ids)
 
     # FIX(E): Flush parking writes into PhysX with one sim step
     env.sim.step()
@@ -1011,19 +1025,26 @@ def main():
         cy = math.cos(0.5 * yaw_rad)
         sy = math.sin(0.5 * yaw_rad)
 
-        # State: [pos(3), quat_wxyz(4), lin_vel(3), ang_vel(3)] = 13
-        state = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
-        state[0, 0, 0] = px
-        state[0, 0, 1] = py
-        state[0, 0, 2] = pz
-        state[0, 0, 3] = cy   # qw
-        state[0, 0, 4] = 0.0  # qx
-        state[0, 0, 5] = 0.0  # qy
-        state[0, 0, 6] = sy   # qz
-        # lin_vel and ang_vel are already zero
-
         object_ids = torch.tensor([idx], dtype=torch.long, device=device)
-        boxes.write_object_state_to_sim(state, _env_ids_0, object_ids)
+
+        if placement_mode == "kinematic":
+            pose = torch.zeros(1, 1, 7, dtype=torch.float32, device=device)
+            pose[0, 0, 0] = px
+            pose[0, 0, 1] = py
+            pose[0, 0, 2] = pz
+            pose[0, 0, 3] = cy   # qw
+            pose[0, 0, 6] = sy   # qz
+            boxes.write_object_pose_to_sim(pose, _env_ids_0, object_ids)
+        else:
+            # State: [pos(3), quat_wxyz(4), lin_vel(3), ang_vel(3)] = 13
+            state = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
+            state[0, 0, 0] = px
+            state[0, 0, 1] = py
+            state[0, 0, 2] = pz
+            state[0, 0, 3] = cy   # qw
+            state[0, 0, 6] = sy   # qz
+            # lin_vel and ang_vel are already zero
+            boxes.write_object_state_to_sim(state, _env_ids_0, object_ids)
 
         # --debug_box_sync: readback verification after every write
         if args.debug_box_sync:
@@ -1062,13 +1083,22 @@ def main():
         cur_pos = boxes.data.object_pos_w[0, idx]    # (3,)
         cur_quat = boxes.data.object_quat_w[0, idx]  # (4,) wxyz
 
-        state = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
-        state[0, 0, :3] = cur_pos
-        state[0, 0, 3:7] = cur_quat
-        # vel fields are already zero
-
         object_ids = torch.tensor([idx], dtype=torch.long, device=device)
-        boxes.write_object_state_to_sim(state, _env_ids_0, object_ids)
+
+        if placement_mode == "kinematic":
+            # Kinematic bodies cannot accept velocity updates cleanly in PhysX 5.
+            # Only update their pose (transform) to avoid Error 114 / 115.
+            pose = torch.zeros(1, 1, 7, dtype=torch.float32, device=device)
+            pose[0, 0, :3] = cur_pos
+            pose[0, 0, 3:7] = cur_quat
+            boxes.write_object_pose_to_sim(pose, _env_ids_0, object_ids)
+        else:
+            # Dynamic bodies require full state reset to dump momentum.
+            state = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
+            state[0, 0, :3] = cur_pos
+            state[0, 0, 3:7] = cur_quat
+            # vel fields are already zero
+            boxes.write_object_state_to_sim(state, _env_ids_0, object_ids)
 
     def get_box_pos(idx: int) -> np.ndarray:
         """Read current position of box `idx`."""
