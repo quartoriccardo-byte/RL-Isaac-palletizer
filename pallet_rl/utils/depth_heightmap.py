@@ -48,6 +48,10 @@ class DepthHeightmapCfg:
     noise_quantization_m: float = 0.002
     noise_dropout_prob: float = 0.001
 
+    # Diagnostics
+    debug_stats: bool = False
+    debug_save_dir: str = ""
+
 
 class DepthHeightmapConverter:
     """
@@ -176,34 +180,50 @@ class DepthHeightmapConverter:
         # 1. Apply noise
         depth = self.apply_noise(depth)
 
-        # 2. Unproject to camera-frame 3D points
+        # 2. Unproject X and Y to world
+        # For a top-down camera (looking along -Z), distance_to_image_plane 
+        # is the exact projection along the optical axis.
+        # Thus, absolute physical height = sensor_Z - depth.
         depth_flat = depth.reshape(N, -1)  # (N, H*W)
 
-        # Camera-frame coordinates: (N, H*W, 3)
+        # We keep the ray unprojection for X, Y just in case of minor offsets/rotation.
+        # In USD convention, camera looks down -Z. X is right, Y is up in viewport.
         pts_cam = torch.stack([
-            self._ray_x.unsqueeze(0).expand(N, -1) * depth_flat,  # X
-            self._ray_y.unsqueeze(0).expand(N, -1) * depth_flat,  # Y
-            depth_flat,                                             # Z (forward)
-        ], dim=-1)  # (N, H*W, 3)
+            self._ray_x.unsqueeze(0).expand(N, -1) * depth_flat,  
+            self._ray_y.unsqueeze(0).expand(N, -1) * depth_flat,  
+            -depth_flat,                                            
+        ], dim=-1)
 
-        # 3. Transform to world frame
-        R = self._quat_to_rotation_matrix(cam_quat_wxyz)  # (N, 3, 3)
-        # pts_world = R @ pts_cam^T + cam_pos
-        pts_world = torch.bmm(pts_cam, R.transpose(1, 2))  # (N, H*W, 3)
-        pts_world = pts_world + cam_pos.unsqueeze(1)  # broadcast add
+        R = self._quat_to_rotation_matrix(cam_quat_wxyz)
+        pts_world = torch.bmm(pts_cam, R.transpose(1, 2)) + cam_pos.unsqueeze(1)
 
-        # 4. Filter by crop bounds and valid depth
-        x_world = pts_world[:, :, 0]  # (N, H*W)
+        x_world = pts_world[:, :, 0]
         y_world = pts_world[:, :, 1]
-        z_world = pts_world[:, :, 2]
+        
+        # FIX: The camera optical axis is perfectly parallel to World Z. 
+        # Relying on R matrix and `pts_cam` sign conventions has proven brittle.
+        # Direct calculation is robust and exactly physically correct:
+        sensor_z = cam_pos[:, 2].unsqueeze(1)  # (N, 1)
+        z_world_unclamped = sensor_z - depth_flat
+        
+        # Explicit background masking: 
+        # Depths close to sensor_z correspond to the floor/background (height ~ 0)
+        # We enforce a hard cutoff to avoid considering noisy far-plane as real objects.
+        bg_thresh = self.cfg.sensor_height_m - 0.005
+        bg_mask = (depth_flat >= bg_thresh)
+
+        # Clamp heights strictly below 0 (underground) up to 0. 
+        # This occurs on the floor due to noise or interpolation.
+        z_world = torch.clamp(z_world_unclamped, min=0.0)
 
         valid = (
-            (depth_flat > 0.01)  # discard dropout / invalid readings
+            (depth_flat > 0.01)       # discard dropout/invalid
+            & (~bg_mask)              # discard empty background / floor
             & (x_world >= self._crop_x_min)
             & (x_world < self._crop_x_max)
             & (y_world >= self._crop_y_min)
             & (y_world < self._crop_y_max)
-        )  # (N, H*W) bool
+        )
 
         # 5. Rasterize: scatter max into grid cells
         map_h, map_w = self.cfg.map_h, self.cfg.map_w
@@ -243,25 +263,57 @@ class DepthHeightmapConverter:
 
         heightmap = heightmap.reshape(N, map_h, map_w)
 
-        # -------------------------------------------------------------------
-        # TEMPORARY DEBUG LOGGING FOR THE FIRST FRAME
-        # -------------------------------------------------------------------
-        if getattr(self, "_debug_printed_once", False) is False:
+        # Diagnostics Logging
+        if self.cfg.debug_stats and getattr(self, "_debug_printed_once", False) is False:
             self._debug_printed_once = True
-            print("\n[DEBUG DEPTH CONVERTER] First frame diagnostics:")
-            print(f"  Depth input  | min: {depth_flat.min():.3f}, max: {depth_flat.max():.3f}, mean: {depth_flat.mean():.3f}")
-            print(f"  X_world      | min: {x_world.min():.3f}, max: {x_world.max():.3f}, mean: {x_world.mean():.3f}")
-            print(f"  Y_world      | min: {y_world.min():.3f}, max: {y_world.max():.3f}, mean: {y_world.mean():.3f}")
-            print(f"  Z_world (ht) | min: {z_world.min():.3f}, max: {z_world.max():.3f}, mean: {z_world.mean():.3f}")
+            print("\n[HMAP_DEBUG] --- Depth to Heightmap Converter Diagnostics ---")
+            print(f"[HMAP_DEBUG] Input Depth | Shape: {depth.shape}, Dtype: {depth.dtype}, Device: {depth.device}")
+            print(f"[HMAP_DEBUG] Input Depth | Min: {depth_flat.min():.4f}, Max: {depth_flat.max():.4f}, Mean: {depth_flat.mean():.4f}")
             
-            z_neg_count = (z_world < 0).sum().item()
-            print(f"  Negative heights: {z_neg_count} / {z_world.numel()}")
+            in_crop_mask = (
+                (x_world >= self._crop_x_min) & (x_world < self._crop_x_max) & 
+                (y_world >= self._crop_y_min) & (y_world < self._crop_y_max)
+            )
+            print(f"[HMAP_DEBUG] Crop Valid  | Pixels in bounds: {in_crop_mask.sum().item()} / {in_crop_mask.numel()}")
             
-            valid_count = valid_flat.sum().item()
-            print(f"  Valid pixels (in crop): {valid_count} / {valid_flat.numel()}")
+            finite_count = torch.isfinite(depth_flat).sum().item()
+            print(f"[HMAP_DEBUG] Finite Px   | {finite_count} / {depth_flat.numel()}")
             
-            print(f"  Final Height | min: {heightmap.min():.3f}, max: {heightmap.max():.3f}")
-            print("[DEBUG DEPTH CONVERTER] End of diagnostics.\n")
+            bg_count = bg_mask.sum().item()
+            print(f"[HMAP_DEBUG] Background  | Threshold: >= {bg_thresh:.3f}m | Pixels masked: {bg_count} / {depth_flat.numel()}")
+            
+            print(f"[HMAP_DEBUG] Final Valid | Pixels scattered: {valid_flat.sum().item()} / {valid_flat.numel()}")
+            
+            print(f"[HMAP_DEBUG] Sensor Z    | {sensor_z[0,0].item():.4f}m")
+            print(f"[HMAP_DEBUG] Z PRE-clamp | Min: {z_world_unclamped.min():.4f}, Max: {z_world_unclamped.max():.4f}, Mean: {z_world_unclamped.mean():.4f}")
+            
+            z_neg_ratio = (z_world_unclamped < 0).sum().item() / z_world_unclamped.numel()
+            print(f"[HMAP_DEBUG] Z PRE-clamp | Ratio > 0: {(1.0 - z_neg_ratio)*100:.1f}%")
+            
+            print(f"[HMAP_DEBUG] Z POST-clamp| Min: {z_world.min():.4f}, Max: {z_world.max():.4f}, Mean: {z_world.mean():.4f}")
+            
+            # Assuming worst-case max_height of 3.0m for normalization print
+            agent_norm = heightmap / 3.0 
+            print(f"[HMAP_DEBUG] Agnt Output | Min: {agent_norm.min():.4f}, Max: {agent_norm.max():.4f}, Mean: {agent_norm.mean():.4f}")
+            print("[HMAP_DEBUG] ------------------------------------------------\n")
+            
+            # Save preclamp debug array
+            import os
+            import numpy as np
+            if self.cfg.debug_save_dir:
+                os.makedirs(self.cfg.debug_save_dir, exist_ok=True)
+                # Scatter the pre-clamp values directly for debugging
+                z_flat_unclamped = z_world_unclamped.reshape(-1)
+                hmap_preclamp = torch.zeros(N, map_h * map_w, device=self.device)
+                hmap_preclamp_flat = hmap_preclamp.reshape(-1)
+                if valid_idx.numel() > 0:
+                    hmap_preclamp_flat.scatter_reduce_(
+                        0, global_cell[valid_idx], z_flat_unclamped[valid_idx], reduce="amax", include_self=True
+                    )
+                hmap_preclamp = hmap_preclamp.reshape(N, map_h, map_w).cpu().numpy()[0]
+                save_path = os.path.join(self.cfg.debug_save_dir, f"hmap_preclamp_{self._step_count:06d}.npy")
+                np.save(save_path, hmap_preclamp.astype(np.float32))
+                print(f"[HMAP_DEBUG] Saved PRE-clamp heightmap tensor to {save_path}")
 
         return heightmap
 

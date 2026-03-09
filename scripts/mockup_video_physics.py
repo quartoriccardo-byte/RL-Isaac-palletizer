@@ -168,7 +168,9 @@ def parse_args():
     parser.add_argument("--save_heightmap_raw", action="store_true",
                         help="Save raw heightmap frames as .npy at diagnostic interval")
     parser.add_argument("--save_heightmap_agent", action="store_true",
-                        help="Save normalized agent-input heightmap frames as .npy at diagnostic interval")
+                        help="Save the normalized 0-1 heightmap input seen by the agent.")
+    parser.add_argument("--debug_heightmap_converter", action="store_true",
+                        help="Enable verbose diagnostics for depth->heightmap conversion")
     parser.add_argument("--save_depth_vis", action="store_true",
                         help="Save depth visualization PNGs at diagnostic interval")
     parser.add_argument("--save_heightmap_vis", action="store_true",
@@ -236,7 +238,7 @@ def inject_kit_args(args, unknown):
         "--/renderer/activeGpu": f"--/renderer/activeGpu={vulkan_idx}",
         # ── Extra lightweight renderer settings (safe for offscreen) ──
         "--/rtx/shadows/enabled": "--/rtx/shadows/enabled=false",
-        "--/rtx/directLighting/sampledLighting/enabled": "--/rtx/directLighting/sampledLighting/enabled=false",
+        "--/rtx/directLighting/sampledLighting/enabled": "--/rtx/directLighting/sampledLighting=false",
         "--/app/livestream/enabled": "--/app/livestream/enabled=false",
         "--/rtx/reflections/enabled": "--/rtx/reflections/enabled=false",
         "--/rtx/indirectDiffuse/enabled": "--/rtx/indirectDiffuse/enabled=false",
@@ -886,6 +888,16 @@ def main():
             noise_quantization_m=cfg.depth_noise_quantization_m,
             noise_dropout_prob=cfg.depth_noise_dropout_prob,
         )
+        depth_hmap_cfg.debug_stats = args.debug_heightmap_converter
+        if args.debug_heightmap_converter:
+            # Determine diag_dir for saving debug outputs
+            diag_dir = args.diag_dir
+            if not diag_dir:
+                output_base, _ = os.path.splitext(args.output_path)
+                diag_dir = f"{output_base}_diagnostics"
+            depth_hmap_cfg.debug_save_dir = diag_dir
+            print(f"[INFO] DepthHeightmapConverter: debug_stats ENABLED, saving to {diag_dir}")
+
         hmap_converter = DepthHeightmapConverter(depth_hmap_cfg, device=device)
         print(f"[INFO] Heightmap converter created (noise_enable={_noise_on})")
 
