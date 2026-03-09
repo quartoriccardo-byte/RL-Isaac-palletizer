@@ -301,18 +301,28 @@ inject_kit_args(args, unknown)
 
 from isaaclab.app import AppLauncher
 
-# FIX C: Intercept AppLauncher's blind SYS.ARGV.APPEND to stop contradictory flags
-_old_append = sys.argv.append
-def _clean_append(val):
-    if val.startswith("--/physics/cudaDevice") and args.physics_device == "cpu":
-        return # SWALLOW: AppLauncher guesses 0, but we explicitly want CPU
-    if val.startswith("--/renderer/activeGpu"):
-        return # SWALLOW: AppLauncher guesses 0, but we already injected our valid activeGpu in inject_kit_args
-    _old_append(val)
+# FIX C: Intercept AppLauncher's blind sys.argv.append to stop contradictory flags
+# sys.argv is a built-in list, so we cannot monkeypatch .append directly.
+# Instead, we construct a custom list subclass and temporarily replace sys.argv.
 
-sys.argv.append = _clean_append
+class CleanArgvList(list):
+    def append(self, val):
+        if isinstance(val, str):
+            if val.startswith("--/physics/cudaDevice") and args.physics_device == "cpu":
+                return  # SWALLOW: AppLauncher guesses 0, but we explicitly want CPU
+            if val.startswith("--/renderer/activeGpu"):
+                return  # SWALLOW: AppLauncher guesses 0, but we already injected our valid activeGpu
+        super().append(val)
+
+_old_argv = sys.argv
+sys.argv = CleanArgvList(_old_argv)
+
 app_launcher = AppLauncher(args)
-sys.argv.append = _old_append
+
+# Restore the original list type but keep the cleaned contents
+sys.argv = _old_argv
+sys.argv.clear()
+sys.argv.extend(app_launcher.app.get_app_filename() if hasattr(app_launcher.app, 'get_app_filename') else sys.argv) # IsaacLab internals typically don't strictly need sys.argv later, but we restore type safety.
 
 simulation_app = app_launcher.app
 # End FIX C interceptor. No post-launch carb overrides are needed anymore.
