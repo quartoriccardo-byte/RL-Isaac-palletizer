@@ -161,6 +161,8 @@ class DepthHeightmapConverter:
         depth: torch.Tensor,
         cam_pos: torch.Tensor,
         cam_quat_wxyz: torch.Tensor,
+        frame_idx: int = -1,
+        save_debug: bool = False,
     ) -> torch.Tensor:
         """
         Convert depth images to heightmap grids.
@@ -260,9 +262,9 @@ class DepthHeightmapConverter:
         heightmap = heightmap.reshape(N, map_h, map_w)
 
         # Diagnostics Logging
-        if self.cfg.debug_stats:
+        if self.cfg.debug_stats and save_debug:
             print("\n[HMAP_DEBUG2] --- Depth to Heightmap Converter Diagnostics ---")
-            print(f"[HMAP_DEBUG2] Input Depth | Shape: {depth.shape}, Dtype: {depth.dtype}, Device: {depth.device}")
+            print(f"[HMAP_DEBUG2] Frame {frame_idx} | Input Depth | Shape: {depth.shape}, Dtype: {depth.dtype}, Device: {depth.device}")
             print(f"[HMAP_DEBUG2] Input Depth | Min: {depth_flat.min():.4f}, Max: {depth_flat.max():.4f}, Mean: {depth_flat.mean():.4f}")
             
             print(f"[HMAP_DEBUG2] X_world     | Min: {x_world.min():.4f}, Max: {x_world.max():.4f}, Mean: {x_world.mean():.4f}")
@@ -306,8 +308,6 @@ class DepthHeightmapConverter:
             else:
                 print(f"[HMAP_DEBUG2] Scatted Out | ALL CELLS ARE ZERO")
                 
-            agent_norm = heightmap / 3.0 
-            print(f"[HMAP_DEBUG2] Agnt Output | Min: {agent_norm.min():.4f}, Max: {agent_norm.max():.4f}, Mean: {agent_norm.mean():.4f}")
             print("[HMAP_DEBUG2] ------------------------------------------------\n")
             
             # Save preclamp debug array (overwrite or sequence depending on run mode)
@@ -323,7 +323,8 @@ class DepthHeightmapConverter:
                         0, global_cell[valid_idx], z_flat_unclamped[valid_idx], reduce="amax", include_self=True
                     )
                 hmap_preclamp = hmap_preclamp.reshape(N, map_h, map_w).cpu().numpy()[0]
-                save_path = os.path.join(self.cfg.debug_save_dir, f"hmap_preclamp_{self._step_count:06d}.npy")
+                save_idx = frame_idx if frame_idx >= 0 else self._step_count
+                save_path = os.path.join(self.cfg.debug_save_dir, f"hmap_preclamp_{save_idx:06d}.npy")
                 np.save(save_path, hmap_preclamp.astype(np.float32))
                 print(f"[HMAP_DEBUG2] Saved PRE-clamp heightmap tensor to {save_path}")
 

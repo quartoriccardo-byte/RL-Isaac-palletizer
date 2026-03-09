@@ -1234,7 +1234,11 @@ def main():
             diag_logger.debug(f"Frame {depth_frame_idx:05d} | Cam Pos (world): ({_cx:.3f}, {_cy:.3f}, {_cz:.3f})")
 
         # Depth → heightmap via converter
-        hmap_t = hmap_converter.depth_to_heightmap(depth_t, cam_pos, cam_quat)
+        hmap_t = hmap_converter.depth_to_heightmap(
+            depth_t, cam_pos, cam_quat,
+            frame_idx=depth_frame_idx,
+            save_debug=is_diag_tick
+        )
         
         # Heightmap diagnostics
         if is_diag_tick and diag_logger:
@@ -1272,14 +1276,23 @@ def main():
                 np.save(os.path.join(raw_depth_dir, f"depth_{depth_frame_idx:06d}.npy"), depth_np.astype(np.float32))
             if raw_hmap_dir:
                 np.save(os.path.join(raw_hmap_dir, f"hmap_raw_{depth_frame_idx:06d}.npy"), hmap_np.astype(np.float32))
+            
+            agent_hmap = None
             if agent_hmap_dir:
                 # Apply the exact normalization function used by observation_builder.py
                 agent_hmap = hmap_np / cfg.max_height
                 np.save(os.path.join(agent_hmap_dir, f"hmap_agent_{depth_frame_idx:06d}.npy"), agent_hmap.astype(np.float32))
+            
             if vis_depth_dir:
                 cv2.imwrite(os.path.join(vis_depth_dir, f"depth_vis_{depth_frame_idx:06d}.png"), depth_bgr)
             if vis_hmap_dir:
                 cv2.imwrite(os.path.join(vis_hmap_dir, f"hmap_vis_{depth_frame_idx:06d}.png"), hmap_bgr)
+                
+            # Compact Frame-Level Diagnostic
+            _d_valid = depth_np[np.isfinite(depth_np)]
+            _depth_mean = float(_d_valid.mean()) if _d_valid.size > 0 else 0.0
+            _agent_max = float(agent_hmap.max()) if agent_hmap is not None else 0.0
+            print(f"[DIAG_COMPACT] Frame: {depth_frame_idx:05d} | Placed: {len(placed_boxes)} | Depth Mean: {_depth_mean:.3f}m | HMap Raw NonZero: {_valid_h_count} | HMap Agent Max: {_agent_max:.3f}")
 
         depth_frame_idx += 1
         
