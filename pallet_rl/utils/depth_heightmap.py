@@ -181,30 +181,24 @@ class DepthHeightmapConverter:
         depth = self.apply_noise(depth)
 
         # 2. Unproject X and Y to world
-        # For a top-down camera (looking along -Z), distance_to_image_plane 
-        # is the exact projection along the optical axis.
-        # Thus, absolute physical height = sensor_Z - depth.
+        # For a top-down camera (looking along -Z):
+        # - The camera's local Z axis points straight down into the ground.
+        # - Depth is distance *along* this Z axis.
+        # - Camera local X maps to World X.
+        # - Camera local Y (down in image) maps to World -Y (up on pallet).
         depth_flat = depth.reshape(N, -1)  # (N, H*W)
 
-        # We keep the ray unprojection for X, Y just in case of minor offsets/rotation.
-        # In USD convention, camera looks down -Z. X is right, Y is up in viewport.
-        pts_cam = torch.stack([
-            self._ray_x.unsqueeze(0).expand(N, -1) * depth_flat,  
-            self._ray_y.unsqueeze(0).expand(N, -1) * depth_flat,  
-            -depth_flat,                                            
-        ], dim=-1)
-
-        R = self._quat_to_rotation_matrix(cam_quat_wxyz)
-        pts_world = torch.bmm(pts_cam, R.transpose(1, 2)) + cam_pos.unsqueeze(1)
-
-        x_world = pts_world[:, :, 0]
-        y_world = pts_world[:, :, 1]
+        # Directly compute World X and Y from image-plane rays, 
+        # scaled by depth to find intersection points.
+        # OpenCV -> World mapping: 
+        #   World X = Camera X 
+        #   World Y = -Camera Y
+        x_world = self._ray_x.unsqueeze(0).expand(N, -1) * depth_flat
+        y_world = -self._ray_y.unsqueeze(0).expand(N, -1) * depth_flat
         
-        # FIX: The camera optical axis is perfectly parallel to World Z. 
-        # Relying on R matrix and `pts_cam` sign conventions has proven brittle.
-        # Direct calculation is robust and exactly physically correct:
-        sensor_z = cam_pos[:, 2].unsqueeze(1)  # (N, 1)
-        z_world_unclamped = sensor_z - depth_flat
+        # Absolute physical height relies solely on configured altitude 
+        sensor_height = self.cfg.sensor_height_m
+        z_world_unclamped = sensor_height - depth_flat
         
         # Explicit background masking: 
         # Depths close to sensor_z correspond to the floor/background (height ~ 0)
@@ -290,7 +284,7 @@ class DepthHeightmapConverter:
             print(f"[HMAP_DEBUG2] Proj Map X  | gx_raw Min: {gx_raw.min():.1f}, Max: {gx_raw.max():.1f}")
             print(f"[HMAP_DEBUG2] Proj Map Y  | gy_raw Min: {gy_raw.min():.1f}, Max: {gy_raw.max():.1f}")
             
-            print(f"[HMAP_DEBUG2] Sensor Z    | {sensor_z[0,0].item():.4f}m")
+            print(f"[HMAP_DEBUG2] Sensor Z    | {sensor_height:.4f}m configured")
             
             # Print stats only on valid pixels if any exist
             if valid_idx.numel() > 0:
