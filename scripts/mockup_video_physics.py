@@ -35,12 +35,13 @@ Run:
   ~/isaac-sim/python.sh scripts/mockup_video_physics.py \\
       --headless --output_path runs/both.mp4 --record_mode both
 
-Three recording modes (--record_mode):
+Four recording modes (--record_mode):
 
   rgb (default)     - Cinematic oblique RGB camera (unchanged behaviour).
   heightmap         - Agent's top-down heightmap (depth camera -> heightmap
                       in meters -> colormap). Noise disabled by default.
   both              - Side-by-side: RGB left, heightmap right.
+  diagnostic        - Composite video + optional raw tensor / vis dumps.
 
 CLI knobs:
   --record_mode, --hmap_vmin, --hmap_vmax, --hmap_colormap, --hmap_invert,
@@ -159,6 +160,18 @@ def parse_args():
                         help="Save depth visualization PNGs at diagnostic interval")
     parser.add_argument("--save_heightmap_vis", action="store_true",
                         help="Save heightmap visualization PNGs at diagnostic interval")
+
+    # ── heightmap visualization ──────────────────────────────────────
+    parser.add_argument("--hmap_vmin", type=float, default=0.0,
+                        help="Minimum height for heightmap colormap (m)")
+    parser.add_argument("--hmap_vmax", type=float, default=-1.0,
+                        help="Maximum height for heightmap colormap (m). -1 means auto (cfg.max_height)")
+    parser.add_argument("--hmap_colormap", type=str, default="inferno",
+                        help="Colormap for heightmap visualization (e.g. inferno, jet, viridis)")
+    parser.add_argument("--hmap_invert", action="store_true", default=False,
+                        help="Invert heightmap colormap")
+    parser.add_argument("--enable_depth_noise", action="store_true", default=False,
+                        help="Enable depth camera noise for heightmap generation")
 
     # ── debug: box sync verification ──────────────────────────────────
     parser.add_argument("--debug_box_sync", action="store_true", default=False,
@@ -555,27 +568,35 @@ def main():
     placement_mode = args.placement_mode
 
     print(f"\n{'='*60}")
-    print(f"  Palletiser Mockup Video — {placement_mode.upper()} Mode")
+    print(f"  Palletiser Mockup Video Configuration")
     print(f"{'='*60}")
-    print(f"  Output:       {args.output_path}")
-    print(f"  FPS:          {args.fps}")
-    print(f"  Duration:     {args.duration_s}s")
-    print(f"  Boxes:        {args.num_boxes}")
-    print(f"  Seed:         {args.seed}")
-    print(f"  Placement:    {placement_mode}")
-    print(f"  Substeps:     {args.sim_substeps}")
+    print(f"  Record mode:   {args.record_mode}")
+    print(f"  Placement:     {placement_mode}")
+    print(f"  Output video:  {args.output_path}")
+    if args.record_mode == "diagnostic":
+        _diag_dir_display = args.diag_dir if args.diag_dir else "<output_path>_diagnostics"
+        print(f"  Diag root:     {_diag_dir_display}")
+    print(f"  Duration:      {args.duration_s}s at {args.fps} FPS ({int(args.duration_s * args.fps)} frames)")
+    print(f"  Boxes:         {args.num_boxes}")
+    print(f"  Seed:          {args.seed}")
+    print(f"  Sim substeps:  {args.sim_substeps}")
     if placement_mode == "drop":
-        print(f"  Lower speed:  {args.lower_speed} m/s")
-        print(f"  Release gap:  {args.release_clearance} m")
-        print(f"  Settle time:  {args.settle_s} s")
-        print(f"  Freeze:       {args.freeze_after_settle}")
-    print(f"  Debug:        {args.debug}")
-    print(f"  Record mode:  {args.record_mode}")
-    if args.record_mode in ("heightmap", "both"):
+        print(f"  Drop params:   speed={args.lower_speed}m/s, gap={args.release_clearance}m, settle={args.settle_s}s, freeze={args.freeze_after_settle}")
+    print(f"  Debug mode:    {args.debug}")
+    
+    _needs_depth = args.record_mode in ("heightmap", "both", "diagnostic")
+    print(f"  Depth active:  {_needs_depth}")
+    if _needs_depth:
         _v = args.hmap_vmax if args.hmap_vmax > 0 else "auto"
-        print(f"  Hmap range:   [{args.hmap_vmin}, {_v}] m")
-        print(f"  Hmap cmap:    {args.hmap_colormap}")
-        print(f"  Noise off:    {not args.enable_depth_noise}")
+        print(f"  Hmap vis:      range=[{args.hmap_vmin}, {_v}]m, cmap={args.hmap_colormap}, invert={args.hmap_invert}")
+        print(f"  Depth noise:   {args.enable_depth_noise}")
+        print(f"  Hmap converter: local DepthHeightmapConverter")
+        if args.record_mode == "diagnostic":
+            print(f"  Diag interval: {args.diag_every_n_frames} frames")
+            print(f"    Raw depth:   {args.save_depth_raw}")
+            print(f"    Raw hmap:    {args.save_heightmap_raw} (meters)")
+            print(f"    Agent hmap:  {args.save_heightmap_agent} (normalized)")
+            print(f"    Vis frames:  depth={args.save_depth_vis}, hmap={args.save_heightmap_vis}, composite={args.save_diag_frames}")
     print(f"{'='*60}\n")
 
     # ─── Environment config ───────────────────────────────────────────
