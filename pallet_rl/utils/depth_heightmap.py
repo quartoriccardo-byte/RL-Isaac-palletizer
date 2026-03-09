@@ -243,6 +243,26 @@ class DepthHeightmapConverter:
 
         heightmap = heightmap.reshape(N, map_h, map_w)
 
+        # -------------------------------------------------------------------
+        # TEMPORARY DEBUG LOGGING FOR THE FIRST FRAME
+        # -------------------------------------------------------------------
+        if getattr(self, "_debug_printed_once", False) is False:
+            self._debug_printed_once = True
+            print("\n[DEBUG DEPTH CONVERTER] First frame diagnostics:")
+            print(f"  Depth input  | min: {depth_flat.min():.3f}, max: {depth_flat.max():.3f}, mean: {depth_flat.mean():.3f}")
+            print(f"  X_world      | min: {x_world.min():.3f}, max: {x_world.max():.3f}, mean: {x_world.mean():.3f}")
+            print(f"  Y_world      | min: {y_world.min():.3f}, max: {y_world.max():.3f}, mean: {y_world.mean():.3f}")
+            print(f"  Z_world (ht) | min: {z_world.min():.3f}, max: {z_world.max():.3f}, mean: {z_world.mean():.3f}")
+            
+            z_neg_count = (z_world < 0).sum().item()
+            print(f"  Negative heights: {z_neg_count} / {z_world.numel()}")
+            
+            valid_count = valid_flat.sum().item()
+            print(f"  Valid pixels (in crop): {valid_count} / {valid_flat.numel()}")
+            
+            print(f"  Final Height | min: {heightmap.min():.3f}, max: {heightmap.max():.3f}")
+            print("[DEBUG DEPTH CONVERTER] End of diagnostics.\n")
+
         return heightmap
 
     def __call__(
