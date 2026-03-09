@@ -153,6 +153,8 @@ def parse_args():
                         help="Save raw depth frames as .npy at diagnostic interval")
     parser.add_argument("--save_heightmap_raw", action="store_true",
                         help="Save raw heightmap frames as .npy at diagnostic interval")
+    parser.add_argument("--save_heightmap_agent", action="store_true",
+                        help="Save normalized agent-input heightmap frames as .npy at diagnostic interval")
     parser.add_argument("--save_depth_vis", action="store_true",
                         help="Save depth visualization PNGs at diagnostic interval")
     parser.add_argument("--save_heightmap_vis", action="store_true",
@@ -1017,6 +1019,11 @@ def main():
         raw_hmap_dir = os.path.join(diag_dir, "heightmap_raw")
         os.makedirs(raw_hmap_dir, exist_ok=True)
         
+    agent_hmap_dir: str | None = None
+    if needs_depth and getattr(args, 'save_heightmap_agent', False):
+        agent_hmap_dir = os.path.join(diag_dir, "heightmap_agent_input")
+        os.makedirs(agent_hmap_dir, exist_ok=True)
+        
     vis_depth_dir: str | None = None
     if needs_depth and getattr(args, 'save_depth_vis', False):
         vis_depth_dir = os.path.join(diag_dir, "depth_vis")
@@ -1101,10 +1108,16 @@ def main():
                 _h_mean = float(_h0[_valid_h_mask].mean())
             else:
                 _h_min = _h_max = _h_mean = 0.0
+                
             diag_logger.info(
                    f"Frame {depth_frame_idx:05d} | HMap  Valid: {_valid_h_count}/{_t_h} "
                    f"({100*_valid_h_count/_t_h:.1f}%) | "
-                   f"Min: {_h_min:.3f}m | Max: {_h_max:.3f}m | Mean: {_h_mean:.3f}m")
+                   f"Raw Min: {_h_min:.3f}m | Raw Max: {_h_max:.3f}m | Raw Mean: {_h_mean:.3f}m")
+                   
+            # Explicitly log the semantic relationship
+            if getattr(args, 'save_heightmap_raw', False) or getattr(args, 'save_heightmap_agent', False):
+                diag_logger.info(f"Frame {depth_frame_idx:05d} | SEMANTICS NOTE: The absolute physical heightmap is strictly recorded in meters.")
+                diag_logger.info(f"Frame {depth_frame_idx:05d} | SEMANTICS NOTE: Agent-facing normalization occurs via factor `cfg.max_height` = {cfg.max_height:.3f}.")
 
         # Visualizations
         depth_np = depth_t[0].cpu().numpy()
@@ -1118,7 +1131,11 @@ def main():
             if raw_depth_dir:
                 np.save(os.path.join(raw_depth_dir, f"depth_{depth_frame_idx:06d}.npy"), depth_np.astype(np.float32))
             if raw_hmap_dir:
-                np.save(os.path.join(raw_hmap_dir, f"hmap_{depth_frame_idx:06d}.npy"), hmap_np.astype(np.float32))
+                np.save(os.path.join(raw_hmap_dir, f"hmap_raw_{depth_frame_idx:06d}.npy"), hmap_np.astype(np.float32))
+            if agent_hmap_dir:
+                # Apply the exact normalization function used by observation_builder.py
+                agent_hmap = hmap_np / cfg.max_height
+                np.save(os.path.join(agent_hmap_dir, f"hmap_agent_{depth_frame_idx:06d}.npy"), agent_hmap.astype(np.float32))
             if vis_depth_dir:
                 cv2.imwrite(os.path.join(vis_depth_dir, f"depth_vis_{depth_frame_idx:06d}.png"), depth_bgr)
             if vis_hmap_dir:
