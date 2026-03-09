@@ -263,13 +263,21 @@ def inject_kit_args(args, unknown):
     if args.physx_sync_launch:
         defaults["--/physics/enableSynchronousKernelLaunches"] = "--/physics/enableSynchronousKernelLaunches=true"
     
+    # ── Extension exclusions (including isaaclab_tasks) ──
+    exclusions = []
     if args.exclude_isaaclab_tasks:
-        # Check if the user already provided an extension exclusion override
+        exclusions.append('isaaclab_tasks')
+    if args.headless and args.record_mode == "rgb":
+        # Aggressively strip heavy systems not needed for simple bare-metal RGB renders
+        exclusions.extend(['omni.replicator.core', 'omni.warp.core', 'omni.warp.ui'])
+
+    for ext in exclusions:
         exclusion_idx = 0
-        while any(p.startswith(f"--/app/extensions/excluded/{exclusion_idx}") for p in user_kit_paths):
+        while any(p.startswith(f"--/app/extensions/excluded/{exclusion_idx}") for p in user_kit_paths) \
+              or f"--/app/extensions/excluded/{exclusion_idx}" in defaults:
             exclusion_idx += 1
-        defaults[f"--/app/extensions/excluded/{exclusion_idx}"] = f"--/app/extensions/excluded/{exclusion_idx}='isaaclab_tasks'"
-        print(f"[INFO] Excluding isaaclab_tasks extension at index {exclusion_idx}")
+        defaults[f"--/app/extensions/excluded/{exclusion_idx}"] = f"--/app/extensions/excluded/{exclusion_idx}='{ext}'"
+        print(f"[INFO] Excluding extension '{ext}' at index {exclusion_idx} (lighter startup)")
 
     for path, arg in defaults.items():
         if path not in user_kit_paths:
@@ -293,28 +301,21 @@ inject_kit_args(args, unknown)
 
 from isaaclab.app import AppLauncher
 
+# FIX C: Intercept AppLauncher's blind SYS.ARGV.APPEND to stop contradictory flags
+_old_append = sys.argv.append
+def _clean_append(val):
+    if val.startswith("--/physics/cudaDevice") and args.physics_device == "cpu":
+        return # SWALLOW: AppLauncher guesses 0, but we explicitly want CPU
+    if val.startswith("--/renderer/activeGpu"):
+        return # SWALLOW: AppLauncher guesses 0, but we already injected our valid activeGpu in inject_kit_args
+    _old_append(val)
+
+sys.argv.append = _clean_append
 app_launcher = AppLauncher(args)
+sys.argv.append = _old_append
+
 simulation_app = app_launcher.app
-
-# ── Force Kit settings AFTER AppLauncher, BEFORE env creation ──────────
-# AppLauncher may overwrite settings during init.  We re-apply the correct
-# values: renderer=Vulkan idx 2, physics=CPU (or GPU if opted in).
-try:
-    import carb.settings
-    _s = carb.settings.get_settings()
-    _s.set("/renderer/activeGpu", 2)       # Vulkan ordinal (RTX 6000)
-    _s.set("/renderer/multiGpu/enabled", False)
-    if args.physics_device == "cpu":
-        _s.set("/physics/simulationDevice", "cpu")
-        print("[INFO] Post-launch Kit settings forced: "
-              "activeGpu=2 (Vulkan), simulationDevice=cpu, multiGpu=false")
-    else:
-        _s.set("/physics/cudaDevice", 0)   # CUDA ordinal (RTX 6000)
-        print("[INFO] Post-launch Kit settings forced: "
-              "activeGpu=2 (Vulkan), cudaDevice=0 (CUDA), multiGpu=false")
-except Exception as _e:
-    print(f"[WARN] Could not force post-launch Kit settings: {_e}")
-
+# End FIX C interceptor. No post-launch carb overrides are needed anymore.
 
 # ═══════════════════════════════════════════════════════════════════════
 # 3) Now safe to import Isaac Lab, pxr, torch, cv2, etc.
@@ -326,14 +327,15 @@ import cv2                # deferred from top-of-file
 import numpy as np
 import torch              # deferred from top-of-file
 
-from pallet_rl.utils.device_utils import pick_supported_cuda_device
-
-# DO NOT set CUDA_VISIBLE_DEVICES. It breaks Omniverse startup and Vulkan contexts.
-# We explicitly select the supported GPU device index instead.
-_cuda_idx, forced_device = pick_supported_cuda_device()
-args.device = forced_device
-torch.cuda.set_device(_cuda_idx)
-print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {_cuda_idx})")
+# DO NOT probe or set CUDA devices unilaterally.
+if args.device.startswith("cuda"):
+    from pallet_rl.utils.device_utils import pick_supported_cuda_device
+    _cuda_idx, forced_device = pick_supported_cuda_device()
+    args.device = forced_device
+    torch.cuda.set_device(_cuda_idx)
+    print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {_cuda_idx})")
+else:
+    print(f"[INFO] PyTorch CPU device selected. (Skipping pick_supported_cuda_device)")
 if args.physics_device == "cpu":
     print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX: CPU (no CUDA context)")
 else:
@@ -699,7 +701,8 @@ def main():
     print(f"{'─'*50}")
     print(f"  Subsystem Status")
     print(f"{'─'*50}")
-    print(f"  PyTorch GPU         : {torch.cuda.get_device_name(torch.cuda.current_device())} ({device})")
+    _torch_dev_str = "SKIPPED (cpu mode)" if args.device == "cpu" else f"{torch.cuda.get_device_name(torch.cuda.current_device())} ({device})"
+    print(f"  PyTorch GPU         : {_torch_dev_str}")
     print(f"  Warp backend        : SKIPPED (mockup_mode)")
     print(f"  Depth converter     : {'active' if _needs_depth else 'SKIPPED (rgb mode)'}")
     print(f"  Pallet mesh visual  : {'active' if cfg.use_pallet_mesh_visual else 'SKIPPED'}")
