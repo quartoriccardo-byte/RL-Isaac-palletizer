@@ -747,47 +747,89 @@ def main():
     boxes = env.scene["boxes"]
     _warmup_dt = env.sim.get_physics_dt()
 
-    # FIX(B): Park ALL boxes to safe, SEPARATED positions BEFORE any sim step.
-    # Default init_state is pos=(0,0,1.5) — all 50 boxes overlap on the pallet,
-    # causing PhysX GPU narrowphase overflow (error 700).
-    # CRITICAL: Each box must have a UNIQUE (x,y) to avoid interpenetration.
-    #   Active boxes   [0..K):  near origin, spread on a 1m grid at z=-5
-    #   Inactive boxes [K..M):  far away (base 100,100), 2m grid at z=-5
-    K = cfg.num_boxes   # active
-    M = cfg.max_boxes   # total prims (always 50)
-    _env_ids_pre = torch.tensor([0], dtype=torch.long, device=device)
-    print(f"[INFO] Parking {M} boxes (K={K} active, {M-K} inactive) BEFORE warmup ...")
+    # FIX: apply USD rigid-body/material setup FIRST, then do final authoritative parking.
+    stage = omni.usd.get_context().get_stage()
 
-    for _pi in range(M):
-        if _pi < K:
-            # Active boxes: park near origin on a small grid
-            _cols = max(5, int(K**0.5) + 1)
-            _px = -3.0 + (_pi % _cols) * 1.0
-            _py = -3.0 + (_pi // _cols) * 1.0
+    def set_visibility(stg, prim_path: str, visible: bool):
+        from pxr import UsdGeom
+        prim = stg.GetPrimAtPath(prim_path)
+        if not prim.IsValid(): return
+        img = UsdGeom.Imageable(prim)
+        if img:
+            img.GetVisibilityAttr().Set(
+                UsdGeom.Tokens.inherited if visible else UsdGeom.Tokens.invisible
+            )
+
+    _debug_mat_path = "/World/_DebugBoxMaterial"
+    _debug_mat_prim = stage.GetPrimAtPath(_debug_mat_path)
+    if not _debug_mat_prim.IsValid():
+        mat = UsdShade.Material.Define(stage, _debug_mat_path)
+        shader = UsdShade.Shader.Define(stage, f"{_debug_mat_path}/Shader")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.85, 0.25, 0.20))
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.7)
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
+        mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+    _debug_mat = UsdShade.Material.Get(stage, _debug_mat_path)
+
+    for i in range(cfg.max_boxes):
+        bp = f"/World/envs/env_0/Boxes/box_{i}"
+        box_prim = stage.GetPrimAtPath(bp)
+        if not box_prim.IsValid(): continue
+        tune_rigid_body(stage, bp, lin_damp=2.0, ang_damp=3.0, max_depen_vel=0.3, max_lin_vel=1.5, pos_iters=32, vel_iters=8)
+        set_physics_material(stage, bp, static_friction=1.2, dynamic_friction=0.9, restitution=0.0, restitution_combine_mode="min")
+        _rb_api = PhysxSchema.PhysxRigidBodyAPI.Apply(box_prim)
+        _rb_api.CreateEnableCCDAttr().Set(False)
+        _mesh_prim = get_render_mesh_prim(stage, box_prim)
+        if _mesh_prim is not None:
+            UsdShade.MaterialBindingAPI.Apply(_mesh_prim).Bind(_debug_mat)
+            _gprim = UsdGeom.Gprim(_mesh_prim)
+            if _gprim:
+                _gprim.CreateDisplayColorAttr().Set([Gf.Vec3f(0.85, 0.25, 0.20)])
+                _gprim.CreateDisplayOpacityAttr().Set([1.0])
         else:
-            # Inactive boxes: far-away grid to avoid any scene interaction
-            _j = _pi - K
-            _cols_inact = 10
-            _px = 100.0 + (_j % _cols_inact) * 2.0
-            _py = 100.0 + (_j // _cols_inact) * 2.0
+            UsdShade.MaterialBindingAPI.Apply(box_prim).Bind(_debug_mat)
+
+    # ─── Authoritative Parking ───
+    K = cfg.num_boxes
+    M = cfg.max_boxes
+    _env_ids_0 = torch.tensor([0], dtype=torch.long, device=device)
+
+    def park_box(idx: int, active: bool):
+        bp = f"/World/envs/env_0/Boxes/box_{idx}"
+        set_kinematic(stage, bp, True)
+        set_disable_gravity(stage, bp, True)
+        set_visibility(stage, bp, False)
+        
+        if active:
+            _cols = max(5, int(cfg.num_boxes**0.5) + 1)
+            _px = -3.0 + (idx % _cols) * 1.0
+            _py = -3.0 + (idx // _cols) * 1.0
+        else:
+            _j = idx - cfg.num_boxes
+            _px = 100.0 + (_j % 10) * 2.0
+            _py = 100.0 + (_j // 10) * 2.0
         _pz = -5.0
-
-        _obj_ids = torch.tensor([_pi], dtype=torch.long, device=device)
-
+        
+        _obj_ids = torch.tensor([idx], dtype=torch.long, device=device)
         if placement_mode == "kinematic":
             _pose = torch.zeros(1, 1, 7, dtype=torch.float32, device=device)
             _pose[0, 0, 0] = _px
             _pose[0, 0, 1] = _py
             _pose[0, 0, 2] = _pz
-            _pose[0, 0, 3] = 1.0   # qw
-            boxes.write_object_pose_to_sim(_pose, _env_ids_pre, _obj_ids)
+            _pose[0, 0, 3] = 1.0
+            boxes.write_object_pose_to_sim(_pose, _env_ids_0, _obj_ids)
         else:
             _st = torch.zeros(1, 1, 13, dtype=torch.float32, device=device)
             _st[0, 0, 0] = _px
             _st[0, 0, 1] = _py
             _st[0, 0, 2] = _pz
-            _st[0, 0, 3] = 1.0   # qw
-            boxes.write_object_state_to_sim(_st, _env_ids_pre, _obj_ids)
+            _st[0, 0, 3] = 1.0
+            boxes.write_object_state_to_sim(_st, _env_ids_0, _obj_ids)
+
+    print(f"[INFO] Parking {M} boxes (K={K} active, {M-K} inactive) BEFORE warmup ...")
+    for _pi in range(M):
+        park_box(_pi, _pi < K)
 
     # FIX(E): Flush parking writes into PhysX with one sim step
     env.sim.step()
@@ -801,18 +843,24 @@ def main():
 
     # Active subset diagnostics
     _act = _all_pos[:K]
-    print(f"[INFO] Post-park ACTIVE [0..{K}):  "
-          f"x=[{_act[:, 0].min():.1f}, {_act[:, 0].max():.1f}]  "
-          f"y=[{_act[:, 1].min():.1f}, {_act[:, 1].max():.1f}]  "
-          f"z=[{_act[:, 2].min():.1f}, {_act[:, 2].max():.1f}]")
+    if K > 0 and _act.numel() > 0:
+        print(f"[INFO] Post-park ACTIVE [0..{K}):  "
+              f"x=[{_act[:, 0].min():.1f}, {_act[:, 0].max():.1f}]  "
+              f"y=[{_act[:, 1].min():.1f}, {_act[:, 1].max():.1f}]  "
+              f"z=[{_act[:, 2].min():.1f}, {_act[:, 2].max():.1f}]")
+    else:
+        print(f"[INFO] Post-park ACTIVE [0..0): empty")
 
     # Inactive subset diagnostics
     if K < M:
         _inact = _all_pos[K:]
-        print(f"[INFO] Post-park INACTIVE [{K}..{M}):  "
-              f"x=[{_inact[:, 0].min():.1f}, {_inact[:, 0].max():.1f}]  "
-              f"y=[{_inact[:, 1].min():.1f}, {_inact[:, 1].max():.1f}]  "
-              f"z=[{_inact[:, 2].min():.1f}, {_inact[:, 2].max():.1f}]")
+        if _inact.numel() > 0:
+            print(f"[INFO] Post-park INACTIVE [{K}..{M}):  "
+                  f"x=[{_inact[:, 0].min():.1f}, {_inact[:, 0].max():.1f}]  "
+                  f"y=[{_inact[:, 1].min():.1f}, {_inact[:, 1].max():.1f}]  "
+                  f"z=[{_inact[:, 2].min():.1f}, {_inact[:, 2].max():.1f}]")
+        else:
+            print(f"[INFO] Post-park INACTIVE [{K}..{M}): empty")
 
     print(f"[INFO] Post-park ALL: finite={_pos_finite.item()}, absmax={_pos_absmax:.2f}")
     if not _pos_finite:
@@ -831,7 +879,7 @@ def main():
         simulation_app.update()
     print("[INFO] Warmup complete (5 sim steps + render pumps).")
 
-    stage = omni.usd.get_context().get_stage()
+
 
     # ─── Depth camera access (robust, with fallbacks) ─────────────────
     needs_depth = args.record_mode in ("heightmap", "both", "diagnostic")
@@ -938,60 +986,7 @@ def main():
     except Exception as _e:
         print(f"[WARN] Could not read GPU/physics settings: {_e}")
 
-    # ─── Tune all box prims for stable, non-elastic contacts ──────────
-    #     Also: disable CCD (causes GPU crash with kinematic toggling)
-    #           and apply bright debug material for visibility.
-    _debug_mat_path = "/World/_DebugBoxMaterial"
-    _debug_mat_prim = stage.GetPrimAtPath(_debug_mat_path)
-    if not _debug_mat_prim.IsValid():
-        mat = UsdShade.Material.Define(stage, _debug_mat_path)
-        shader = UsdShade.Shader.Define(stage, f"{_debug_mat_path}/Shader")
-        shader.CreateIdAttr("UsdPreviewSurface")
-        shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(
-            Gf.Vec3f(0.85, 0.25, 0.20)   # bright red — unmissable
-        )
-        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.7)
-        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(0.0)
-        mat.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
-    _debug_mat = UsdShade.Material.Get(stage, _debug_mat_path)
 
-    for i in range(cfg.max_boxes):
-        bp = f"/World/envs/env_0/Boxes/box_{i}"
-        box_prim = stage.GetPrimAtPath(bp)
-        if not box_prim.IsValid():
-            continue
-        tune_rigid_body(stage, bp,
-                        lin_damp=2.0, ang_damp=3.0,
-                        max_depen_vel=0.3, max_lin_vel=1.5,
-                        pos_iters=32, vel_iters=8)
-        set_physics_material(stage, bp,
-                             static_friction=1.2,
-                             dynamic_friction=0.9,
-                             restitution=0.0,
-                             restitution_combine_mode="min")
-        # ── Patch B: disable CCD to prevent GPU narrowphase crash ──
-        _rb_api = PhysxSchema.PhysxRigidBodyAPI.Apply(box_prim)
-        _rb_api.CreateEnableCCDAttr().Set(False)
-        # ── Patch E: bind bright debug material for visibility ──
-        # Visual properties MUST target the renderable Gprim mesh,
-        # NOT the Xform root — otherwise boxes are invisible.
-        _mesh_prim = get_render_mesh_prim(stage, box_prim)
-        if _mesh_prim is not None:
-            UsdShade.MaterialBindingAPI.Apply(_mesh_prim).Bind(_debug_mat)
-            # ── Patch V: displayColor/Opacity fallback (Storm ignores unresolved materials) ──
-            _gprim = UsdGeom.Gprim(_mesh_prim)
-            if _gprim:
-                _gprim.CreateDisplayColorAttr().Set(
-                    [Gf.Vec3f(0.85, 0.25, 0.20)]   # bright red
-                )
-                _gprim.CreateDisplayOpacityAttr().Set([1.0])
-        else:
-            # Fallback: apply to root (should not happen with Isaac Lab assets)
-            UsdShade.MaterialBindingAPI.Apply(box_prim).Bind(_debug_mat)
-            print(f"[WARN] No Gprim mesh found under {bp}, binding material to Xform root")
-
-    print("[INFO] CCD disabled for all box prims (stability mode)")
-    print(f"[INFO] Applied debug material + displayColor to {cfg.max_boxes} box meshes")
 
     # ─── Debug diagnostics ─────────────────────────────────────────────
     if args.debug or args.debug_box_sync:
@@ -1387,15 +1382,6 @@ def main():
             
             if video_writer.isOpened():
                 video_writer.write(frame_to_write)
-    # ─── Park all boxes + set kinematic (USD-level) ────────────────────
-    # NOTE(B): Pose parking was already done BEFORE warmup (via tensor API).
-    # Here we additionally set kinematic + disable gravity via USD APIs,
-    # which must happen after `stage` is available.
-    for i in range(cfg.max_boxes):
-        bp = box_prim_path(i)
-        set_kinematic(stage, bp, True)
-        set_disable_gravity(stage, bp, True)
-
     # FIX(G): Diagnostic — verify positions after full parking
     if args.debug or args.debug_box_sync:
         _post_park_pos = boxes.data.object_pos_w[0, :cfg.max_boxes, 2].cpu()
@@ -1566,6 +1552,7 @@ def main():
                 )
                 set_kinematic(stage, bp, True)
                 set_disable_gravity(stage, bp, True)
+                set_visibility(stage, bp, True)
                 set_box_pose(current_box_idx, carry_start_pos.tolist(), yaw)
 
                 if args.debug:
