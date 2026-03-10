@@ -882,7 +882,7 @@ def main():
 
 
     # ─── Depth camera access (robust, with fallbacks) ─────────────────
-    needs_depth = args.record_mode in ("heightmap", "both", "diagnostic")
+    needs_depth = args.record_mode in ("heightmap", "both", "diagnostic") or placement_mode == "kinematic"
     depth_cam = None
     hmap_converter = None
     if needs_depth:
@@ -1545,6 +1545,71 @@ def main():
 
             # ─────────────────────────────────────────
             if state == "SPAWN":
+                if placement_mode == "kinematic":
+                    # --- Heightmap validation pass ---
+                    # 1. capture latest depth
+                    depth_cam.update(dt=sim_dt * substeps)
+                    depth_raw = depth_cam.data.output["distance_to_image_plane"]
+                    if hasattr(depth_raw, 'detach'):
+                        depth_t = depth_raw.detach()
+                    else:
+                        depth_t = torch.as_tensor(depth_raw, device=device)
+                    if depth_t.dim() == 4 and depth_t.shape[-1] == 1:
+                        depth_t = depth_t.squeeze(-1)
+                    if depth_t.dim() == 2:
+                        depth_t = depth_t.unsqueeze(0)
+                        
+                    # 2. Convert to heightmap
+                    cam_pos = depth_cam.data.pos_w
+                    cam_quat = depth_cam.data.quat_w_world
+                    hmap_t = hmap_converter.depth_to_heightmap(
+                        depth_t, cam_pos, cam_quat, -1, False
+                    )
+                    hmap_np = hmap_t[0].cpu().numpy()
+                    
+                    # 3. Find footprint indices
+                    tx, ty, tz = target
+                    eff_x, eff_y, _ = dims
+                    
+                    crop_x_min = cfg.depth_crop_x[0]
+                    crop_x_range = cfg.depth_crop_x[1] - cfg.depth_crop_x[0]
+                    crop_y_min = cfg.depth_crop_y[0]
+                    crop_y_range = cfg.depth_crop_y[1] - cfg.depth_crop_y[0]
+                    map_h, map_w = cfg.map_shape
+                    
+                    x_min = tx - 0.5 * eff_x
+                    x_max = tx + 0.5 * eff_x
+                    y_min = ty - 0.5 * eff_y
+                    y_max = ty + 0.5 * eff_y
+                    
+                    gx_min = int(np.clip((x_min - crop_x_min) / crop_x_range * map_w, 0, map_w - 1))
+                    gx_max = int(np.clip((x_max - crop_x_min) / crop_x_range * map_w, 0, map_w - 1))
+                    gy_min = int(np.clip((y_min - crop_y_min) / crop_y_range * map_h, 0, map_h - 1))
+                    gy_max = int(np.clip((y_max - crop_y_min) / crop_y_range * map_h, 0, map_h - 1))
+                    
+                    region = hmap_np[gy_min:gy_max+1, gx_min:gx_max+1]
+                    support_z = 0.0
+                    rejected = False
+                    confidence = 0.0
+                    if region.size > 0:
+                        support_z = float(region.max())
+                        peak_mask = region > (support_z - 0.05)
+                        confidence = peak_mask.sum() / region.size
+                        
+                        if confidence < 0.20:
+                            rejected = True
+                    else:
+                        rejected = True
+                        
+                    if rejected:
+                        print(f"  [DIAG_PLACE] Reject box {current_box_idx} ({eff_x:.2f}x{eff_y:.2f}) at ({tx:.2f}, {ty:.2f}) -> support_z={support_z:.3f}, confidence: {confidence:.2f}")
+                        placement_idx += 1
+                        continue
+                        
+                    target_center_z = support_z + 0.5 * dims[2] + 0.005
+                    target[2] = target_center_z
+                    print(f"  [DIAG_PLACE] Accept box {current_box_idx} ({eff_x:.2f}x{eff_y:.2f}) at ({tx:.2f}, {ty:.2f}) -> support_z={support_z:.3f}, confidence: {confidence:.2f}, target_z={target_center_z:.3f}")
+
                 # Teleport box to side (far from any geometry), kinematic
                 carry_start_pos = np.array(
                     [PALLET_LX + 0.5, -0.5, args.carry_height],
