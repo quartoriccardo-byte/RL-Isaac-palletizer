@@ -1185,7 +1185,7 @@ def main():
     hmap_cmap_id = resolve_cv2_colormap(args.hmap_colormap)
     hmap_invert = args.hmap_invert
 
-    def _capture_diagnostic_data(placed_count) -> dict:
+    def _capture_diagnostic_data(placed_count: int = 0) -> dict:
         """Read depth camera, log stats, save raw dumps, and create BGR views."""
         nonlocal depth_frame_idx
         
@@ -1349,7 +1349,7 @@ def main():
                 
         elif record_mode == "diagnostic":
             rgb_frame = env.render()
-            diag_data = _capture_diagnostic_data(len(placed_boxes))
+            diag_data = _capture_diagnostic_data()
             depth_bgr = diag_data["depth_bgr"]
             hmap_bgr = diag_data["hmap_bgr"]
             
