@@ -7,11 +7,15 @@ name = "pallet_rl"
 version = "0.1.0"
 description = "RL for Palletizing with Isaac Lab"
 authors = [{name = "Riccardo4", email = "quartoriccardo@gmail.com"}]
+requires-python = ">=3.10,<3.11"
 dependencies = [
-    "torch",
-    "gymnasium",
-    "warp-lang",
-    "pyyaml",
+    # Core runtime dependencies.  These are intentionally constrained to
+    # match a single, known-good Isaac Lab 4.x stack.  Broader version
+    # ranges are not tested and may break the pipeline.
+    "torch>=2.1,<2.3",
+    "gymnasium>=0.29,<0.30",
+    "warp-lang>=1.10,<1.12",
+    "pyyaml>=6.0,<7.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -22,7 +26,9 @@ include = ["pallet_rl*"]
 # RSL-RL 3.x provides rsl_rl.modules.ActorCritic which we subclass.
 # 4.x changes the API and is NOT compatible.
 train = [
-    "rsl-rl-lib>=3.2,<4",
+    # Tested against rsl-rl-lib 3.2.x; newer major versions are not
+    # supported by this repository.
+    "rsl-rl-lib>=3.2,<3.3",
 ]
 # Extra dependencies used only by legacy utilities (CPU heightmap channels, etc.).
 # These are not required for the main Isaac Lab + RSL-RL training/eval pipeline.

@@ -37,7 +37,8 @@ def handle_buffer_actions(env: PalletTask):
     slot_idx = dec.slot_idx
     op_type = dec.op_type
 
-    # Reset last_moved_box_id; will be set appropriately below
+    # Reset last_moved_box_id; will be set appropriately below for
+    # PLACE / RETRIEVE actions that actually move a physical box.
     env.last_moved_box_id[:] = -1
 
     # ==================================================================
@@ -67,13 +68,22 @@ def handle_buffer_actions(env: PalletTask):
     # ==================================================================
     # PLACE: Advance box_idx and record last_moved_box_id
     # ==================================================================
-    place_mask = env.active_place_mask & ~env._height_invalid_mask
+    # Only PLACE operations with a remaining *fresh* box are allowed to
+    # consume from the episode stream.  This enforces num_boxes vs
+    # max_boxes semantics and prevents box_idx from advancing beyond the
+    # active episode allocation.
+    has_fresh_box = env.box_idx < cfg.num_boxes
+    place_mask = env.active_place_mask & ~env._height_invalid_mask & has_fresh_box
 
     env.last_moved_box_id = torch.where(
         place_mask, env.box_idx, env.last_moved_box_id
     )
 
-    env.box_idx += place_mask.long()
+    # Clamp box_idx at num_boxes to keep inactive boxes truly inactive.
+    env.box_idx = torch.minimum(
+        env.box_idx + place_mask.long(),
+        torch.full_like(env.box_idx, cfg.num_boxes),
+    )
 
 
 def _execute_store(

@@ -44,12 +44,23 @@ if TYPE_CHECKING:
 
 def pre_physics_step(env: PalletTask, actions: torch.Tensor) -> None:
     """
-    Normalize/convert actions before physics stepping.
+    RL-step action commit for DirectRLEnv.
 
-    Handles two formats (backwards-compatible):
+    DirectRLEnv calls ``_pre_physics_step`` once per RL step but may call
+    ``_apply_action`` on every physics substep when ``decimation > 1``.
+    To avoid repeated side effects within a single RL step, all placement
+    and buffer bookkeeping is performed here, and ``_apply_action`` is
+    intentionally left as a no-op in :mod:`pallet_task`.
+
+    Handles two input formats (backwards-compatible):
       1. Discrete indices from MultiCategorical policy → center-of-bin normalize.
       2. Already-normalized float actions in [-1, 1] → clamp.
     """
+    from pallet_rl.envs.buffer_logic import handle_buffer_actions
+    from pallet_rl.envs.action_adapter import decode_normalized_action
+    # ------------------------------------------------------------------
+    # 0. Normalize/convert actions once per RL step
+    # ------------------------------------------------------------------
     actions = actions.to(env._device).float()
 
     is_discrete = actions.abs().max() > 1.5
@@ -61,30 +72,14 @@ def pre_physics_step(env: PalletTask, actions: torch.Tensor) -> None:
 
     env._actions = torch.clamp(actions, -1.0, 1.0)
 
-
-def apply_action(env: PalletTask) -> None:
-    """
-    Decode continuous action and apply placement to simulation.
-
-    Steps:
-      1. Decode continuous [-1, 1] → discrete sub-actions.
-      2. Compute target world position from action grid.
-      3. Validate height constraint.
-      4. Write pose to simulation for valid PLACE actions.
-      5. Update payload mass and arm settling window.
-      6. Delegate buffer operations to ``buffer_logic``.
-    """
-    from pallet_rl.envs.buffer_logic import handle_buffer_actions
-    from pallet_rl.envs.action_adapter import decode_normalized_action
-
+    # ------------------------------------------------------------------
+    # 1. Decode sub-actions explicitly (factored discrete)
+    # ------------------------------------------------------------------
     n = env.num_envs
     device = env._device
     cfg = env.cfg
     action = env._actions
 
-    # ------------------------------------------------------------------
-    # 1. Decode sub-actions explicitly
-    # ------------------------------------------------------------------
     env.decoded_action = decode_normalized_action(action, cfg.action_dims)
     dec = env.decoded_action
     op_type = dec.op_type
@@ -94,7 +89,23 @@ def apply_action(env: PalletTask) -> None:
     grid_y = dec.grid_y
 
     # ------------------------------------------------------------------
-    # 2. Grid → world coordinates
+    # 2. Operation masks (per RL step)
+    # ------------------------------------------------------------------
+    env.active_place_mask = (op_type == 0) | (op_type == 2)
+    env.store_mask = op_type == 1
+    env.retrieve_mask = op_type == 2
+
+    # ------------------------------------------------------------------
+    # 3. Height constraint validation (PLACE + RETRIEVE)
+    # ------------------------------------------------------------------
+    _validate_height_constraint(
+        env, op_type, slot_idx, grid_x, grid_y, n, device,
+    )
+
+    place_only_mask = (op_type == 0) & ~env._height_invalid_mask
+
+    # ------------------------------------------------------------------
+    # 4. Grid → world coordinates
     # ------------------------------------------------------------------
     pallet_x, pallet_y = cfg.pallet_size
     num_x, num_y = cfg.action_dims[2], cfg.action_dims[3]
@@ -106,22 +117,6 @@ def apply_action(env: PalletTask) -> None:
     target_x = grid_x.float() * step_x - half_x + step_x / 2
     target_y = grid_y.float() * step_y - half_y + step_y / 2
     target_z = torch.full((n,), 1.5, device=device)
-
-    # ------------------------------------------------------------------
-    # 3. Operation masks
-    # ------------------------------------------------------------------
-    env.active_place_mask = (op_type == 0) | (op_type == 2)
-    env.store_mask = op_type == 1
-    env.retrieve_mask = op_type == 2
-
-    # ------------------------------------------------------------------
-    # 4. Height constraint validation
-    # ------------------------------------------------------------------
-    _validate_height_constraint(
-        env, op_type, slot_idx, grid_x, grid_y, n, device,
-    )
-
-    place_only_mask = (op_type == 0) & ~env._height_invalid_mask
 
     # ------------------------------------------------------------------
     # 5. Build target pose and rotation quaternion
@@ -141,13 +136,13 @@ def apply_action(env: PalletTask) -> None:
     env.last_target_quat.copy_(quat)
 
     # ------------------------------------------------------------------
-    # 6. Write poses for PLACE actions
+    # 6. Write poses for PLACE actions (one-shot)
     # ------------------------------------------------------------------
     if "boxes" in env.scene.keys() and place_only_mask.any():
         _write_place_poses(env, place_only_mask, target_pos, quat, n, device)
 
     # ------------------------------------------------------------------
-    # 7. Buffer logic (store / retrieve)
+    # 7. Buffer logic (store / retrieve, box_idx updates)
     # ------------------------------------------------------------------
     handle_buffer_actions(env)
 
@@ -258,24 +253,49 @@ def _validate_height_constraint(
     if env._last_heightmap is None or not needs_height_check.any():
         return
 
+    # Map discrete grid indices to heightmap pixel coordinates
     pixel_x = (grid_x.float() / max(1, cfg.action_dims[2] - 1) * (cfg.map_shape[1] - 1)).long()
     pixel_y = (grid_y.float() / max(1, cfg.action_dims[3] - 1) * (cfg.map_shape[0] - 1)).long()
     pixel_x = pixel_x.clamp(0, cfg.map_shape[1] - 1)
     pixel_y = pixel_y.clamp(0, cfg.map_shape[0] - 1)
 
     env_idx = torch.arange(n, device=device)
-    local_height = env._last_heightmap[env_idx, pixel_y, pixel_x]
 
-    # PLACE: fresh box height
+    # PLACE: fresh box height and footprint
     box_idx_clamped = env.box_idx.clamp(0, cfg.max_boxes - 1)
-    place_box_height = env.box_dims[env_idx, box_idx_clamped, 2]
+    place_box_dims = env.box_dims[env_idx, box_idx_clamped]  # (N, 3)
+    place_box_height = place_box_dims[:, 2]
 
-    # RETRIEVE: buffered box height
+    # RETRIEVE: buffered box height and footprint
     slot_idx_clamped = slot_idx.clamp(0, cfg.buffer_slots - 1)
-    retrieve_box_height = env.buffer_state[env_idx, slot_idx_clamped, 2]
+    retrieve_box_dims = env.buffer_state[env_idx, slot_idx_clamped, :3]
+    retrieve_box_height = retrieve_box_dims[:, 2]
 
+    # SELECT footprint dims per-op (L,W,H)
+    box_dims = torch.where(
+        place_mask.unsqueeze(-1),
+        place_box_dims,
+        retrieve_box_dims,
+    )
     box_height = torch.where(place_mask, place_box_height, retrieve_box_height)
-    predicted_top = local_height + box_height
+
+    # Approximate footprint-based validation by sampling a 3×3 stencil
+    # around the target pixel, using the current box height. This is
+    # substantially more robust than a single-point check while keeping
+    # the computation lightweight and GPU-friendly.
+    H, W = cfg.map_shape
+    offsets = torch.tensor([-1, 0, 1], device=device, dtype=torch.long)
+    off_x = pixel_x[:, None] + offsets[None, :]
+    off_y = pixel_y[:, None] + offsets[None, :]
+    off_x = off_x.clamp(0, W - 1)
+    off_y = off_y.clamp(0, H - 1)
+
+    # Gather local 3×3 neighborhood heights
+    hmap = env._last_heightmap
+    local_heights = hmap[env_idx[:, None], off_y, off_x]  # (N, 3)
+    max_local_height, _ = local_heights.max(dim=1)
+
+    predicted_top = max_local_height + box_height
 
     height_exceeds = predicted_top > cfg.max_stack_height
     env._height_invalid_mask = height_exceeds & needs_height_check

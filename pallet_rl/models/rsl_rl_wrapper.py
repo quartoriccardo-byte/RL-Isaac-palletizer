@@ -284,7 +284,69 @@ class PalletizerActorCritic(ActorCritic):
         
         return fusion
     
-    def act(self, obs: torch.Tensor, action_mask: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
+    def _compute_action_mask_from_obs(self, obs) -> torch.Tensor:
+        """
+        Compute a height-based action mask directly from observations.
+
+        This mirrors the environment-side masking logic but runs purely
+        on the policy side so that training and evaluation both enforce
+        the same validity constraints even when the runner is unaware of
+        action masks.
+        """
+        obs_tensor = self._unwrap_obs(obs)
+        device = obs_tensor.device
+        batch_size = obs_tensor.shape[0]
+
+        mask = torch.ones(batch_size, self.total_logits, dtype=torch.bool, device=device)
+
+        # Guard against unexpected observation layouts
+        if obs_tensor.shape[1] < self.image_dim + self.vector_dim:
+            return mask
+
+        # Heightmap (normalized to [0,1]) → meters
+        images = obs_tensor[:, :self.image_dim].view(-1, 1, 160, 240)
+        heightmap_norm = images[:, 0]
+        max_height_m = 2.0  # must match PalletTaskCfg.max_height
+        heightmap = heightmap_norm * max_height_m
+
+        # Vector slice: [buffer (60), box dims (3), ...]
+        vector = obs_tensor[:, self.image_dim : self.image_dim + self.vector_dim]
+        current_dims = vector[:, 60:63]
+        box_h = current_dims[:, 2]
+
+        num_x = self.action_dims[2]
+        num_y = self.action_dims[3]
+        H, W = 160, 240
+
+        grid_xs = torch.arange(num_x, device=device)
+        grid_ys = torch.arange(num_y, device=device)
+
+        pixel_xs = (grid_xs.float() / max(1, num_x - 1) * (W - 1)).long().clamp(0, W - 1)
+        pixel_ys = (grid_ys.float() / max(1, num_y - 1) * (H - 1)).long().clamp(0, H - 1)
+
+        # all_heights: (B, num_y, num_x)
+        all_heights = heightmap[:, pixel_ys[:, None], pixel_xs[None, :]]
+        predicted_tops = all_heights + box_h[:, None, None]
+
+        max_stack_height = 1.8  # must match PalletTaskCfg.max_stack_height
+        grid_invalid = predicted_tops > max_stack_height
+
+        all_y_invalid_at_x = grid_invalid.all(dim=1)  # (B, num_x)
+        all_x_invalid_at_y = grid_invalid.all(dim=2)  # (B, num_y)
+
+        slot_start = self.action_dims[0]
+        x_start = slot_start + self.action_dims[1]
+        y_start = x_start + self.action_dims[2]
+
+        # Mask out logits corresponding to grid X/Y that are invalid for
+        # all Y/X respectively. This is still factored but strictly
+        # height-consistent and used identically in train and eval.
+        mask[:, x_start : x_start + num_x] &= ~all_y_invalid_at_x
+        mask[:, y_start : y_start + num_y] &= ~all_x_invalid_at_y
+
+        return mask
+    
+    def act(self, obs, action_mask: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
         """
         Sample actions from policy.
         
@@ -296,14 +358,20 @@ class PalletizerActorCritic(ActorCritic):
         """
         features = self._process_obs(obs)
         logits = self.actor_head(features)
+        
+        # Height-based mask derived from observations (train + eval)
+        auto_mask = self._compute_action_mask_from_obs(obs)
 
-        # Optional action masking: mask is shaped (N, total_logits)
+        # Optional external mask is AND-ed with the auto mask.
         if action_mask is not None:
             assert action_mask.shape == logits.shape, (
                 f"Action mask shape {action_mask.shape} must match logits {logits.shape}"
             )
-            # Invalid actions get very negative logits so their prob ~ 0
-            logits = logits.masked_fill(~action_mask, -1e9)
+            combined_mask = action_mask & auto_mask
+        else:
+            combined_mask = auto_mask
+
+        logits = logits.masked_fill(~combined_mask, -1e9)
         
         # Split logits and create distributions
         self.distributions = []
@@ -349,7 +417,7 @@ class PalletizerActorCritic(ActorCritic):
         
         return log_prob
     
-    def act_inference(self, obs: torch.Tensor) -> torch.Tensor:
+    def act_inference(self, obs) -> torch.Tensor:
         """
         Deterministic action selection (argmax).
         
@@ -362,6 +430,11 @@ class PalletizerActorCritic(ActorCritic):
         features = self._process_obs(obs)
         logits = self.actor_head(features)
         
+        # Deterministic inference must respect the same validity mask as
+        # training to keep evaluation semantics honest.
+        mask = self._compute_action_mask_from_obs(obs)
+        logits = logits.masked_fill(~mask, -1e9)
+        
         action_list = []
         start = 0
         
@@ -373,7 +446,7 @@ class PalletizerActorCritic(ActorCritic):
         
         return torch.stack(action_list, dim=-1)
     
-    def evaluate(self, obs: torch.Tensor, action_mask: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
+    def evaluate(self, obs, action_mask: torch.Tensor | None = None, **kwargs) -> torch.Tensor:
         """
         Compute value estimate and set distributions.
         
@@ -389,11 +462,15 @@ class PalletizerActorCritic(ActorCritic):
         # Also populate distributions for get_actions_log_prob
         logits = self.actor_head(features)
 
+        auto_mask = self._compute_action_mask_from_obs(obs)
         if action_mask is not None:
             assert action_mask.shape == logits.shape, (
                 f"Action mask shape {action_mask.shape} must match logits {logits.shape}"
             )
-            logits = logits.masked_fill(~action_mask, -1e9)
+            combined_mask = action_mask & auto_mask
+        else:
+            combined_mask = auto_mask
+        logits = logits.masked_fill(~combined_mask, -1e9)
         self.distributions = []
         start = 0
         

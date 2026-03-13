@@ -39,6 +39,10 @@ def compute_rewards(env: PalletTask) -> torch.Tensor:
     # Height-invalid penalty
     # ------------------------------------------------------------------
     rewards += cfg.reward_invalid_height * env._height_invalid_mask.float()
+    # Track invalid action rate for diagnostics
+    if env._height_invalid_mask.any():
+        env._kpi_invalid_action_count = getattr(env, "_kpi_invalid_action_count", torch.zeros(1, device=device))
+        env._kpi_invalid_action_count += env._height_invalid_mask.float().sum()
 
     # ------------------------------------------------------------------
     # Infeasible payload penalty
@@ -298,6 +302,17 @@ def _log_kpis(env: PalletTask):
     payload_utilization = env.payload_kg.mean() / env.cfg.max_payload_kg
     unstable_rot_rate = env._kpi_unstable_rot_count / (env._kpi_eval_count + 1e-8)
 
+    # Episode-level metrics (success / failure / end reasons)
+    total_episodes = env._kpi_episode_count + 1e-8
+    success_episode_rate = env._kpi_success_episodes / total_episodes
+    infeasible_episode_rate = env._kpi_infeasible_episodes / total_episodes
+    failure_episode_rate = env._kpi_failure_episodes / total_episodes
+    buffer_nonempty_end_rate = env._kpi_buffer_nonempty_at_end / total_episodes
+
+    invalid_action_rate = getattr(env, "_kpi_invalid_action_count", torch.zeros(1)).to(env._device) / (
+        total_settle + 1e-8
+    )
+
     env.extras["metrics/place_success_rate"] = place_success_rate.detach().cpu().item()
     env.extras["metrics/place_failure_rate"] = place_failure_rate.detach().cpu().item()
     env.extras["metrics/retrieve_success_rate"] = retrieve_success_rate.detach().cpu().item()
@@ -310,3 +325,8 @@ def _log_kpis(env: PalletTask):
     env.extras["metrics/avg_drift_deg"] = avg_drift_deg.detach().cpu().item()
     env.extras["metrics/payload_utilization"] = payload_utilization.detach().cpu().item()
     env.extras["metrics/unstable_rot_rate"] = unstable_rot_rate.detach().cpu().item()
+    env.extras["metrics/episode_success_rate"] = success_episode_rate.detach().cpu().item()
+    env.extras["metrics/episode_infeasible_rate"] = infeasible_episode_rate.detach().cpu().item()
+    env.extras["metrics/episode_failure_rate"] = failure_episode_rate.detach().cpu().item()
+    env.extras["metrics/episode_buffer_nonempty_end_rate"] = buffer_nonempty_end_rate.detach().cpu().item()
+    env.extras["metrics/invalid_action_rate"] = invalid_action_rate.detach().cpu().item()

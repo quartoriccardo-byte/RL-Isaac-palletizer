@@ -51,8 +51,7 @@ from pallet_rl.envs.scene_builder import setup_scene, _create_prim
 from pallet_rl.envs.observation_builder import build_observations
 from pallet_rl.envs.reward_manager import compute_rewards
 from pallet_rl.envs.placement_controller import (
-    pre_physics_step,
-    apply_action,
+    pre_physics_step as _placement_pre_physics_step,
     get_action_mask as _get_action_mask_impl,
 )
 
@@ -438,6 +437,13 @@ class PalletTask(DirectRLEnv):
         self._kpi_settle_eval_count = torch.zeros(1, device=device)
         self._kpi_unstable_rot_count = torch.zeros(1, device=device)
 
+        # Episode-level KPIs (success / failure / end reasons)
+        self._kpi_success_episodes = torch.zeros(1, device=device)
+        self._kpi_infeasible_episodes = torch.zeros(1, device=device)
+        self._kpi_failure_episodes = torch.zeros(1, device=device)
+        self._kpi_episode_count = torch.zeros(1, device=device)
+        self._kpi_buffer_nonempty_at_end = torch.zeros(1, device=device)
+
         self.extras = {}
 
     # =====================================================================
@@ -465,12 +471,27 @@ class PalletTask(DirectRLEnv):
         return compute_rewards(self)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        """Delegate to placement_controller module."""
-        pre_physics_step(self, actions)
+        """
+        RL-step hook: decode and commit the pending RL action once.
+
+        DirectRLEnv calls ``_pre_physics_step`` exactly once per RL step,
+        while ``_apply_action`` may be called on every physics substep
+        (``decimation`` > 1).  All one-shot RL side effects (box index
+        updates, buffer mutations, payload accounting, settling arming)
+        must therefore happen here to remain decimation-safe.
+        """
+        _placement_pre_physics_step(self, actions)
 
     def _apply_action(self) -> None:
-        """Delegate to placement_controller module."""
-        apply_action(self)
+        """
+        Physics-substep hook.
+
+        For this task, all placement and buffer side effects are committed
+        in :meth:`_pre_physics_step`.  To keep DirectRLEnv decimation-safe,
+        this hook is intentionally a no-op so that repeated physics
+        substeps within a single RL step cannot re-apply placement logic.
+        """
+        return None
 
     def get_action_mask(self) -> torch.Tensor:
         """Delegate to placement_controller module."""
@@ -514,15 +535,61 @@ class PalletTask(DirectRLEnv):
             active_place_valid = self.active_place_mask[valid_envs]
             terminated[valid_envs] = active_place_valid & failure_valid
 
-        terminated = terminated | (self.box_idx >= self.cfg.max_boxes)
-
-        # Payload infeasibility
-        remaining_boxes = (self.cfg.max_boxes - self.box_idx).float()
+        # ------------------------------------------------------------------
+        # Payload infeasibility (uses num_boxes, not max_boxes)
+        # ------------------------------------------------------------------
+        remaining_boxes = (self.cfg.num_boxes - self.box_idx).clamp(min=0).float()
         remaining_mass = remaining_boxes * self.cfg.base_box_mass_kg
         buffer_mass = (self.buffer_state[:, :, 5] * self.buffer_has_box.float()).sum(dim=1)
         prospective_total = self.payload_kg + buffer_mass + remaining_mass
         self._infeasible_mask = prospective_total > self.cfg.max_payload_kg
         terminated = terminated | self._infeasible_mask
+
+        # ------------------------------------------------------------------
+        # Successful completion: all active boxes placed and buffer empty,
+        # after the final placement has gone through settling evaluation.
+        #
+        # Success is defined over num_boxes (episode allocation), not
+        # max_boxes (scene capacity).  Boxes with index >= num_boxes are
+        # treated as inactive and must never affect termination.
+        # ------------------------------------------------------------------
+        all_fresh_consumed = self.box_idx >= self.cfg.num_boxes
+        buffer_nonempty = self.buffer_has_box.any(dim=1)
+
+        # Settling logic marks _settle_box_id >= 0 while a box is still in
+        # its settling window, and resets it to -1 after stability has been
+        # evaluated.  To ensure the last placement is evaluated before
+        # success, require no pending settling box.
+        no_pending_settle = self._settle_box_id < 0
+
+        success_mask = all_fresh_consumed & (~buffer_nonempty) & no_pending_settle
+
+        # Never override failure-type terminations with success.
+        success_only = success_mask & ~terminated
+        terminated = terminated | success_only
+
+        # ------------------------------------------------------------------
+        # Episode-level KPI bookkeeping for diagnostics
+        # ------------------------------------------------------------------
+        if not hasattr(self, "_kpi_success_episodes"):
+            # Backwards-compat for older checkpoints
+            self._kpi_success_episodes = torch.zeros(1, device=device)
+            self._kpi_infeasible_episodes = torch.zeros(1, device=device)
+            self._kpi_failure_episodes = torch.zeros(1, device=device)
+            self._kpi_episode_count = torch.zeros(1, device=device)
+            self._kpi_buffer_nonempty_at_end = torch.zeros(1, device=device)
+
+        ended = terminated
+        if ended.any():
+            success_envs = ended & success_only
+            infeasible_envs = ended & self._infeasible_mask
+            failure_envs = ended & ~(success_envs | infeasible_envs)
+
+            self._kpi_success_episodes += success_envs.float().sum()
+            self._kpi_infeasible_episodes += infeasible_envs.float().sum()
+            self._kpi_failure_episodes += failure_envs.float().sum()
+            self._kpi_episode_count += ended.float().sum()
+            self._kpi_buffer_nonempty_at_end += (ended & buffer_nonempty).float().sum()
 
         return terminated, truncated
 

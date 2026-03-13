@@ -52,9 +52,15 @@ class WarpBackend(BaseHeightmapBackend):
 
         pallet_pos = torch.zeros(n, 3, device=device)
 
-        # Mask inactive boxes
+        # Mask inactive boxes:
+        #   - Only physical boxes with index < num_boxes belong to the
+        #     active episode set.
+        #   - Among those, only indices < box_idx have been consumed as
+        #     fresh placements; the rest are still off-map.
         box_indices = torch.arange(M, device=device).view(1, -1)
-        active_mask = box_indices < env.box_idx.view(-1, 1)
+        active_mask = (box_indices < env.box_idx.view(-1, 1)) & (
+            box_indices < cfg.num_boxes
+        )
 
         env._box_dims_for_hmap.copy_(env.box_dims)
         env._box_dims_for_hmap[~active_mask] = 0.0

@@ -4,13 +4,13 @@ Reinforcement Learning for robotic palletization using Isaac Lab and RSL-RL.
 
 ## Task Objective
 
-The agent must **load ALL possible boxes onto the pallet** while respecting hard physical constraints:
+The agent must **place all active episode boxes onto the pallet** while respecting hard physical constraints:
 
 - **Maximum Stack Height**: Placements that would exceed `max_stack_height` are masked as invalid actions
 - **Maximum Payload**: Episode terminates if prospective on-pallet mass exceeds `max_payload_kg`
 - **Physical Stability**: Boxes must not fall or drift excessively after placement
 
-The **buffer** is a **temporary staging area** only—it allows the agent to defer placement decisions strategically, but all boxes must ultimately be placed on the pallet to maximize reward.
+The **buffer** is a **temporary staging area** only—it allows the agent to defer placement decisions strategically, but all boxes in the active episode set must ultimately be placed on the pallet (and no box may remain buffered) for an episode to terminate in success.
 
 ---
 
@@ -102,10 +102,13 @@ When storing/retrieving:
 
 Episodes terminate when:
 
-1. **Physical Collapse**: Any actively placed box falls (z < 0.05m during settling)
-2. **Infeasible Mass**: `payload_kg + buffer_mass + remaining_mass > max_payload_kg`
-3. **All Boxes Placed**: `box_idx >= max_boxes` (successful completion)
-4. **Time Limit**: Episode length exceeded (handled by DirectRLEnv)
+1. **Physical Collapse or Unstable Placement**: Any actively placed box falls (z < 0.05m during settling) or exceeds drift thresholds (both immediate and post-settling checks).
+2. **Infeasible Mass**: `payload_kg + buffer_mass + remaining_mass > max_payload_kg`, where `remaining_mass` is computed from `num_boxes` (episode allocation), not `max_boxes` (scene capacity).
+3. **All Active Boxes Successfully Placed**: All active episode boxes have been consumed from the fresh stream and are on the pallet, the buffer is empty, and the last placement has completed its settling evaluation. Concretely:
+   - `box_idx >= num_boxes`
+   - `buffer_has_box.any(dim=1) == False`
+   - No pending settling window for the last moved box.
+4. **Time Limit**: Episode length exceeded (handled by DirectRLEnv).
 
 ---
 
@@ -122,10 +125,16 @@ Task KPIs are emitted via `self.extras` and logged to TensorBoard under `metrics
 | `buffer_occupancy` | Average buffer slot utilization |
 | `drift_rate` | Fraction of placements with excessive drift |
 | `collapse_rate` | Fraction of placements that resulted in collapse |
-| `infeasible_rate` | Rate of infeasibility terminations |
+| `infeasible_rate` | Rate of infeasibility terminations (per placement) |
 | `avg_drift_xy` | Average XY drift in meters |
 | `avg_drift_deg` | Average rotation drift in degrees |
 | `payload_utilization` | `payload_kg.mean() / max_payload_kg` |
+| `unstable_rot_rate` | Fraction of placements unstable only in rotation |
+| `episode_success_rate` | Fraction of episodes that ended in success |
+| `episode_infeasible_rate` | Fraction of episodes that ended due to infeasibility |
+| `episode_failure_rate` | Fraction of episodes that ended in other failures (collapse, drift, etc.) |
+| `episode_buffer_nonempty_end_rate` | Fraction of episodes that ended while the buffer was still non-empty |
+| `invalid_action_rate` | Fraction of RL steps with a height-invalid PLACE/RETRIEVE attempt |
 
 ---
 
@@ -142,9 +151,15 @@ Task KPIs are emitted via `self.extras` and logged to TensorBoard under `metrics
 
 **Prerequisites** (on a machine that can run Isaac):
 
-- **Isaac Sim 4.x**: Python 3.10+, Isaac Lab 4.x compatible version
-- **Isaac Sim 5.x**: Python 3.11, Isaac Lab 5.x compatible version
-- CUDA-capable GPU with recent drivers (tested with RTX 30xx/40xx)
+This repository is maintained and tested against a **single, known-good stack**:
+
+- **Isaac Sim / Isaac Lab**: Isaac Lab 4.x inside Isaac Sim 4.x
+- **Python**: 3.10
+- **PyTorch**: 2.1–2.2
+- **Warp**: 1.10–1.11
+- **RSL-RL**: `rsl-rl-lib` 3.2.x
+
+Other combinations are not guaranteed to work.
 
 **Install the package** (inside your Isaac Lab Python environment):
 
@@ -176,6 +191,20 @@ python scripts/train.py \
   --max_iterations 2000 \
   --log_dir runs/palletizer \
   --experiment_name palletizer_ppo
+```
+
+### Smoke Training Run
+
+For a quick smoke check of the full Isaac Lab + RSL-RL pipeline:
+
+```bash
+python scripts/train.py \
+  --headless \
+  --num_envs 64 \
+  --device cuda:0 \
+  --max_iterations 2 \
+  --log_dir runs/smoke_train \
+  --experiment_name palletizer_smoke
 ```
 
 The script:
@@ -219,6 +248,18 @@ runs/demo/demo_smoke/videos/
 python scripts/eval.py \
   --headless \
   --num_envs 128 \
+  --device cuda:0 \
+  --checkpoint path/to/checkpoint.pt
+```
+
+### Smoke Evaluation Run
+
+After a short training run, you can perform a lightweight deterministic evaluation:
+
+```bash
+python scripts/eval.py \
+  --headless \
+  --num_envs 32 \
   --device cuda:0 \
   --checkpoint path/to/checkpoint.pt
 ```
@@ -363,9 +404,11 @@ cfg.depth_noise_enable = True
 python -m pytest tests/ -v
 
 # Specific test suites
-python -m pytest tests/test_action_fix.py -v      # Action space fix
-python -m pytest tests/test_depth_heightmap.py -v  # Depth heightmap pipeline
-python -m pytest tests/test_constraints.py -v      # Constraint logic
+python -m pytest tests/test_action_fix.py -v           # Action space fix
+python -m pytest tests/test_depth_heightmap.py -v      # Depth heightmap pipeline
+python -m pytest tests/test_constraints.py -v          # Constraint logic
+python -m pytest tests/test_decimation_semantics.py -v # DirectRLEnv decimation safety
+python -m pytest tests/test_termination_semantics.py -v # Success/termination semantics
 ```
 
 ---
@@ -429,14 +472,14 @@ tests/
 ```text
 DirectRLEnv.step(action)
   │
-  ├─ _pre_physics_step(action)   ← Discrete→normalized conversion (auto-detect)
-  ├─ _apply_action(action)         ← Height validation, box placement, buffer logic
-  │                                    Payload updates, settling window armed
-  ├─ Physics stepping              ← cfg.decimation × sim.step()
+  ├─ _pre_physics_step(action)   ← Discrete→normalized conversion, action decode,
+  │                                 height validation, placement/buffer commit
+  ├─ _apply_action(action)       ← No-op (decimation-safe; no one-shot side effects)
+  ├─ Physics stepping            ← cfg.decimation × sim.step()
   ├─ _post_physics_step()
-  ├─ _get_observations()           ← Heightmap, buffer, mass/payload, constraints
-  ├─ _get_rewards()                ← Settling evaluation, KPI logging
-  ├─ _get_dones()                  ← Termination checks (collapse, infeasible)
+  ├─ _get_observations()         ← Heightmap, buffer, mass/payload, constraints
+  ├─ _get_rewards()              ← Settling evaluation, KPI logging, metrics
+  ├─ _get_dones()                ← Termination checks (collapse, infeasible, success)
   └─ Reset handling
 ```
 
