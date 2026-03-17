@@ -2,7 +2,7 @@
 
 ## Overview
 
-GPU-only palletizing RL environment built on [Isaac Lab 4.0+](https://github.com/NVIDIA-Omniverse/IsaacLab) with [RSL-RL](https://github.com/leggedrobotics/rsl_rl) PPO training.
+GPU-only palletizing RL environment built on Isaac Lab with RSL-RL PPO training.
 
 ## Package Layout
 

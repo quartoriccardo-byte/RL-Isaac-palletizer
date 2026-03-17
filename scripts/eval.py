@@ -34,10 +34,6 @@ def parse_args():
     # Isaac Lab launcher args (defined locally to avoid importing AppLauncher before main())
     # These match the most common AppLauncher CLI args for compatibility.
     parser.add_argument("--livestream", type=int, default=0, help="Livestream mode (0=off, 1=native, 2=webrtc)")
-    parser.add_argument("--enable_cameras", action="store_true", help="Enable camera sensors")
-    parser.add_argument("--video", action="store_true", help="Record video")
-    parser.add_argument("--video_length", type=int, default=200, help="Video length in steps")
-    parser.add_argument("--video_interval", type=int, default=2000, help="Video recording interval")
 
     return parser.parse_args()
 

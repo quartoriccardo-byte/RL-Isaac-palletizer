@@ -51,20 +51,7 @@ def parse_args():
     # Evaluation
     parser.add_argument("--eval_steps", type=int, default=500, help="Rollout steps for video")
     
-    # Video recording
-    parser.add_argument("--video", action="store_true", default=True, help="Enable video recording (default: True)")
-    parser.add_argument("--video_length", type=int, default=500, help="Video length in steps")
-    parser.add_argument("--video_folder", type=str, default="runs/eval_videos", help="Video output folder")
-    
-    # Mosaic configuration
-    parser.add_argument("--tile_rows", type=int, default=2, help="Number of tile rows")
-    parser.add_argument("--tile_cols", type=int, default=4, help="Number of tile columns")
-    parser.add_argument("--cam_width", type=int, default=320, help="Per-env camera width")
-    parser.add_argument("--cam_height", type=int, default=180, help="Per-env camera height")
-    
-    # Isaac Lab launcher args
     parser.add_argument("--livestream", type=int, default=0, help="Livestream mode")
-    parser.add_argument("--enable_cameras", action="store_true", help="Enable camera sensors")
     
     args, unknown = parser.parse_known_args()
     return args, unknown
@@ -120,9 +107,7 @@ def main():
     else:
         print(f"[INFO] Using user-specified device: {args.device}")
     
-    # Force enable cameras for mosaic recording
-    args.enable_cameras = True
-    args.video = True
+    # Features are enabled by default in the wrapper setup
     
     # =========================================================================
     # CRITICAL: Inject Kit/Carb args into sys.argv BEFORE importing AppLauncher
@@ -306,7 +291,7 @@ def main():
     # ==========================================================================
 
     print(f"\n{'='*60}")
-    print("Isaac Lab 4.x Mosaic Evaluation Video")
+    print("Isaac Lab Mosaic Evaluation Video")
     print(f"{'='*60}")
     print(f"Device: {args.device}")
     print(f"Environments: {args.num_envs}")

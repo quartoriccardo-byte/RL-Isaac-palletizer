@@ -16,15 +16,15 @@ The **buffer** is a **temporary staging area** only—it allows the agent to def
 
 ## Architecture
 
-**Pipeline:** Isaac Lab (DirectRLEnv) + RSL-RL PPO + MultiDiscrete Actions + Warp heightmaps
+**Pipeline:** Isaac Lab (DirectRLEnv) + RSL-RL PPO + Box(-1, 1) Actions + Warp heightmaps
 
 | Component     | Implementation                                                       |
 | ------------- | -------------------------------------------------------------------- |
 | Environment   | `pallet_rl.envs.pallet_task.PalletTask` (Isaac Lab `DirectRLEnv`)    |
-| Policy        | `pallet_rl.models.rsl_rl_wrapper.PalletizerActorCritic` (MultiDiscrete) |
+| Policy        | `pallet_rl.models.rsl_rl_wrapper.PalletizerActorCritic` (Box Actions) |
 | Algorithm     | RSL-RL `OnPolicyRunner` with PPO                                     |
 | Observations  | Heightmap (Warp GPU kernel) + buffer + box dims + mass/payload + constraints |
-| Actions       | MultiDiscrete: [Operation(3), Slot(10), X(16), Y(24), Rotation(2)]  |
+| Actions       | Box(-1, 1, shape=(5,)). Decoded to: [Operation(3), Slot(10), X(16), Y(24), Rotation(2)] |
 
 ### Observation Space (38491-dim)
 
@@ -222,7 +222,7 @@ The script:
 - Launches Isaac Lab via `isaaclab.app.AppLauncher`
 - Instantiates `PalletTask` with `PalletTaskCfg` (DirectRLEnv)
 - Wraps it with `RslRlVecEnvWrapper` for RSL-RL
-- Uses `PalletizerActorCritic` for MultiDiscrete action distribution
+- Uses `PalletizerActorCritic` for CNN-based image + vector fusion
 
 ### Quick Video Smoke Test
 
@@ -365,11 +365,7 @@ On machines with mixed GPU architectures (e.g. GTX 1080 Ti on GPU 0/1, RTX 6000 
 
 ```bash
 # Example: RTX 6000 is GPU 2
-~/isaac-sim/python.sh scripts/mockup_video_physics.py \
-  --headless \
-  --device cuda:2 \
-  --num_boxes 15 \
-  --duration_s 20
+  --device cuda:2
 ```
 
 The mockup script automatically injects `--/renderer/activeGpu=N` and `--/physics/cudaDevice=N` from `--device cuda:N`. To override manually:

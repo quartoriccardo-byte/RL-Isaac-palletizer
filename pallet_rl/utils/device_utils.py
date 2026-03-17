@@ -9,7 +9,8 @@ def pick_supported_cuda_device(min_cc=(7, 5)):
         min_cc (tuple): Minimum required compute capability (major, minor).
         
     Returns:
-        tuple: (selected_index, device_str) where device_str is "cuda:<index>"
+        tuple[int, str]: (device_index, device_info_string).
+            Returns (None, "cuda") if no supported GPU (CC >= 7.5) is found.
         
     Raises:
         RuntimeError: If no compatible device is found.

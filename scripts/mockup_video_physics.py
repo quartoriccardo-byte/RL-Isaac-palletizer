@@ -219,10 +219,21 @@ def inject_kit_args(args, unknown):
     if not args.enable_cameras:
         args.enable_cameras = True
 
-    # ── GPU ordinal mapping for this machine ───────────────────────
-    # /renderer/activeGpu  uses *Vulkan* ordinals → RTX 6000 = 2
-    # /physics/cudaDevice   is NOT set when physics runs on CPU.
-    vulkan_idx = "2"   # RTX 6000 in Vulkan device list
+    # ── GPU ordinal mapping ──────────────────────────────────────────
+    # Derive indices from --device (e.g. cuda:0)
+    cuda_idx = 0
+    if ":" in args.device:
+        try:
+            cuda_idx = int(args.device.split(":")[-1])
+        except ValueError:
+            pass
+
+    # Machine-specific heuristic: on the target system (RTX 6000 + 1080 Ti), 
+    # the RTX 6000 is CUDA 0 but Vulkan 2.
+    if cuda_idx == 0:
+        vulkan_idx = "2"
+    else:
+        vulkan_idx = str(cuda_idx)
 
     user_kit_args = [a for a in unknown if a.startswith("--/")]
     user_kit_paths = {a.split("=")[0] for a in user_kit_args}
@@ -258,8 +269,8 @@ def inject_kit_args(args, unknown):
     if args.physics_device == "cpu":
         defaults["--/physics/simulationDevice"] = "--/physics/simulationDevice=cpu"
     else:
-        # GPU physics: route PhysX to RTX 6000 (CUDA idx 0)
-        defaults["--/physics/cudaDevice"] = "--/physics/cudaDevice=0"
+        # GPU physics: route PhysX to the same hardware unit
+        defaults["--/physics/cudaDevice"] = f"--/physics/cudaDevice={cuda_idx}"
     
     if args.physx_sync_launch:
         defaults["--/physics/enableSynchronousKernelLaunches"] = "--/physics/enableSynchronousKernelLaunches=true"
@@ -358,9 +369,9 @@ else:
         except:
             pass
 if args.physics_device == "cpu":
-    print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX: CPU (no CUDA context)")
+    print(f"[INFO] Kit renderer: Vulkan GPU {vulkan_idx} | PhysX: CPU (no CUDA context)")
 else:
-    print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX CUDA device: 0")
+    print(f"[INFO] Kit renderer: Vulkan GPU {vulkan_idx} | PhysX CUDA device: {cuda_idx}")
 
 from pxr import UsdPhysics, PhysxSchema, UsdShade, Sdf, Gf, UsdGeom
 

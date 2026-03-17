@@ -290,7 +290,7 @@ class DepthHeightmapConverter:
             print(f"[HMAP_DEBUG2] Proj Map X  | gx_raw Min: {gx_raw.min():.1f}, Max: {gx_raw.max():.1f}")
             print(f"[HMAP_DEBUG2] Proj Map Y  | gy_raw Min: {gy_raw.min():.1f}, Max: {gy_raw.max():.1f}")
             
-            print(f"[HMAP_DEBUG2] Sensor Z    | {sensor_height:.4f}m configured")
+            print(f"[HMAP_DEBUG2] Sensor Z    | {self.cfg.sensor_height_m:.4f}m configured")
             
             # Print stats only on valid pixels if any exist
             if valid_idx.numel() > 0:

@@ -313,9 +313,12 @@ class PalletizerActorCritic(ActorCritic):
         # max_height is stored on policy instance
         heightmap = heightmap_norm * self.max_height
 
-        # Vector slice: [buffer (60), box dims (3), ...]
-        vector = obs_tensor[:, self.image_dim : self.image_dim + self.vector_dim]
-        current_dims = vector[:, 60:63]
+        # Vector slice: [buffer (60), box dims (3), payload (1), mass (3), constraints (2), proprio (24)]
+        # Indices are hardcoded based on the observation structure defined in VecEnv.
+        idx_box_dims = slice(60, 63)
+        idx_max_height = 67 # max_stack_height_norm
+
+        current_dims = vector[:, idx_box_dims]
         box_h = current_dims[:, 2]
 
         num_x = self.action_dims[2]
@@ -332,8 +335,8 @@ class PalletizerActorCritic(ActorCritic):
         all_heights = heightmap[:, pixel_ys[:, None], pixel_xs[None, :]]
         predicted_tops = all_heights + box_h[:, None, None]
 
-        # max_stack_height is derived from observation (normalized by 3.0)
-        max_stack_height = vector[:, 67] * 3.0
+        # max_stack_height is derived from observation (normalized by 3.0m)
+        max_stack_height = vector[:, idx_max_height] * 3.0
         grid_invalid = predicted_tops > max_stack_height[:, None, None]
 
         all_y_invalid_at_x = grid_invalid.all(dim=1)  # (B, num_x)

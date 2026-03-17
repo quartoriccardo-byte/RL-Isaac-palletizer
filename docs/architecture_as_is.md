@@ -1,4 +1,4 @@
-## RL-Isaac-# [DEPRECATED] PalletRL Architecture (As-Is State Before Refactor)
+# [HISTORICAL] PalletRL Architecture (As-Is State Before Modularization)
 
 > **⚠️ DEPRECATION WARNING ⚠️**
 > This document describes the architecture *before* the deep modularization refactor.
