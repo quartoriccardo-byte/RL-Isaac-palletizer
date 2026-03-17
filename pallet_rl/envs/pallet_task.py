@@ -384,6 +384,7 @@ class PalletTask(DirectRLEnv):
 
         self.last_moved_box_id = torch.full((n,), -1, dtype=torch.long, device=device)
         self.active_place_mask = torch.zeros(n, dtype=torch.bool, device=device)
+        self.active_motion_mask = torch.zeros(n, dtype=torch.bool, device=device)
         self.store_mask = torch.zeros(n, dtype=torch.bool, device=device)
         self.retrieve_mask = torch.zeros(n, dtype=torch.bool, device=device)
         self.valid_retrieve = torch.zeros(n, dtype=torch.bool, device=device)
@@ -532,8 +533,8 @@ class PalletTask(DirectRLEnv):
             unstable = exceeded_xy | exceeded_rot
 
             failure_valid = fell | unstable
-            active_place_valid = self.active_place_mask[valid_envs]
-            terminated[valid_envs] = active_place_valid & failure_valid
+            active_motion_valid = self.active_motion_mask[valid_envs]
+            terminated[valid_envs] = active_motion_valid & failure_valid
 
         # ------------------------------------------------------------------
         # Payload infeasibility (uses num_boxes, not max_boxes)
@@ -607,6 +608,7 @@ class PalletTask(DirectRLEnv):
         self.box_idx[env_ids] = 0
         self.last_moved_box_id[env_ids] = -1
         self.active_place_mask[env_ids] = False
+        self.active_motion_mask[env_ids] = False
         self.store_mask[env_ids] = False
         self.retrieve_mask[env_ids] = False
         self.valid_retrieve[env_ids] = False

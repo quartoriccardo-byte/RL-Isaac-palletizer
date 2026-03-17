@@ -503,6 +503,9 @@ def main():
                 else:
                     print(f"  Warm-up {i+1}/10: frame is None")
             print("[INFO] Camera warm-up complete")
+            # CRITICAL: Reset the environment after warm-up to clear any
+            # state mutations (e.g., box consumer advancement) caused by warm-up steps.
+            env.reset()
         
         # ---------------------------------------------------------------------
         # Step 4: Apply RecordVideo wrapper (if video recording is requested)

@@ -4,8 +4,7 @@ install:
 	pip install -e .
 
 test:
-	python tests/test_imports.py
-	python tests/test_bugs.py
+	pytest tests/ -v
 
 train_smoke:
 	@echo "Smoke test requires Isaac Lab environment"

@@ -57,20 +57,26 @@ def pre_physics_step(env: PalletTask, actions: torch.Tensor) -> None:
       2. Already-normalized float actions in [-1, 1] → clamp.
     """
     from pallet_rl.envs.buffer_logic import handle_buffer_actions
-    from pallet_rl.envs.action_adapter import decode_normalized_action
+    from pallet_rl.envs.action_adapter import (
+        decode_action_tensor,
+        is_discrete_action_tensor,
+        discrete_to_center_normalized
+    )
+
     # ------------------------------------------------------------------
     # 0. Normalize/convert actions once per RL step
     # ------------------------------------------------------------------
-    actions = actions.to(env._device).float()
+    actions = actions.to(env._device)
+    dims = env.cfg.action_dims
 
-    is_discrete = actions.abs().max() > 1.5
+    # Centralized decoding ensures [[1,1,1,1,1]] is correctly treated as discrete
+    env.decoded_action = decode_action_tensor(actions, dims)
 
-    if is_discrete:
-        dims = env.cfg.action_dims
-        for col, k in enumerate(dims):
-            actions[:, col] = (actions[:, col].float() + 0.5) / k * 2.0 - 1.0
-
-    env._actions = torch.clamp(actions, -1.0, 1.0)
+    # Normalize actions internal state for consistency/logging if needed
+    if is_discrete_action_tensor(actions, dims):
+        env._actions = discrete_to_center_normalized(actions, dims)
+    else:
+        env._actions = torch.clamp(actions.float(), -1.0, 1.0)
 
     # ------------------------------------------------------------------
     # 1. Decode sub-actions explicitly (factored discrete)
@@ -78,9 +84,7 @@ def pre_physics_step(env: PalletTask, actions: torch.Tensor) -> None:
     n = env.num_envs
     device = env._device
     cfg = env.cfg
-    action = env._actions
-
-    env.decoded_action = decode_normalized_action(action, cfg.action_dims)
+    
     dec = env.decoded_action
     op_type = dec.op_type
     slot_idx = dec.slot_idx
@@ -91,7 +95,8 @@ def pre_physics_step(env: PalletTask, actions: torch.Tensor) -> None:
     # ------------------------------------------------------------------
     # 2. Operation masks (per RL step)
     # ------------------------------------------------------------------
-    env.active_place_mask = (op_type == 0) | (op_type == 2)
+    env.active_place_mask = (op_type == 0)
+    env.active_motion_mask = (op_type == 0) | (op_type == 2)
     env.store_mask = op_type == 1
     env.retrieve_mask = op_type == 2
 

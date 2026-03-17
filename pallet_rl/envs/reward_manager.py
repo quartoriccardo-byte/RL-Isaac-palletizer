@@ -131,8 +131,8 @@ def _eval_placement_rewards(
     failure[valid_envs] = failure_valid
     success[valid_envs] = success_valid
 
-    failure = failure & env.active_place_mask
-    success = success & env.active_place_mask
+    failure = failure & env.active_motion_mask
+    success = success & env.active_motion_mask
 
     rewards -= 10.0 * failure.float()
     rewards += 1.0 * success.float()
@@ -151,9 +151,9 @@ def _queue_kpi_evaluations(env: PalletTask):
     """Queue place/retrieve actions for settled KPI evaluation."""
     cfg = env.cfg
 
-    place_only = env.active_place_mask & ~env.valid_retrieve
-    if place_only.any():
-        place_envs = place_only.nonzero(as_tuple=False).flatten()
+    # Separate PLACE and RETRIEVE queuing
+    if env.active_place_mask.any():
+        place_envs = env.active_place_mask.nonzero(as_tuple=False).flatten()
         env._kpi_countdown[place_envs] = cfg.kpi_settle_steps + 1
         env._kpi_pending_type[place_envs] = 1
         env._kpi_pending_box_id[place_envs] = env.last_moved_box_id[place_envs]

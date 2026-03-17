@@ -69,17 +69,16 @@ def handle_buffer_actions(env: PalletTask):
     # PLACE: Advance box_idx and record last_moved_box_id
     # ==================================================================
     # Only PLACE operations with a remaining *fresh* box are allowed to
-    # consume from the episode stream.  This enforces num_boxes vs
-    # max_boxes semantics and prevents box_idx from advancing beyond the
-    # active episode allocation.
+    # consume from the episode stream.
     has_fresh_box = env.box_idx < cfg.num_boxes
     place_mask = env.active_place_mask & ~env._height_invalid_mask & has_fresh_box
 
+    # record last_moved_box_id for PLACE
     env.last_moved_box_id = torch.where(
         place_mask, env.box_idx, env.last_moved_box_id
     )
 
-    # Clamp box_idx at num_boxes to keep inactive boxes truly inactive.
+    # box_idx advances ONLY for valid PLACE actions
     env.box_idx = torch.minimum(
         env.box_idx + place_mask.long(),
         torch.full_like(env.box_idx, cfg.num_boxes),
@@ -194,5 +193,5 @@ def _execute_retrieve(
     env.buffer_box_id[retr_envs, retr_slots] = -1
     env.buffer_state[retr_envs, retr_slots] = 0.0
 
+    # record last_moved_box_id for RETRIEVE
     env.last_moved_box_id[retr_envs] = retrieved_physical_id
-    env.active_place_mask = env.active_place_mask | env.valid_retrieve

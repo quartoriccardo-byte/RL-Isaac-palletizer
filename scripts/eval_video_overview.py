@@ -339,6 +339,9 @@ def main():
             if frame is not None and i % 3 == 0:
                 print(f"  Warm-up {i+1}/10: shape={frame.shape}")
         print("[INFO] Camera warm-up complete")
+        # CRITICAL: Reset the environment after warm-up to clear any
+        # state mutations caused by warm-up steps.
+        env.reset()
         
         # Apply wrappers
         # 1. MosaicOverviewWrapper - compose multi-env frames

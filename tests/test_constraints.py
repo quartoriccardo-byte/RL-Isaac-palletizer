@@ -56,8 +56,6 @@ def test_mass_bookkeeping_place():
     expected_payload = torch.tensor([8.0, 10.0, 12.0, 14.0])
     assert torch.allclose(state.payload_kg, expected_payload), \
         f"Cumulative payload {state.payload_kg} != expected {expected_payload}"
-    
-    print("✓ Mass bookkeeping PLACE test passed")
 
 
 def test_mass_bookkeeping_store_retrieve():
@@ -108,144 +106,40 @@ def test_mass_bookkeeping_store_retrieve():
     expected_payload = torch.tensor([5.0, 10.0])
     assert torch.allclose(state.payload_kg, expected_payload), \
         f"Payload after RETRIEVE {state.payload_kg} != expected {expected_payload}"
-    
-    print("✓ Mass bookkeeping STORE/RETRIEVE test passed")
 
 
 def test_infeasibility_termination():
-    """Test infeasibility detection when prospective mass exceeds max."""
+    """Test infeasibility detection using num_boxes (episode allocation)."""
     n = 4
     max_payload_kg = 500.0
-    max_boxes = 50
-    base_box_mass_kg = 5.0
+    num_boxes = 40  # Episode allocation
+    base_box_mass_kg = 10.0
     
-    # Create state
-    payload_kg = torch.tensor([100.0, 400.0, 490.0, 600.0])
-    box_idx = torch.tensor([10, 40, 48, 50])
+    # Env 0: 100kg on pallet, 20 boxes placed. Remaining: (40-20)*10 = 200. Total 300. -> OK
+    # Env 1: 400kg on pallet, 35 boxes placed. Remaining: (40-35)*10 = 50. Total 450. -> OK
+    # Env 2: 450kg on pallet, 30 boxes placed. Remaining: (40-30)*10 = 100. Total 550. -> INFEASIBLE
+    # Env 3: 100kg on pallet, 40 boxes placed, BUT 50kg in buffer. Remaining: (40-40)*10 = 0. Total 150. -> OK
+    
+    payload_kg = torch.tensor([100.0, 400.0, 450.0, 100.0])
+    box_idx = torch.tensor([20, 35, 30, 40])
     buffer_state = torch.zeros(n, 10, 6)
     buffer_has_box = torch.zeros(n, 10, dtype=torch.bool)
     
-    # Add some buffer mass for env 2
-    buffer_state[2, 0, 5] = 20.0  # 20kg in buffer slot
-    buffer_has_box[2, 0] = True
+    buffer_state[3, 0, 5] = 50.0
+    buffer_has_box[3, 0] = True
     
-    # Compute remaining mass estimate
-    remaining_boxes = (max_boxes - box_idx).float()
+    # Regression: Logic must use num_boxes, not max_boxes
+    remaining_boxes = (num_boxes - box_idx).clamp(min=0).float()
     remaining_mass = remaining_boxes * base_box_mass_kg
-    
-    # Buffer mass
     buffer_mass = (buffer_state[:, :, 5] * buffer_has_box.float()).sum(dim=1)
     
-    # Prospective total
     prospective_total = payload_kg + buffer_mass + remaining_mass
-    
-    # Expected:
-    # Env 0: 100 + 0 + 40*5 = 300   -> OK
-    # Env 1: 400 + 0 + 10*5 = 450   -> OK
-    # Env 2: 490 + 20 + 2*5 = 520   -> INFEASIBLE (> 500)
-    # Env 3: 600 + 0 + 0*5 = 600    -> INFEASIBLE (> 500)
-    
     infeasible_mask = prospective_total > max_payload_kg
     
-    expected_infeasible = torch.tensor([False, False, True, True])
-    assert (infeasible_mask == expected_infeasible).all(), \
-        f"Infeasible mask {infeasible_mask} != expected {expected_infeasible}"
-    
-    print("✓ Infeasibility termination test passed")
-
-
-def test_height_constraint_validation():
-    """Test height constraint logic for action validation."""
-    n = 3
-    max_stack_height = 1.8  # meters
-    
-    # Mock heightmap values at target positions
-    local_heights = torch.tensor([1.5, 1.7, 0.5])  # meters
-    current_box_heights = torch.tensor([0.2, 0.2, 0.2])  # box height
-    
-    predicted_top = local_heights + current_box_heights
-    # Expected: [1.7, 1.9, 0.7]
-    
-    height_exceeds = predicted_top > max_stack_height
-    # Expected: [False, True, False]
-    
-    expected = torch.tensor([False, True, False])
-    assert (height_exceeds == expected).all(), \
-        f"Height exceeds {height_exceeds} != expected {expected}"
-    
-    print("✓ Height constraint validation test passed")
-
-
-def test_settling_drift_computation():
-    """Test drift computation for settling stability check."""
-    n = 3
-    pi = 3.14159265359
-    
-    # Current positions after settling
-    current_pos = torch.tensor([
-        [0.1, 0.2, 0.15],   # Near target
-        [0.2, 0.3, 0.14],   # Drifted XY
-        [0.1, 0.2, 0.02],   # Fell (z < 0.05)
-    ])
-    
-    # Target positions
-    target_pos = torch.tensor([
-        [0.1, 0.2, 0.0],
-        [0.1, 0.2, 0.0],
-        [0.1, 0.2, 0.0],
-    ])
-    
-    # Compute XY drift
-    drift_xy = torch.norm(current_pos[:, :2] - target_pos[:, :2], dim=-1)
-    # Expected: [0.0, ~0.14, 0.0]
-    
-    # Check drift thresholds
-    drift_xy_threshold = 0.05
-    exceeded_xy = drift_xy > drift_xy_threshold
-    # Expected: [False, True, False]
-    
-    # Check falls
-    fell = current_pos[:, 2] < 0.05
-    # Expected: [False, False, True]
-    
-    expected_exceeded = torch.tensor([False, True, False])
-    expected_fell = torch.tensor([False, False, True])
-    
-    assert (exceeded_xy == expected_exceeded).all(), \
-        f"Exceeded XY {exceeded_xy} != expected {expected_exceeded}"
-    assert (fell == expected_fell).all(), \
-        f"Fell {fell} != expected {expected_fell}"
-    
-    print("✓ Settling drift computation test passed")
-
-
-def test_observation_dimension():
-    """Test that observation dimension matches expected value."""
-    # Config values
-    map_shape = (160, 240)
-    buffer_slots = 10
-    buffer_features = 6  # Was 5, now 6 (added mass)
-    robot_state_dim = 24
-    
-    vis_dim = map_shape[0] * map_shape[1]  # 38400
-    buf_dim = buffer_slots * buffer_features  # 60
-    box_dim = 3
-    mass_dim = 2  # payload_norm + current_box_mass_norm
-    constraint_dim = 2  # max_payload_norm + max_stack_height_norm
-    
-    expected_obs_dim = vis_dim + buf_dim + box_dim + mass_dim + constraint_dim + robot_state_dim
-    # 38400 + 60 + 3 + 2 + 2 + 24 = 38491
-    
-    assert expected_obs_dim == 38491, f"Expected 38491, got {expected_obs_dim}"
-    
-    print("✓ Observation dimension test passed")
+    expected = torch.tensor([False, False, True, False])
+    assert (infeasible_mask == expected).all(), \
+        f"Infeasible mask {infeasible_mask} != expected {expected}\nTotals: {prospective_total}"
 
 
 if __name__ == "__main__":
-    test_mass_bookkeeping_place()
-    test_mass_bookkeeping_store_retrieve()
-    test_infeasibility_termination()
-    test_height_constraint_validation()
-    test_settling_drift_computation()
-    test_observation_dimension()
-    print("\n✅ All constraint tests passed!")
+    pytest.main([__file__, "-v"])

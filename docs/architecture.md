@@ -15,9 +15,9 @@ pallet_rl/
 │   │   ├── pallet_task.py           # Thin orchestrator (configs + lifecycle)
 │   │   ├── scene_builder.py         # Scene setup, lighting, pallet mesh, mockup physics
 │   │   ├── observation_builder.py   # Heightmap + obs vector construction
-│   │   ├── reward_manager.py        # All reward terms, KPI logging, settling
-│   │   ├── buffer_logic.py          # Store/retrieve buffer operations
-│   │   ├── placement_controller.py  # Action decode, height validation, pose writing
+│   │   ├── reward_manager.py        # All reward terms, KPI logging, settling (uses active_motion_mask)
+│   │   ├── buffer_logic.py          # Store/retrieve buffer operations (advances box_idx only on PLACE)
+│   │   ├── placement_controller.py  # Action decode (via action_adapter), height validation, pose writing
 │   │   └── perception/
 │   │       ├── __init__.py          # Factory: create_backend("warp"|"depth_camera")
 │   │       ├── base.py              # BaseHeightmapBackend ABC
@@ -90,6 +90,13 @@ The environment relies on a strict separation between the trainer-facing API and
 | 4     | Rotation  | 0/1        | 0° or 90° Z-rotation    |
 
 Grid → World: pallet (1.2×0.8 m) centered at origin.
+The Action Adapter ensures that ambiguous inputs like `[[1,1,1,1,1]]` are correctly interpreted as discrete Store operations.
+
+## Masking & Semantics
+
+- **`active_place_mask`**: Strictly for PLACE (op 0) operations. Used to trigger `box_idx` advancement and volume bonuses.
+- **`active_motion_mask`**: Inclusive of PLACE (op 0) and RETRIEVE (op 2). Used for stability/drift/collapse checking and termination.
+- **`valid_store` / `valid_retrieve`**: Logical gate for buffer operations based on slot occupancy and height validity.
 
 ## Perception Backends
 

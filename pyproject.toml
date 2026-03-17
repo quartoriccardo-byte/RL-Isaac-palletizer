@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pallet_rl"
-version = "0.1.0"
+version = "2.0.0"
 description = "RL for Palletizing with Isaac Lab"
 authors = [{name = "Riccardo4", email = "quartoriccardo@gmail.com"}]
 requires-python = ">=3.10,<3.11"
@@ -16,6 +16,7 @@ dependencies = [
     "gymnasium>=0.29,<0.30",
     "warp-lang>=1.10,<1.12",
     "pyyaml>=6.0,<7.0",
+    "numpy",
 ]
 
 [tool.setuptools.packages.find]
@@ -33,6 +34,5 @@ train = [
 # Extra dependencies used only by legacy utilities (CPU heightmap channels, etc.).
 # These are not required for the main Isaac Lab + RSL-RL training/eval pipeline.
 legacy = [
-    "numpy",
     "scipy",
 ]
