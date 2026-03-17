@@ -79,7 +79,7 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--duration_s", type=float, default=20.0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--enable_cameras", action="store_true", default=True)
+    parser.add_argument("--enable_cameras", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cam_width", type=int, default=640)
     parser.add_argument("--cam_height", type=int, default=360)
 
@@ -194,7 +194,7 @@ def parse_args():
                              "box world z to verify it left the parking pose")
 
     # extensions
-    parser.add_argument("--exclude_isaaclab_tasks", action="store_true", default=True,
+    parser.add_argument("--exclude_isaaclab_tasks", action=argparse.BooleanOptionalAction, default=True,
                         help="Exclude problematic isaaclab_tasks extension")
 
     # physics fallback & physx gpu buffer sizes
@@ -214,40 +214,38 @@ def parse_args():
     return parser.parse_known_args()
 
 
-def inject_kit_args(args, unknown):
+def inject_kit_args(args, unknown, cuda_idx: int):
     """Inject safe Kit/Carb args BEFORE AppLauncher reads sys.argv."""
     if not args.enable_cameras:
         args.enable_cameras = True
 
     # ── GPU ordinal mapping ──────────────────────────────────────────
-    # Derive indices from --device (e.g. cuda:0)
-    cuda_idx = 0
-    if ":" in args.device:
-        try:
-            cuda_idx = int(args.device.split(":")[-1])
-        except ValueError:
-            pass
-
-    # Machine-specific heuristic: on the target system (RTX 6000 + 1080 Ti), 
-    # the RTX 6000 is CUDA 0 but Vulkan 2.
-    if cuda_idx == 0:
-        vulkan_idx = "2"
-    else:
-        vulkan_idx = str(cuda_idx)
+    # Machine-independent routing: N -> N
+    vulkan_idx = str(cuda_idx)
 
     user_kit_args = [a for a in unknown if a.startswith("--/")]
     user_kit_paths = {a.split("=")[0] for a in user_kit_args}
 
-    # Strip any user-supplied --/physics/cudaDevice to prevent PhysX GPU init
-    user_kit_args = [a for a in user_kit_args
-                     if not a.startswith("--/physics/cudaDevice")]
+    # Only strip if the user did NOT provide an explicit override
+    if not any(a.startswith("--/physics/cudaDevice=") for a in unknown):
+        user_kit_args = [a for a in user_kit_args if not a.startswith("--/physics/cudaDevice")]
 
     defaults = {
         "--/ngx/enabled": "--/ngx/enabled=false",
         "--/rtx/post/dlss/enabled": "--/rtx/post/dlss/enabled=false",
         "--/renderer/multiGpu/enabled": "--/renderer/multiGpu/enabled=false",
         "--/renderer/activeGpu": f"--/renderer/activeGpu={vulkan_idx}",
-        # ── Extra lightweight renderer settings (safe for offscreen) ──
+    }
+    
+    # ── Override Check ──
+    # If any specific /renderer or /physics flags exist in 'unknown', 
+    # they take precedence over our defaults.
+    for path in list(defaults.keys()):
+        if any(a.startswith(path + "=") for a in unknown):
+            del defaults[path]
+
+    # Re-wrap defaults with some critical renderer settings
+    renderer_defaults = {
         "--/rtx/shadows/enabled": "--/rtx/shadows/enabled=false",
         "--/rtx/directLighting/sampledLighting/enabled": "--/rtx/directLighting/sampledLighting=false",
         "--/app/livestream/enabled": "--/app/livestream/enabled=false",
@@ -257,6 +255,7 @@ def inject_kit_args(args, unknown):
         "--/rtx-transient/dlssg/enabled": "--/rtx-transient/dlssg/enabled=false",
         "--/rtx-transient/dldenoiser/enabled": "--/rtx-transient/dldenoiser/enabled=false",
     }
+    defaults.update(renderer_defaults)
 
     # ── Viewport / window suppression for headless mode ──
     if args.headless:
@@ -270,7 +269,8 @@ def inject_kit_args(args, unknown):
         defaults["--/physics/simulationDevice"] = "--/physics/simulationDevice=cpu"
     else:
         # GPU physics: route PhysX to the same hardware unit
-        defaults["--/physics/cudaDevice"] = f"--/physics/cudaDevice={cuda_idx}"
+        if "--/physics/cudaDevice" not in defaults: # Only if not explicitly overridden by user
+             defaults["--/physics/cudaDevice"] = f"--/physics/cudaDevice={cuda_idx}"
     
     if args.physx_sync_launch:
         defaults["--/physics/enableSynchronousKernelLaunches"] = "--/physics/enableSynchronousKernelLaunches=true"
@@ -303,10 +303,23 @@ def inject_kit_args(args, unknown):
 
 args, unknown = parse_args()
 
-# NOTE: torch, cv2 and pick_supported_cuda_device are NOT called here.
-# They are deferred until after SimulationApp is created (below).
+# ── Early CUDA Resolution ──────────────────────────────────────────────
+# Resolve generic 'cuda' to a specific device index BEFORE injecting Kit args.
+# This ensures Kit and Torch use identical routing.
+cuda_idx = 0
+if args.device == "cuda":
+    # Need to import this earlier for resolution
+    from pallet_rl.utils.device_utils import pick_supported_cuda_device
+    cuda_idx, forced_device = pick_supported_cuda_device()
+    args.device = forced_device
+    print(f"[INFO] Auto-selected supported GPU: {args.device} (CUDA idx {cuda_idx})")
+elif args.device.startswith("cuda:"):
+    try:
+        cuda_idx = int(args.device.split(":")[-1])
+    except ValueError:
+        pass
 
-inject_kit_args(args, unknown)
+inject_kit_args(args, unknown, cuda_idx)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -335,8 +348,7 @@ app_launcher = AppLauncher(args)
 
 # Restore the original list type but keep the cleaned contents
 sys.argv = _old_argv
-sys.argv.clear()
-sys.argv.extend(app_launcher.app.get_app_filename() if hasattr(app_launcher.app, 'get_app_filename') else sys.argv) # IsaacLab internals typically don't strictly need sys.argv later, but we restore type safety.
+# sys.argv now contains exactly what AppLauncher (and Kit) processed.
 
 simulation_app = app_launcher.app
 # End FIX C interceptor. No post-launch carb overrides are needed anymore.
@@ -351,23 +363,12 @@ import cv2                # deferred from top-of-file
 import numpy as np
 import torch              # deferred from top-of-file
 
-# Selective GPU selection (RTX 6000 vs 1080 Ti)
-# Only override if using the generic 'cuda' default
-if args.device == "cuda":
-    from pallet_rl.utils.device_utils import pick_supported_cuda_device
-    _cuda_idx, forced_device = pick_supported_cuda_device()
-    args.device = forced_device
-    torch.cuda.set_device(_cuda_idx)
-    print(f"[INFO] Auto-selected supported GPU: {args.device} (CUDA idx {_cuda_idx})")
+# Torch device selection (now using the index resolved earlier)
+if args.device.startswith("cuda"):
+    torch.cuda.set_device(cuda_idx)
+    print(f"[INFO] Torch using device: {args.device} (idx {cuda_idx})")
 else:
-    print(f"[INFO] Using user-specified device: {args.device}")
-    if args.device.startswith("cuda"):
-        # Still need to set torch device if user specified a cuda index
-        try:
-            _idx = int(args.device.split(":")[-1])
-            torch.cuda.set_device(_idx)
-        except:
-            pass
+    print(f"[INFO] Torch using device: {args.device}")
 if args.physics_device == "cpu":
     print(f"[INFO] Kit renderer: Vulkan GPU {vulkan_idx} | PhysX: CPU (no CUDA context)")
 else:

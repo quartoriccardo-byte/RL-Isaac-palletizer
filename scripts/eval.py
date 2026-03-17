@@ -1,13 +1,8 @@
-
 """
-Canonical evaluation script for the PalletTask + RSL-RL pipeline.
+Evaluation script for Palletizer policies.
 
-This script mirrors the training setup in `scripts/train.py` but:
-- Loads a trained checkpoint.
-- Runs a limited number of evaluation episodes.
-
-NOTE: This file is not executed in this environment. It is structurally
-correct by design and should be validated on a machine with Isaac Lab.
+Usage:
+    python scripts/eval.py --checkpoint /path/to/model.pt --num_envs 16
 """
 
 from __future__ import annotations

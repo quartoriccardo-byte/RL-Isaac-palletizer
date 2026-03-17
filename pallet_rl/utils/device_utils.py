@@ -8,9 +8,13 @@ def pick_supported_cuda_device(min_cc=(7, 5)):
     Args:
         min_cc (tuple): Minimum required compute capability (major, minor).
         
+    Automatic GPU selection policy:
+    - Filters for NVIDIA GPUs with Compute Capability (CC) >= 7.5.
+    - Required for hardware acceleration of certain Isaac Sim features on the target workstation (RTX 6000).
+        
     Returns:
         tuple[int, str]: (device_index, device_info_string).
-            Returns (None, "cuda") if no supported GPU (CC >= 7.5) is found.
+            Returns (None, "cuda") if no supported GPU is found.
         
     Raises:
         RuntimeError: If no compatible device is found.
@@ -40,8 +44,9 @@ def pick_supported_cuda_device(min_cc=(7, 5)):
 
     if selected_index is None:
         raise RuntimeError(
-            f"No CUDA device found with Compute Capability >= {min_cc[0]}.{min_cc[1]}. "
-            "Update hardware or adjust requirements."
+            "No suitable NVIDIA GPU (Compute Capability >= 7.5) found. "
+            "Isaac Sim hardware acceleration may fail. "
+            "Please specify a device explicitly via --device if you wish to bypass this check."
         )
 
     # Force the device

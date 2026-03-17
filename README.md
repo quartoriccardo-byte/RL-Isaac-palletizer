@@ -24,7 +24,7 @@ The **buffer** is a **temporary staging area** only—it allows the agent to def
 | Policy        | `pallet_rl.models.rsl_rl_wrapper.PalletizerActorCritic` (Box Actions) |
 | Algorithm     | RSL-RL `OnPolicyRunner` with PPO                                     |
 | Observations  | Heightmap (Warp GPU kernel) + buffer + box dims + mass/payload + constraints |
-| Actions       | Box(-1, 1, shape=(5,)). Decoded to: [Operation(3), Slot(10), X(16), Y(24), Rotation(2)] |
+| Actions       | Box(-1, 1, shape=(5,)). Decoded to: PLACE/RETRIEVE/STORE operations on a grid |
 
 ### Observation Space (38491-dim)
 
@@ -355,7 +355,9 @@ python scripts/mockup_video_physics.py \
 
 ## Multi-GPU Setup
 
-On machines with mixed GPU architectures (e.g. GTX 1080 Ti on GPU 0/1, RTX 6000 on GPU 2), Isaac Sim must target an **RTX-capable** GPU (compute capability ≥ 7.5 recommended for Warp kernels) for both rendering and PhysX.
+On machines with mixed GPU architectures (e.g. GTX 1080 Ti on GPU 0/1, RTX 6000 on GPU 2), Isaac Sim must target an **RTX-capable** GPU for both rendering and PhysX. 
+
+**Automatic GPU selection requires Compute Capability ≥ 7.5** (e.g. RTX 20-series, 30-series, 40-series, or Quadro/RTX 6000+).
 
 ### Key points
 
@@ -368,7 +370,9 @@ On machines with mixed GPU architectures (e.g. GTX 1080 Ti on GPU 0/1, RTX 6000 
   --device cuda:2
 ```
 
-The mockup script automatically injects `--/renderer/activeGpu=N` and `--/physics/cudaDevice=N` from `--device cuda:N`. To override manually:
+The mockup script derives defaults for `--/renderer/activeGpu` and `--/physics/cudaDevice` from the selected `--device cuda:N`. 
+
+**Manual overrides take precedence.** If you explicitly pass Kit args, they are respected:
 
 ```bash
 ~/isaac-sim/python.sh scripts/mockup_video_physics.py \
@@ -447,7 +451,7 @@ pallet_rl/
 ├── envs/
 │   └── pallet_task.py           # Isaac Lab DirectRLEnv palletizing task
 ├── models/
-│   └── rsl_rl_wrapper.py        # PalletizerActorCritic (MultiDiscrete)
+│   └── rsl_rl_wrapper.py        # PalletizerActorCritic (Box actions with internal decoding)
 ├── utils/
 │   ├── heightmap_rasterizer.py  # Warp-based GPU heightmap kernel
 │   ├── depth_heightmap.py       # Depth camera → heightmap pipeline

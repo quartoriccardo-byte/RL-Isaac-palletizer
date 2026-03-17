@@ -92,9 +92,9 @@ class PalletizerActorCritic(ActorCritic):
         # - Added payload_norm and current_box_mass_norm
         # - Added max_payload_norm and max_stack_height_norm (for future domain randomization)
         self.image_shape = (160, 240)
-        self.image_dim = 160 * 240  # 38400
+        self.image_dim = self.image_shape[0] * self.image_shape[1]  # 38400
         # Buffer (60) + Box dims (3) + payload_norm (1) + mass_norm (1) + max_payload_norm (1) + max_stack_height_norm (1) + Proprio (24) = 91
-        self.vector_dim = 91  # was 89
+        self.vector_dim = 91
         
         # ---------------------------------------------------------------------
         # Visual Encoder (CNN)
@@ -122,9 +122,8 @@ class PalletizerActorCritic(ActorCritic):
             nn.ELU()
         )
         
-        # ---------------------------------------------------------------------
         # Vector Encoder (MLP)
-        # Input: (N, 77) = Buffer (50) + Box dims (3) + Proprio (24)
+        # Input: (N, 91) = Buffer (60) + Box dims (3) + payload/mass/constraints (4) + Proprio (24)
         # Output: (N, 64)
         # ---------------------------------------------------------------------
         self.mlp = nn.Sequential(
@@ -273,7 +272,7 @@ class PalletizerActorCritic(ActorCritic):
         
         # Split observation
         images = obs_tensor[:, :self.image_dim]
-        images = images.view(-1, 1, 160, 240)
+        images = images.view(-1, 1, self.image_shape[0], self.image_shape[1])
         
         # Vector = Buffer (60) + Box dims (3) + payload/mass/constraints (4) + Proprio (24) = 91 dims
         vector = obs_tensor[:, self.image_dim:self.image_dim + self.vector_dim]
@@ -347,8 +346,10 @@ class PalletizerActorCritic(ActorCritic):
         y_start = x_start + self.action_dims[2]
 
         # Mask out logits corresponding to grid X/Y that are invalid for
-        # all Y/X respectively. This is still factored but strictly
-        # height-consistent and used identically in train and eval.
+        # all Y/X respectively. 
+        # WARNING: This fallback mask is non-authoritative and depends 
+        # strictly on the observation vector layout defined in PalletTask.
+        # It is used as a safety prior for the actor.
         mask[:, x_start : x_start + num_x] &= ~all_y_invalid_at_x
         mask[:, y_start : y_start + num_y] &= ~all_x_invalid_at_y
 
