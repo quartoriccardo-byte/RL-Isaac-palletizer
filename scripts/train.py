@@ -136,10 +136,14 @@ def main():
     # unknown contains Kit/Carb settings like --/rtx/post/dlss/execMode=0
     args, unknown = parse_args()
     
-    # Force supported GPU (RTX 6000 vs 1080 Ti)
-    start_idx, forced_device = pick_supported_cuda_device()
-    args.device = forced_device
-    print(f"[INFO] Overriding CLI device with forced supported GPU: {args.device}")
+    # Selective GPU selection (RTX 6000 vs 1080 Ti)
+    # Only override if using the generic 'cuda' default
+    if args.device == "cuda":
+        start_idx, forced_device = pick_supported_cuda_device()
+        args.device = forced_device
+        print(f"[INFO] Auto-selected supported GPU: {args.device}")
+    else:
+        print(f"[INFO] Using user-specified device: {args.device}")
     
     # =========================================================================
     # CRITICAL: Inject Kit/Carb args into sys.argv BEFORE importing AppLauncher

@@ -7,7 +7,7 @@
 
 ---
 
-This document captures the current high‑level architecture of the `RL-Isaac-palletizer` repo as it exists in this workspace, before additional refactors.
+This document captures the historical high‑level architecture of the `RL-Isaac-palletizer` repo as it existed before the deep modularization refactor.
 
 ### Top‑Level Overview
 

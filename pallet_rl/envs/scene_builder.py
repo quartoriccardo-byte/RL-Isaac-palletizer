@@ -57,7 +57,7 @@ def _create_prim(path: str, prim_type: str, attributes: dict = None):
 
 def setup_scene(cfg, scene):
     """
-    Configure stage-level scene objects (Isaac Lab 5.0 API).
+    Configure stage-level scene objects.
 
     Handles:
       1. Ground plane spawning (with visual material).

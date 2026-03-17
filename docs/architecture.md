@@ -111,7 +111,7 @@ Both conform to `BaseHeightmapBackend`, keeping `observation_builder` clean.
 
 **Note to Contributors:** The integration of the CNN-based `PalletizerActorCritic` into RSL-RL is handled via a **monkey-patch workaround**, not a native dependency injection framework.
 
-RSL-RL (v1/v2) hardcodes policy lookups against its own internal `rsl_rl.modules` namespace. To inject our custom image+vector fusion network without forking the trainer, we provide a centralized hook:
+RSL-RL resolves policy_class_name via a direct lookup against its internal `rsl_rl.modules` namespace. To inject our custom image+vector fusion network without forking the trainer, we provide a centralized hook:
 
 ```python
 # pallet_rl.models.rsl_rl_wrapper

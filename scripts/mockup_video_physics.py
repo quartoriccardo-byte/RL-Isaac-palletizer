@@ -340,15 +340,23 @@ import cv2                # deferred from top-of-file
 import numpy as np
 import torch              # deferred from top-of-file
 
-# DO NOT probe or set CUDA devices unilaterally.
-if args.device.startswith("cuda"):
+# Selective GPU selection (RTX 6000 vs 1080 Ti)
+# Only override if using the generic 'cuda' default
+if args.device == "cuda":
     from pallet_rl.utils.device_utils import pick_supported_cuda_device
     _cuda_idx, forced_device = pick_supported_cuda_device()
     args.device = forced_device
     torch.cuda.set_device(_cuda_idx)
-    print(f"[INFO] PyTorch CUDA device: {args.device}  (CUDA idx {_cuda_idx})")
+    print(f"[INFO] Auto-selected supported GPU: {args.device} (CUDA idx {_cuda_idx})")
 else:
-    print(f"[INFO] PyTorch CPU device selected. (Skipping pick_supported_cuda_device)")
+    print(f"[INFO] Using user-specified device: {args.device}")
+    if args.device.startswith("cuda"):
+        # Still need to set torch device if user specified a cuda index
+        try:
+            _idx = int(args.device.split(":")[-1])
+            torch.cuda.set_device(_idx)
+        except:
+            pass
 if args.physics_device == "cpu":
     print(f"[INFO] Kit renderer: Vulkan GPU 2 | PhysX: CPU (no CUDA context)")
 else:

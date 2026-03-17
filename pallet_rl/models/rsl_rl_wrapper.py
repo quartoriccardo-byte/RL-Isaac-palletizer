@@ -24,9 +24,10 @@ def register_custom_policy():
     """
     Registers the custom PalletizerActorCritic with RSL-RL.
 
-    Isaac Lab relies on RSL-RL for PPO generation. In RSL-RL v1/v2, the 
-    OnPolicyRunner resolves the policy class by looking up `rsl_rl.modules.PolicyName`.
-    The cleanest available workaround to inject a custom architecture is to patch 
+    Isaac Lab relies on RSL-RL for PPO generation. In this repo's 
+    intended stack, the OnPolicyRunner resolves the policy class by 
+    looking up `rsl_rl.modules.PolicyName`. The cleanest available 
+    workaround to inject a custom architecture is to patch 
     this global namespace before the runner is instantiated.
     """
     import rsl_rl.modules
@@ -69,6 +70,7 @@ class PalletizerActorCritic(ActorCritic):
         critic_hidden_dims: list[int] = [256, 128],
         activation: str = 'elu',
         init_noise_std: float = 1.0,
+        max_height: float = 2.0,
         **kwargs
     ):
         # Initialize nn.Module directly (we override everything)
@@ -78,6 +80,7 @@ class PalletizerActorCritic(ActorCritic):
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
         self.num_actions = num_actions
+        self.max_height = max_height
         
         # Action space definition
         self.action_dims = [3, 10, 16, 24, 2]  # Op, Slot, X, Y, Rot
@@ -288,10 +291,11 @@ class PalletizerActorCritic(ActorCritic):
         """
         Compute a height-based action mask directly from observations.
 
-        This mirrors the environment-side masking logic but runs purely
-        on the policy side so that training and evaluation both enforce
-        the same validity constraints even when the runner is unaware of
-        action masks.
+        This provides an auxiliary height-based filter directly from observations.
+        NOTE: The environment-side validity logic in `PlacementController` 
+        is the authoritative source of truth for physical constraints.
+        This policy-side mask is a conservative fallback that must correspond 
+        to the env-side checks.
         """
         obs_tensor = self._unwrap_obs(obs)
         device = obs_tensor.device
@@ -304,10 +308,10 @@ class PalletizerActorCritic(ActorCritic):
             return mask
 
         # Heightmap (normalized to [0,1]) → meters
-        images = obs_tensor[:, :self.image_dim].view(-1, 1, 160, 240)
+        images = obs_tensor[:, :self.image_dim].view(-1, 1, self.image_shape[0], self.image_shape[1])
         heightmap_norm = images[:, 0]
-        max_height_m = 2.0  # must match PalletTaskCfg.max_height
-        heightmap = heightmap_norm * max_height_m
+        # max_height is stored on policy instance
+        heightmap = heightmap_norm * self.max_height
 
         # Vector slice: [buffer (60), box dims (3), ...]
         vector = obs_tensor[:, self.image_dim : self.image_dim + self.vector_dim]
@@ -316,20 +320,21 @@ class PalletizerActorCritic(ActorCritic):
 
         num_x = self.action_dims[2]
         num_y = self.action_dims[3]
-        H, W = 160, 240
-
+        image_h, image_w = self.image_shape
+        
         grid_xs = torch.arange(num_x, device=device)
         grid_ys = torch.arange(num_y, device=device)
 
-        pixel_xs = (grid_xs.float() / max(1, num_x - 1) * (W - 1)).long().clamp(0, W - 1)
-        pixel_ys = (grid_ys.float() / max(1, num_y - 1) * (H - 1)).long().clamp(0, H - 1)
+        pixel_xs = (grid_xs.float() / max(1, num_x - 1) * (image_w - 1)).long().clamp(0, image_w - 1)
+        pixel_ys = (grid_ys.float() / max(1, num_y - 1) * (image_h - 1)).long().clamp(0, image_h - 1)
 
         # all_heights: (B, num_y, num_x)
         all_heights = heightmap[:, pixel_ys[:, None], pixel_xs[None, :]]
         predicted_tops = all_heights + box_h[:, None, None]
 
-        max_stack_height = 1.8  # must match PalletTaskCfg.max_stack_height
-        grid_invalid = predicted_tops > max_stack_height
+        # max_stack_height is derived from observation (normalized by 3.0)
+        max_stack_height = vector[:, 67] * 3.0
+        grid_invalid = predicted_tops > max_stack_height[:, None, None]
 
         all_y_invalid_at_x = grid_invalid.all(dim=1)  # (B, num_x)
         all_x_invalid_at_y = grid_invalid.all(dim=2)  # (B, num_y)

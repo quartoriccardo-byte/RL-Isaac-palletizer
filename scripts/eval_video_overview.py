@@ -111,10 +111,14 @@ def main():
     """Main evaluation entry point."""
     args, unknown = parse_args()
     
-    # Force supported GPU (RTX 6000 vs 1080 Ti)
-    _, forced_device = pick_supported_cuda_device()
-    args.device = forced_device
-    print(f"[INFO] Overriding CLI device with forced supported GPU: {args.device}")
+    # Selective GPU selection (RTX 6000 vs 1080 Ti)
+    # Only override if using the generic 'cuda' default
+    if args.device == "cuda":
+        _, forced_device = pick_supported_cuda_device()
+        args.device = forced_device
+        print(f"[INFO] Auto-selected supported GPU: {args.device}")
+    else:
+        print(f"[INFO] Using user-specified device: {args.device}")
     
     # Force enable cameras for mosaic recording
     args.enable_cameras = True
@@ -302,7 +306,7 @@ def main():
     # ==========================================================================
 
     print(f"\n{'='*60}")
-    print("Isaac Lab 5.0+ Mosaic Evaluation Video")
+    print("Isaac Lab 4.x Mosaic Evaluation Video")
     print(f"{'='*60}")
     print(f"Device: {args.device}")
     print(f"Environments: {args.num_envs}")

@@ -310,7 +310,7 @@ def _log_kpis(env: PalletTask):
     buffer_nonempty_end_rate = env._kpi_buffer_nonempty_at_end / total_episodes
 
     invalid_action_rate = getattr(env, "_kpi_invalid_action_count", torch.zeros(1)).to(env._device) / (
-        total_settle + 1e-8
+        float(env.num_envs) * env.common_step_counter + 1e-8
     )
 
     env.extras["metrics/place_success_rate"] = place_success_rate.detach().cpu().item()

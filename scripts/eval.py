@@ -45,10 +45,14 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Force supported GPU (RTX 6000 vs 1080 Ti)
-    _, forced_device = pick_supported_cuda_device()
-    args.device = forced_device
-    print(f"[INFO] Overriding CLI device with forced supported GPU: {args.device}")
+    # Selective GPU selection (RTX 6000 vs 1080 Ti)
+    # Only override if using the generic 'cuda' default
+    if args.device == "cuda":
+        _, forced_device = pick_supported_cuda_device()
+        args.device = forced_device
+        print(f"[INFO] Auto-selected supported GPU: {args.device}")
+    else:
+        print(f"[INFO] Using user-specified device: {args.device}")
 
     # Launch Isaac Lab app before other imports that touch simulation
     from isaaclab.app import AppLauncher

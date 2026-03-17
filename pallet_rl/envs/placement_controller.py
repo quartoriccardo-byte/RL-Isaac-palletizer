@@ -27,6 +27,9 @@ Grid → World Mapping
   - Pallet size = (1.2, 0.8) m, centered at origin.
   - grid_x: 0..15 → X: -0.6..+0.6 m  (step = 0.075 m)
   - grid_y: 0..23 → Y: -0.4..+0.4 m  (step = 0.0333 m)
+
+This component is the AUTHORITATIVE source of truth for action validity 
+and environment-side physical constraints.
 """
 
 from __future__ import annotations

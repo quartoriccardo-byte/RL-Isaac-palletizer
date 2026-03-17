@@ -8,7 +8,7 @@ pipeline is agnostic to the heightmap source.
 All operations stay on GPU. No CPU copies.
 
 Pipeline:
-    depth (N, H_cam, W_cam) → noise → unproject to 3D → world transform
+    depth (N, H_cam, W_cam) → noise → unproject (Camera Frame) → transform (World Frame)
     → crop to pallet region → rasterize (scatter_reduce amax) → (N, H_map, W_map)
 """
 
@@ -182,39 +182,43 @@ class DepthHeightmapConverter:
         # 1. Apply noise
         depth = self.apply_noise(depth)
 
-        # 2. Unproject X and Y to world
-        # For a top-down camera (looking along -Z):
-        # - The camera's local Z axis points straight down into the ground.
-        # - Depth is distance *along* this Z axis.
-        # - Camera local X maps to World X.
-        # - Camera local Y (down in image) maps to World -Y (up on pallet).
+        # 2. Points in Camera Frame (OpenCV: +Z forward)
+        # depth: (N, H, W)
+        # self._ray_x: (H*W,)
         depth_flat = depth.reshape(N, -1)  # (N, H*W)
-
-        # Directly compute World X and Y from image-plane rays, 
-        # scaled by depth to find intersection points.
-        # OpenCV -> World mapping: 
-        #   World X = Camera X 
-        #   World Y = -Camera Y
-        x_world = self._ray_x.unsqueeze(0).expand(N, -1) * depth_flat
-        y_world = -self._ray_y.unsqueeze(0).expand(N, -1) * depth_flat
         
-        # Absolute physical height relies solely on configured altitude 
-        sensor_height = self.cfg.sensor_height_m
-        z_world_unclamped = sensor_height - depth_flat
-        
-        # Explicit background masking: 
-        # Depths close to sensor_z correspond to the floor/background (height ~ 0)
-        # We enforce a hard cutoff to avoid considering noisy far-plane as real objects.
-        bg_thresh = self.cfg.sensor_height_m - 0.005
-        bg_mask = (depth_flat >= bg_thresh)
+        # p_cam: (N, 3, H*W)
+        p_cam = torch.stack([
+            self._ray_x.unsqueeze(0).expand(N, -1) * depth_flat,
+            self._ray_y.unsqueeze(0).expand(N, -1) * depth_flat,
+            depth_flat
+        ], dim=1)
 
-        # Clamp heights strictly below 0 (underground) up to 0. 
-        # This occurs on the floor due to noise or interpolation.
+        # 3. Transform to World Frame
+        # R: (N, 3, 3), T: (N, 3, 1)
+        R = self._quat_to_rotation_matrix(cam_quat_wxyz)
+        T = cam_pos.unsqueeze(2)
+        
+        # p_world: (N, 3, H*W) = R * p_cam + T
+        p_world = torch.bmm(R, p_cam) + T
+        
+        x_world = p_world[:, 0, :]
+        y_world = p_world[:, 1, :]
+        z_world_unclamped = p_world[:, 2, :]
+        
+        # 4. Explicit Background Masking
+        # Depths close to the background plane are masked (if background plane exists).
+        # We also enforce a hard cutoff below ground (Z < 0).
         z_world = torch.clamp(z_world_unclamped, min=0.0)
+        
+        # Background mask (depth-based or height-based)
+        # If the camera is looking down from 3m, heights ~0m are background.
+        bg_thresh = 0.005 # Threshold above ground to consider "not floor"
+        bg_mask = (z_world < bg_thresh)
 
         valid = (
             (depth_flat > 0.01)       # discard dropout/invalid
-            & (~bg_mask)              # discard empty background / floor
+            & (~bg_mask)              # discard floor/background
             & (x_world >= self._crop_x_min)
             & (x_world < self._crop_x_max)
             & (y_world >= self._crop_y_min)

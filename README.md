@@ -31,7 +31,7 @@ The **buffer** is a **temporary staging area** only—it allows the agent to def
 | Component | Size | Description |
 |-----------|------|-------------|
 | Heightmap | 38400 | Normalized heights (160×240 grid, Warp GPU kernel) |
-| Buffer State | 60 | 10 slots × 6 features [L, W, H, ID, Age, Mass] |
+| Buffer State | 60 | 10 slots × 6 features [L, W, H, OccupiedFlag, Age, Mass] |
 | Box Dimensions | 3 | Current box L, W, H in meters |
 | Payload Norm | 1 | `payload_kg / max_payload_kg` |
 | Box Mass Norm | 1 | `current_box_mass / max_box_mass` |
@@ -47,7 +47,7 @@ The **buffer** is a **temporary staging area** only—it allows the agent to def
 
 | Constraint | Mechanism | Effect |
 |------------|-----------|--------|
-| **Max Stack Height** | Action masking via `get_action_mask()` | Invalid grid cells masked; attempting blocked → `reward_invalid_height` |
+| **Max Stack Height** | Env-side + Policy-side masking | Enforced in `PlacementController` (authoritative) and auxiliary policy filter |
 | **Max Payload** | Infeasibility termination | Episode ends if prospective total mass exceeds limit |
 
 ### Stability Evaluation
@@ -66,18 +66,24 @@ Drift thresholds:
 
 ### Reward Hierarchy
 
-Rewards are tuned to ensure correct learning priority:
+Rewards are categorized into immediate action terms and long-term settling/outcome terms:
 
+#### Immediate Action Terms
 | Event | Reward | Rationale |
 |-------|--------|-----------|
-| **Physical collapse / Drift** | **-10.0** | Severe—safety-critical stability failure |
-| **Infeasible termination** | **-4.0** | Moderate—forces rollout end |
 | **Invalid height action** | **-2.0** | Small—attempted placement in blocked cell |
+| **Infeasible payload** | **-4.0** | Moderate—detected prospective mass limit breach |
 | **Buffer Store Attempt** | **-0.1** | Penalty for deferring placement |
 | **Valid Buffer Retrieve** | **+2.0** | Incentive for successful restoration |
-| **Buffer Aging** | **-0.01 / step** | Penalty for holding boxes in buffer too long |
-| **Stable placement** | **+1.0** | Positive reinforcement for success |
-| **Volume Bonus** | **+Volume** | Continuous bonus based on box volume |
+| **Buffer Aging** | **-0.01 / step** | Penalty for holding boxes (only aged if slot occupied) |
+
+#### Settling & Outcome Terms
+| Event | Reward | Rationale |
+|-------|--------|-----------|
+| **Physical collapse / Fall** | **-25.0** | Severe—safety-critical stability failure (Z < 0.05m) |
+| **Excessive Drift** | **-3.0** | Moderate—placement unstable after settling window |
+| **Stable placement** | **+1.0** | Positive reinforcement for successful settling |
+| **Volume Bonus** | **+Volume** | Continuous bonus based on box volume for success |
 
 > **Note**: These values are used in the default reward manager. The code is the final source of truth for the active weights.
 
@@ -96,6 +102,7 @@ Example: `Place A → Store slot0 → Place B → Retrieve slot0` returns box A 
 When storing/retrieving:
 
 - Mass is tracked in `buffer_state[:, :, 5]`
+- physical IDs are tracked internally in `buffer_box_id`, not directly exposed in the observation vector.
 - STORE removes mass from `payload_kg`
 - RETRIEVE adds mass back to `payload_kg`
 
@@ -137,7 +144,7 @@ Task KPIs are emitted via `self.extras` and logged to TensorBoard under `metrics
 | `episode_infeasible_rate` | Fraction of episodes that ended due to infeasibility |
 | `episode_failure_rate` | Fraction of episodes that ended in other failures (collapse, drift, etc.) |
 | `episode_buffer_nonempty_end_rate` | Fraction of episodes that ended while the buffer was still non-empty |
-| `invalid_action_rate` | Fraction of RL steps with a height-invalid PLACE/RETRIEVE attempt |
+| `invalid_action_rate` | Normalized rate of height-invalid PLACE/RETRIEVE attempts per environment step |
 
 ---
 
@@ -348,7 +355,7 @@ python scripts/mockup_video_physics.py \
 
 ## Multi-GPU Setup
 
-On machines with mixed GPU architectures (e.g. GTX 1080 Ti on GPU 0/1, RTX 6000 on GPU 2), Isaac Sim must target an **RTX-capable** GPU (compute capability ≥ 7.0) for both rendering and PhysX.
+On machines with mixed GPU architectures (e.g. GTX 1080 Ti on GPU 0/1, RTX 6000 on GPU 2), Isaac Sim must target an **RTX-capable** GPU (compute capability ≥ 7.5 recommended for Warp kernels) for both rendering and PhysX.
 
 ### Key points
 
