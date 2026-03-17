@@ -36,22 +36,6 @@ def test_decode_action_rectangular():
     print("✓ decode_action rectangular grid tests passed")
 
 
-def test_action_mean_no_mutation():
-    """Deprecated: legacy ActorCritic implementation has been removed.
-
-    This test is kept as a placeholder to document the original bug
-    but no longer runs against any live code.
-    """
-    pass
-
-
-def test_mask_shape_contract():
-    """Deprecated: legacy SpatialPolicyHead has been removed.
-
-    Action masking is now implemented securely downstream of the action adapter.
-    This test serves only as a historical graveyard map.lletTask for details.
-    """
-    pass
 
 
 def test_terminated_truncated_types():

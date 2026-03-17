@@ -65,28 +65,27 @@ def build_observations(env: PalletTask) -> dict[str, torch.Tensor]:
     buffer_flat = env.buffer_state.view(n, -1)
 
     # ------------------------------------------------------------------
-    # 5. Current box dimensions (respect num_boxes semantics)
+    # 5. Current box dimensions and mass (respect num_boxes semantics)
     # ------------------------------------------------------------------
     # When there is no fresh box remaining in the episode stream
-    # (box_idx >= num_boxes), expose a neutral "no-box" encoding instead
-    # of reusing stale dimensions from clamped indices.
+    # (box_idx >= num_boxes), expose a neutral "no-box" encoding.
     idx = env.box_idx.clamp(0, cfg.max_boxes - 1)
     env_idx = torch.arange(n, device=device)
     current_dims = env.box_dims[env_idx, idx]
+    current_box_mass = env.box_mass_kg[env_idx, idx]
 
     no_fresh_mask = env.box_idx >= cfg.num_boxes
     if no_fresh_mask.any():
-        # Zero dims acts as a neutral sentinel; policy can learn that
-        # no more fresh boxes are available from this encoding.
         current_dims = current_dims.clone()
         current_dims[no_fresh_mask] = 0.0
+        current_box_mass = current_box_mass.clone()
+        current_box_mass[no_fresh_mask] = 0.0
 
     # ------------------------------------------------------------------
     # 6. Payload and mass observations
     # ------------------------------------------------------------------
     payload_norm = (env.payload_kg / cfg.max_payload_kg).unsqueeze(-1)
     max_box_mass = cfg.base_box_mass_kg + cfg.box_mass_variance
-    current_box_mass = env.box_mass_kg[env_idx, idx]
     current_mass_norm = (current_box_mass / max_box_mass).unsqueeze(-1)
 
     # ------------------------------------------------------------------

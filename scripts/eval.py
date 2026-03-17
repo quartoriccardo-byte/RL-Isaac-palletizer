@@ -66,10 +66,8 @@ def main():
             from rsl_rl.runners import OnPolicyRunner
         except ImportError as e:
             raise ImportError(
-                "Failed to import rsl_rl. Please install RSL-RL:\n"
-                "  Option 1 (recommended): pip install git+https://github.com/leggedrobotics/rsl_rl.git@<commit>\n"
-                "  Option 2: pip install -e /path/to/rsl_rl\n"
-                "  Option 3: If using Isaac Lab environment, rsl_rl may already be available.\n"
+                "Failed to import rsl_rl. Please install the training dependencies via:\n"
+                "  pip install -e '.[train]'\n"
                 f"Original error: {e}"
             ) from e
 

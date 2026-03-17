@@ -70,13 +70,16 @@ Rewards are tuned to ensure correct learning priority:
 
 | Event | Reward | Rationale |
 |-------|--------|-----------|
-| Physical collapse (box falls) | **-25.0** | Most severe—safety-critical |
-| Infeasible termination | **-4.0** | Moderate—not directly agent's fault |
-| Unstable placement (drift) | **-3.0** | Mild—recoverable quality issue |
-| Invalid height action | **-2.0** | Small—should be masked anyway |
-| Stable successful placement | **+1.0** | Positive reinforcement |
+| **Physical collapse / Drift** | **-10.0** | Severe—safety-critical stability failure |
+| **Infeasible termination** | **-4.0** | Moderate—forces rollout end |
+| **Invalid height action** | **-2.0** | Small—attempted placement in blocked cell |
+| **Buffer Store Attempt** | **-0.1** | Penalty for deferring placement |
+| **Valid Buffer Retrieve** | **+2.0** | Incentive for successful restoration |
+| **Buffer Aging** | **-0.01 / step** | Penalty for holding boxes in buffer too long |
+| **Stable placement** | **+1.0** | Positive reinforcement for success |
+| **Volume Bonus** | **+Volume** | Continuous bonus based on box volume |
 
-> **Note**: Infeasible termination has a moderate penalty because it depends on box generation, not agent action quality. It should not dominate PPO gradients.
+> **Note**: These values are used in the default reward manager. The code is the final source of truth for the active weights.
 
 ---
 
@@ -169,7 +172,7 @@ cd RL-Isaac-palletizer   # repo root
 # Base install (without RSL-RL training dependencies)
 pip install -e .
 
-# Training install (includes RSL-RL from GitHub)
+# Training install (includes RSL-RL 3.2.x from PyPI)
 pip install -e ".[train]"
 
 # Quick import check
@@ -288,7 +291,7 @@ Output: `runs/mosaic_eval/rl-video-step-0.mp4` with 2×4 tiled view.
 Generate a demonstration video showing scripted box packing:
 
 ```bash
-python scripts/mockup_video.py \
+python scripts/mockup_video_physics.py \
   --headless \
   --output_path mockup_demo.mp4 \
   --num_boxes 15 \
@@ -355,7 +358,7 @@ On machines with mixed GPU architectures (e.g. GTX 1080 Ti on GPU 0/1, RTX 6000 
 
 ```bash
 # Example: RTX 6000 is GPU 2
-~/isaac-sim/python.sh scripts/mockup_video.py \
+~/isaac-sim/python.sh scripts/mockup_video_physics.py \
   --headless \
   --device cuda:2 \
   --num_boxes 15 \
@@ -365,7 +368,7 @@ On machines with mixed GPU architectures (e.g. GTX 1080 Ti on GPU 0/1, RTX 6000 
 The mockup script automatically injects `--/renderer/activeGpu=N` and `--/physics/cudaDevice=N` from `--device cuda:N`. To override manually:
 
 ```bash
-~/isaac-sim/python.sh scripts/mockup_video.py \
+~/isaac-sim/python.sh scripts/mockup_video_physics.py \
   --headless --device cuda:2 \
   --/renderer/activeGpu=2 \
   --/physics/cudaDevice=2
@@ -454,7 +457,7 @@ scripts/
 ├── train.py                     # Training entrypoint
 ├── eval.py                      # Evaluation entrypoint
 ├── eval_video_overview.py       # Mosaic evaluation video
-└── mockup_video.py              # Scripted demo video generator
+└── mockup_video_physics.py      # Scripted demo video generator
 tests/
 ├── test_action_fix.py           # Action space fix tests
 ├── test_depth_heightmap.py      # Depth heightmap tests

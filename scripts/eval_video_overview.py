@@ -1,5 +1,5 @@
 """
-Isaac Lab 5.0+ Evaluation Video Overview Script
+Isaac Lab Evaluation Video Overview Script
 
 Records a tiled mosaic video showing multiple parallel environments
 during policy evaluation. Each environment's camera view is composed
@@ -183,8 +183,8 @@ def main():
         from rsl_rl.runners import OnPolicyRunner
     except ImportError as e:
         raise ImportError(
-            "Failed to import rsl_rl. Please install RSL-RL:\n"
-            "  pip install git+https://github.com/leggedrobotics/rsl_rl.git\n"
+            "Failed to import rsl_rl. Please install the training dependencies via:\n"
+            "  pip install -e '.[train]'\n"
             f"Original error: {e}"
         ) from e
 
@@ -333,6 +333,8 @@ def main():
         print("[INFO] Warming up camera with 10 render passes...")
         obs, _ = env.reset()
         for i in range(10):
+            # Zeros were only used for render warm-up; they are not semantic no-ops.
+            # reset() afterwards restores a clean initial state.
             action = torch.zeros(env.num_envs, 5, device=args.device)
             obs, _, _, _, _ = env.step(action)
             frame = env.render()

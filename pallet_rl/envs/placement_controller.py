@@ -290,15 +290,18 @@ def _validate_height_constraint(
     # the computation lightweight and GPU-friendly.
     H, W = cfg.map_shape
     offsets = torch.tensor([-1, 0, 1], device=device, dtype=torch.long)
-    off_x = pixel_x[:, None] + offsets[None, :]
-    off_y = pixel_y[:, None] + offsets[None, :]
-    off_x = off_x.clamp(0, W - 1)
-    off_y = off_y.clamp(0, H - 1)
+    # Cartesian product for a true 3x3 neighborhood
+    grid_off_y, grid_off_x = torch.meshgrid(offsets, offsets, indexing="ij")
+    grid_off_y = grid_off_y.reshape(-1)
+    grid_off_x = grid_off_x.reshape(-1)
 
-    # Gather local 3×3 neighborhood heights
+    off_y = (pixel_y[:, None] + grid_off_y[None, :]).clamp(0, H - 1)
+    off_x = (pixel_x[:, None] + grid_off_x[None, :]).clamp(0, W - 1)
+
+    # Gather local 3×3 (9 points) neighborhood heights
     hmap = env._last_heightmap
-    local_heights = hmap[env_idx[:, None], off_y, off_x]  # (N, 3)
-    max_local_height, _ = local_heights.max(dim=1)
+    local_heights = hmap[env_idx[:, None], off_y, off_x]  # (N, 9)
+    max_local_height = local_heights.max(dim=1).values
 
     predicted_top = max_local_height + box_height
 

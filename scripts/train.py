@@ -232,10 +232,8 @@ def main():
         from rsl_rl.runners import OnPolicyRunner
     except ImportError as e:
         raise ImportError(
-            "Failed to import rsl_rl. Please install RSL-RL:\n"
-            "  Option 1 (recommended): pip install git+https://github.com/leggedrobotics/rsl_rl.git@<commit>\n"
-            "  Option 2: pip install -e /path/to/rsl_rl\n"
-            "  Option 3: If using Isaac Lab environment, rsl_rl may already be available.\n"
+            "Failed to import rsl_rl. Please install the training dependencies via:\n"
+            "  pip install -e '.[train]'\n"
             f"Original error: {e}"
         ) from e
 
@@ -494,7 +492,8 @@ def main():
             import torch
             obs, _ = env.reset()
             for i in range(10):
-                # Step with no-op action (zeros)
+                # Zeros were only used for render warm-up; they are not semantic no-ops.
+                # reset() afterwards restores a clean initial state.
                 action = torch.zeros(env.num_envs, 5, device=args.device)
                 obs, _, _, _, _ = env.step(action)
                 frame = env.render()

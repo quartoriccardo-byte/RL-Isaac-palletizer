@@ -151,9 +151,9 @@ def _queue_kpi_evaluations(env: PalletTask):
     """Queue place/retrieve actions for settled KPI evaluation."""
     cfg = env.cfg
 
-    # Separate PLACE and RETRIEVE queuing
-    if env.active_place_mask.any():
-        place_envs = env.active_place_mask.nonzero(as_tuple=False).flatten()
+    valid_place = env.active_place_mask & ~env._height_invalid_mask & (env.last_moved_box_id >= 0)
+    if valid_place.any():
+        place_envs = valid_place.nonzero(as_tuple=False).flatten()
         env._kpi_countdown[place_envs] = cfg.kpi_settle_steps + 1
         env._kpi_pending_type[place_envs] = 1
         env._kpi_pending_box_id[place_envs] = env.last_moved_box_id[place_envs]

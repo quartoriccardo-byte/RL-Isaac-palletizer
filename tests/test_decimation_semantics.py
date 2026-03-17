@@ -60,6 +60,7 @@ class MockEnv:
         self._height_invalid_mask = torch.zeros(n, dtype=torch.bool, device=self._device)
 
         self.last_moved_box_id = torch.full((n,), -1, dtype=torch.long, device=self._device)
+        self._inactive_box_pos = torch.tensor([10.0, 10.0, 10.0], device=self._device)
         self.last_target_pos = torch.zeros(n, 3, device=self._device)
         self.last_target_quat = torch.zeros(n, 4, device=self._device)
         self.last_target_quat[:, 0] = 1.0
@@ -161,7 +162,7 @@ def test_retrieve_does_not_consume_fresh_box():
     # 2. Store it
     pre_physics_step(env, torch.tensor([[1, 0, 8, 12, 0]], dtype=torch.long))
     assert env.box_idx.item() == 1  # Store doesn't advance
-    assert env.buffer_has_box[0, 0] is True
+    assert env.buffer_has_box[0, 0].item() is True
     
     # 3. Retrieve it
     # Reset height mask which might have been set if we had real perception
@@ -169,7 +170,7 @@ def test_retrieve_does_not_consume_fresh_box():
     pre_physics_step(env, torch.tensor([[2, 0, 8, 12, 0]], dtype=torch.long))
     
     assert env.box_idx.item() == 1, "box_idx must NOT increment on RETRIEVE"
-    assert env.buffer_has_box[0, 0] is False
+    assert env.buffer_has_box[0, 0].item() is False
     assert env.last_moved_box_id.item() == 0, "last_moved_box_id must track retrieved box ID"
 
 

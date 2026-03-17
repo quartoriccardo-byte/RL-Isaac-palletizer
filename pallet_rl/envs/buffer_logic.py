@@ -62,8 +62,8 @@ def handle_buffer_actions(env: PalletTask):
     if env.valid_retrieve.any():
         _execute_retrieve(env, slot_idx, device)
 
-    # Age all buffer slots
-    env.buffer_state[:, :, 4] += 1.0
+    # Age only occupied buffer slots
+    env.buffer_state[:, :, 4] += env.buffer_has_box.float()
 
     # ==================================================================
     # PLACE: Advance box_idx and record last_moved_box_id
