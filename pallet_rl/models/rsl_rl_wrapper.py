@@ -19,6 +19,24 @@ import torch.nn as nn
 cnn_out_dim: int = 256
 hidden_dims: tuple[int, ...] = (128, 64)
 
+# Observation layout constants
+IMAGE_SHAPE = (160, 240)
+VECTOR_DIM = 91
+VECTOR_BOX_DIMS_SLICE = slice(60, 63)
+VECTOR_MAX_STACK_HEIGHT_IDX = 67
+
+"""
+Vector observation layout:
+- buffer (60)
+- current_box_dims (3)
+- payload_norm (1)
+- current_box_mass_norm (1)
+- max_payload_norm (1)
+- max_stack_height_norm (1)
+- proprio (24)
+Total: 91
+"""
+
 
 def register_custom_policy():
     """
@@ -91,10 +109,10 @@ class PalletizerActorCritic(ActorCritic):
         # - Buffer features increased from 5 to 6 (added mass)
         # - Added payload_norm and current_box_mass_norm
         # - Added max_payload_norm and max_stack_height_norm (for future domain randomization)
-        self.image_shape = (160, 240)
+        self.image_shape = IMAGE_SHAPE
         self.image_dim = self.image_shape[0] * self.image_shape[1]  # 38400
-        # Buffer (60) + Box dims (3) + payload_norm (1) + mass_norm (1) + max_payload_norm (1) + max_stack_height_norm (1) + Proprio (24) = 91
-        self.vector_dim = 91
+        # Buffer (60) + current_box_dims (3) + payload/mass/norms (4) + Proprio (24) = 91
+        self.vector_dim = VECTOR_DIM
         
         # ---------------------------------------------------------------------
         # Visual Encoder (CNN)
@@ -291,10 +309,10 @@ class PalletizerActorCritic(ActorCritic):
         Compute a height-based action mask directly from observations.
 
         This provides an auxiliary height-based filter directly from observations.
-        NOTE: The environment-side validity logic in `PlacementController` 
+        NOTE: This wrapper-side mask depends strictly on the current observation 
+        vector layout. The environment-side validity logic in `PlacementController` 
         is the authoritative source of truth for physical constraints.
-        This policy-side mask is a conservative fallback that must correspond 
-        to the env-side checks.
+        This policy-side mask is a conservative fallback.
         """
         obs_tensor = self._unwrap_obs(obs)
         device = obs_tensor.device
@@ -306,18 +324,18 @@ class PalletizerActorCritic(ActorCritic):
         if obs_tensor.shape[1] < self.image_dim + self.vector_dim:
             return mask
 
+        # Extract vector part and verify dimension
+        vector = obs_tensor[:, self.image_dim : self.image_dim + self.vector_dim]
+        assert vector.shape[1] == VECTOR_DIM, f"Unexpected vector dim: {vector.shape[1]} != {VECTOR_DIM}"
+
         # Heightmap (normalized to [0,1]) → meters
         images = obs_tensor[:, :self.image_dim].view(-1, 1, self.image_shape[0], self.image_shape[1])
         heightmap_norm = images[:, 0]
         # max_height is stored on policy instance
         heightmap = heightmap_norm * self.max_height
 
-        # Vector slice: [buffer (60), box dims (3), payload (1), mass (3), constraints (2), proprio (24)]
-        # Indices are hardcoded based on the observation structure defined in VecEnv.
-        idx_box_dims = slice(60, 63)
-        idx_max_height = 67 # max_stack_height_norm
-
-        current_dims = vector[:, idx_box_dims]
+        # Extraction logic depends strictly on the observation vector layout.
+        current_dims = vector[:, VECTOR_BOX_DIMS_SLICE]
         box_h = current_dims[:, 2]
 
         num_x = self.action_dims[2]
@@ -335,7 +353,7 @@ class PalletizerActorCritic(ActorCritic):
         predicted_tops = all_heights + box_h[:, None, None]
 
         # max_stack_height is derived from observation (normalized by 3.0m)
-        max_stack_height = vector[:, idx_max_height] * 3.0
+        max_stack_height = vector[:, VECTOR_MAX_STACK_HEIGHT_IDX] * 3.0
         grid_invalid = predicted_tops > max_stack_height[:, None, None]
 
         all_y_invalid_at_x = grid_invalid.all(dim=1)  # (B, num_x)
