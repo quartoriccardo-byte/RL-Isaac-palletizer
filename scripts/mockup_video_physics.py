@@ -79,7 +79,6 @@ def parse_args():
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--duration_s", type=float, default=20.0)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--enable_cameras", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cam_width", type=int, default=640)
     parser.add_argument("--cam_height", type=int, default=360)
 
@@ -214,21 +213,16 @@ def parse_args():
     return parser.parse_known_args()
 
 
-def inject_kit_args(args, unknown, cuda_idx: int):
-    """Inject safe Kit/Carb args BEFORE AppLauncher reads sys.argv."""
-    if not args.enable_cameras:
-        args.enable_cameras = True
-
-    # ── GPU ordinal mapping ──────────────────────────────────────────
-    # Machine-independent routing: N -> N
-    vulkan_idx = str(cuda_idx)
+def inject_kit_args(args, unknown, cuda_idx: int) -> tuple[int, int]:
+    """Inject safe Kit/Carb args BEFORE AppLauncher reads sys.argv.
+    
+    Returns:
+        tuple[int, int]: (resolved_cuda_idx, resolved_vulkan_idx)
+    """
+    vulkan_idx = cuda_idx
 
     user_kit_args = [a for a in unknown if a.startswith("--/")]
     user_kit_paths = {a.split("=")[0] for a in user_kit_args}
-
-    # Only strip if the user did NOT provide an explicit override
-    if not any(a.startswith("--/physics/cudaDevice=") for a in unknown):
-        user_kit_args = [a for a in user_kit_args if not a.startswith("--/physics/cudaDevice")]
 
     defaults = {
         "--/ngx/enabled": "--/ngx/enabled=false",
@@ -299,6 +293,8 @@ def inject_kit_args(args, unknown, cuda_idx: int):
     for arg in user_kit_args:
         if arg not in sys.argv:
             sys.argv.append(arg)
+    
+    return cuda_idx, vulkan_idx
 
 
 args, unknown = parse_args()
@@ -319,7 +315,7 @@ elif args.device.startswith("cuda:"):
     except ValueError:
         pass
 
-inject_kit_args(args, unknown, cuda_idx)
+cuda_idx, vulkan_idx = inject_kit_args(args, unknown, cuda_idx)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -330,7 +326,7 @@ from isaaclab.app import AppLauncher
 
 # FIX C: Intercept AppLauncher's blind sys.argv.append to stop contradictory flags
 # sys.argv is a built-in list, so we cannot monkeypatch .append directly.
-# Instead, we construct a custom list subclass and temporarily replace sys.argv.
+original_argv_backup = list(sys.argv)
 
 class CleanArgvList(list):
     def append(self, val):
@@ -341,13 +337,12 @@ class CleanArgvList(list):
                 return  # SWALLOW: AppLauncher guesses 0, but we already injected our valid activeGpu
         super().append(val)
 
-_old_argv = sys.argv
-sys.argv = CleanArgvList(_old_argv)
+sys.argv = CleanArgvList(original_argv_backup)
 
 app_launcher = AppLauncher(args)
 
 # Restore the original list type but keep the cleaned contents
-sys.argv = _old_argv
+sys.argv = list(sys.argv)
 # sys.argv now contains exactly what AppLauncher (and Kit) processed.
 
 simulation_app = app_launcher.app
