@@ -1,38 +1,38 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "pallet_rl"
 version = "2.0.0"
 description = "RL for Palletizing with Isaac Lab"
-authors = [{name = "Riccardo4", email = "quartoriccardo@gmail.com"}]
-requires-python = ">=3.10,<3.11"
+authors = [
+    { name = "Riccardo4", email = "quartoriccardo@gmail.com" }
+]
+requires-python = ">=3.11,<3.12"
 dependencies = [
-    # Core runtime dependencies.  These are intentionally constrained to
-    # match a single, known-good Isaac Lab 4.x stack.  Broader version
-    # ranges are not tested and may break the pipeline.
-    "torch>=2.1,<2.3",
-    "gymnasium>=0.29,<0.30",
-    "warp-lang>=1.10,<1.12",
-    "pyyaml>=6.0,<7.0",
+    # Isaac Sim 5.0 / Isaac Lab 5.x runtime provides torch/torchvision and
+    # related CUDA packages. We intentionally do NOT pin torch here to avoid
+    # fighting the bundled Isaac environment.
+    "gymnasium>=0.29",
+    "pyyaml>=6.0",
     "numpy",
+    # Work around the torch/_inductor typing crash seen with newer
+    # typing_extensions on Python 3.11 in this runtime stack.
+    "typing_extensions<4.12",
 ]
 
 [tool.setuptools.packages.find]
 include = ["pallet_rl*"]
 
 [project.optional-dependencies]
-# Training dependencies
-# RSL-RL 3.x provides rsl_rl.modules.ActorCritic which we subclass.
-# 4.x changes the API and is NOT compatible.
 train = [
-    # Tested against rsl-rl-lib 3.2.x; newer major versions are not
-    # supported by this repository.
-    "rsl-rl-lib>=3.2,<3.3",
+    # Practical target for the current port on Isaac Sim 5.0.
+    # Keep this on the 3.3 line first; do not jump to rsl-rl 5.x until the
+    # repo is explicitly adapted and smoke-tested for that API.
+    "rsl-rl-lib>=3.3,<3.4",
 ]
-# Extra dependencies used only by legacy utilities (CPU heightmap channels, etc.).
-# These are not required for the main Isaac Lab + RSL-RL training/eval pipeline.
+
 legacy = [
     "scipy",
 ]
