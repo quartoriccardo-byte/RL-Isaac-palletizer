@@ -132,6 +132,7 @@ def apply_carb_settings(unknown_args: list):
 
 def main():
     """Main training entry point."""
+    print("DEBUG_STAGE: entered main", flush=True)
     # Parse arguments (inside main to avoid import-time side effects)
     # unknown contains Kit/Carb settings like --/rtx/post/dlss/execMode=0
     args, unknown = parse_args()
@@ -483,8 +484,16 @@ def main():
         # ---------------------------------------------------------------------
         # Step 3: Create environment
         # ---------------------------------------------------------------------
+        print("DEBUG_STAGE: before env creation", flush=True)
         print("Creating environment...")
-        env = PalletTask(cfg=env_cfg, render_mode=render_mode)
+        try:
+            env = PalletTask(cfg=env_cfg, render_mode=render_mode)
+        except Exception as e:
+            print(f"DEBUG_FAIL: env creation - {repr(e)}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+        print("DEBUG_STAGE: after env creation", flush=True)
         
         # ---------------------------------------------------------------------
         # Step 3b: Camera warm-up (BEFORE wrapping with RecordVideo)
@@ -499,7 +508,9 @@ def main():
                 # Zeros were only used for render warm-up; they are not semantic no-ops.
                 # reset() afterwards restores a clean initial state.
                 action = torch.zeros(env.num_envs, 5, device=args.device)
+                print(f"DEBUG_STAGE: before warmup env.step {i+1}", flush=True)
                 obs, _, _, _, _ = env.step(action)
+                print(f"DEBUG_STAGE: after warmup env.step {i+1}", flush=True)
                 frame = env.render()
                 if frame is not None:
                     print(f"  Warm-up {i+1}/10: shape={frame.shape} min={frame.min()} max={frame.max()} mean={frame.mean():.2f}")
@@ -508,7 +519,15 @@ def main():
             print("[INFO] Camera warm-up complete")
             # CRITICAL: Reset the environment after warm-up to clear any
             # state mutations (e.g., box consumer advancement) caused by warm-up steps.
-            env.reset()
+            print("DEBUG_STAGE: before warmup env.reset", flush=True)
+            try:
+                env.reset()
+            except Exception as e:
+                print(f"DEBUG_FAIL: warmup env.reset - {repr(e)}", flush=True)
+                import traceback
+                traceback.print_exc()
+                raise
+            print("DEBUG_STAGE: after warmup env.reset", flush=True)
         
         # ---------------------------------------------------------------------
         # Step 4: Apply RecordVideo wrapper (if video recording is requested)
@@ -535,12 +554,15 @@ def main():
                 name_prefix="rl-video",
             )
             print(f"[INFO] Recording videos to: {video_folder}")
+            print("DEBUG_STAGE: after log dir setup (RecordVideo)", flush=True)
         
         # ---------------------------------------------------------------------
         # Step 5: Wrap for RSL-RL
         # ---------------------------------------------------------------------
+        print("DEBUG_STAGE: before RslRl wrapper", flush=True)
         print("Wrapping environment for RSL-RL...")
         env = RslRlVecEnvWrapper(env)
+        print("DEBUG_STAGE: after RslRl wrapper", flush=True)
         
         # ---------------------------------------------------------------------
         # Step 6: Register custom policy class with RSL-RL
@@ -565,12 +587,20 @@ def main():
         print(f"[DEBUG] policy.class_name: {rsl_cfg.get('policy', {}).get('class_name')}")
         print(f"[DEBUG] algorithm.class_name: {rsl_cfg.get('algorithm', {}).get('class_name')}")
         
-        runner = OnPolicyRunner(
-            env=env,
-            train_cfg=rsl_cfg,
-            log_dir=args.log_dir,
-            device=args.device
-        )
+        print("DEBUG_STAGE: before runner init", flush=True)
+        try:
+            runner = OnPolicyRunner(
+                env=env,
+                train_cfg=rsl_cfg,
+                log_dir=args.log_dir,
+                device=args.device
+            )
+        except Exception as e:
+            print(f"DEBUG_FAIL: runner init - {repr(e)}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+        print("DEBUG_STAGE: after runner init", flush=True)
         
         # ---------------------------------------------------------------------
         # Step 8: Load checkpoint if resuming
@@ -584,10 +614,18 @@ def main():
         # ---------------------------------------------------------------------
         print(f"\nStarting training for {args.max_iterations} iterations...\n")
         
-        runner.learn(
-            num_learning_iterations=args.max_iterations,
-            init_at_random_ep_len=True
-        )
+        print("DEBUG_STAGE: before training call", flush=True)
+        try:
+            runner.learn(
+                num_learning_iterations=args.max_iterations,
+                init_at_random_ep_len=True
+            )
+        except Exception as e:
+            print(f"DEBUG_FAIL: training call - {repr(e)}", flush=True)
+            import traceback
+            traceback.print_exc()
+            raise
+        print("DEBUG_STAGE: after training call", flush=True)
         
         print("\nTraining complete.")
         
@@ -598,6 +636,7 @@ def main():
         # Critical: close env first to finalize RecordVideo writers,
         # then close simulation_app. This prevents hangs and ensures
         # video files are properly saved.
+        print("DEBUG_STAGE: before shutdown", flush=True)
         print("\nShutting down...")
         
         if env is not None:
@@ -615,5 +654,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import traceback
+    try:
+        main()
+    except Exception as e:
+        print(f"FATAL PYTHON EXCEPTION: {repr(e)}", flush=True)
+        traceback.print_exc()
+        raise
 
