@@ -16,7 +16,7 @@ runner:
   
   # Training settings
   max_iterations: 2000
-  save_interval: 100
+  save_interval: 10
   
   # Experiment tracking
   experiment_name: palletizer_ppo
