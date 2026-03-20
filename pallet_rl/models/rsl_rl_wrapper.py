@@ -349,6 +349,10 @@ class PalletizerActorCritic(ActorCritic):
         # Constants from canonical environment configuration
         pallet_x, pallet_y = 1.2, 0.8
         eps = 1e-6
+
+        slot_start = self.action_dims[0]
+        x_start = slot_start + self.action_dims[1]
+        y_start = x_start + self.action_dims[2]
         
         step_x = pallet_x / num_x
         step_y = pallet_y / num_y

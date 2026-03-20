@@ -197,7 +197,7 @@ def get_action_mask(env: PalletTask) -> torch.Tensor:
     eff_xy_rot1 = _get_effective_xy_dims(fresh_box_dims, 1) # (N, 2)
     
     px, py = cfg.pallet_size
-    eps = cfg.place_border_epsilon_m
+    eps = getattr(cfg, "place_border_epsilon_m", 1e-6)
 
     # X validity: (N, num_x)
     # Valid if center is okay for EITHER rot0 OR rot1
@@ -293,26 +293,37 @@ def _grid_to_pallet_center(
 
 def _get_effective_xy_dims(
     box_dims: torch.Tensor,
-    rot_idx: torch.Tensor,
+    rot_idx: torch.Tensor | int,
 ) -> torch.Tensor:
-    """Compute effective XY footprint dimensions from box dims and rot_idx."""
-    # box_dims: (N, 3) or (3,)
-    # rot_idx: (N,) or int
+    """
+    Compute effective XY footprint dimensions from box dims and rot_idx.
     
-    # If rot_idx == 0: (box_dim_x, box_dim_y)
-    # If rot_idx == 1: swap x and y
-    
-    # Ensure tensor shape handles both single env and batch
+    Robust to:
+      - box_dims: (3,) or (N, 3)
+      - rot_idx: int, scalar tensor, (1,) tensor, or (N,) tensor.
+    """
+    # Normalize box_dims to (N, 3)
     if box_dims.dim() == 1:
         box_dims = box_dims.unsqueeze(0)
-    if not isinstance(rot_idx, torch.Tensor):
-        rot_idx = torch.tensor([rot_idx], device=box_dims.device)
+    N = box_dims.shape[0]
+    device = box_dims.device
     
-    effective_xy = box_dims[:, :2].clone()
-    rot_mask = rot_idx == 1
-    if rot_mask.any():
-        effective_xy[rot_mask, 0] = box_dims[rot_mask, 1]
-        effective_xy[rot_mask, 1] = box_dims[rot_mask, 0]
+    # Normalize rot_idx to (N,)
+    rot_tensor = torch.as_tensor(rot_idx, dtype=torch.long, device=device)
+    if rot_tensor.dim() == 0:
+        rot_tensor = rot_tensor.expand(N)
+    elif rot_tensor.dim() == 1 and rot_tensor.shape[0] == 1:
+        rot_tensor = rot_tensor.expand(N)
+    
+    xy_rot0 = box_dims[:, :2] # (N, 2)
+    xy_rot1 = torch.stack([box_dims[:, 1], box_dims[:, 0]], dim=-1) # (N, 2)
+    
+    # Deterministic batch selection
+    effective_xy = torch.where(
+        (rot_tensor == 1).unsqueeze(-1),
+        xy_rot1,
+        xy_rot0
+    )
     
     return effective_xy
 
@@ -409,6 +420,12 @@ def _validate_height_constraint(
       3. Support check: Sufficient fraction of footprint must be supported.
     """
     cfg = env.cfg
+    
+    # Fallback for missing config fields
+    border_eps = getattr(cfg, "place_border_epsilon_m", 1e-6)
+    support_tol = getattr(cfg, "place_support_height_tol_m", 0.02)
+    support_ratio_min = getattr(cfg, "place_support_ratio_min", 0.60)
+
     env._height_invalid_mask[:] = False
 
     place_mask = op_type == 0
@@ -453,7 +470,8 @@ def _validate_height_constraint(
         )
         
         # 3. Border check
-        if not _check_inside_pallet(cx, cy, eff_xy, cfg.pallet_size, cfg.place_border_epsilon_m):
+        border_valid = _check_inside_pallet(cx, cy, eff_xy, cfg.pallet_size, border_eps)
+        if not bool(border_valid.item()):
             env._height_invalid_mask[idx] = True
             continue
             
@@ -470,11 +488,11 @@ def _validate_height_constraint(
             patch,
             env_box_dims[idx, 2],
             cfg.max_stack_height,
-            cfg.place_support_height_tol_m,
-            cfg.place_support_ratio_min,
+            support_tol,
+            support_ratio_min,
         )
         
-        if not valid:
+        if not bool(valid.item()):
             env._height_invalid_mask[idx] = True
 
 
