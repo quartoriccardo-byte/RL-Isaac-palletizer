@@ -345,6 +345,34 @@ class PalletizerActorCritic(ActorCritic):
         grid_xs = torch.arange(num_x, device=device)
         grid_ys = torch.arange(num_y, device=device)
 
+        # --- 1. Conservative Border Mask ---
+        # Constants from canonical environment configuration
+        pallet_x, pallet_y = 1.2, 0.8
+        eps = 1e-6
+        
+        step_x = pallet_x / num_x
+        step_y = pallet_y / num_y
+        cxs = grid_xs.float() * step_x - pallet_x/2 + step_x/2
+        cys = grid_ys.float() * step_y - pallet_y/2 + step_y/2
+        
+        # Effective XY for both rotations (swap X/Y for rot 1)
+        # Current box dims from observation: current_dims (B, 3)
+        box_dx0 = current_dims[:, 0:1] # (B, 1)
+        box_dy0 = current_dims[:, 1:2] # (B, 1)
+        
+        # X Border Mask
+        x_valid_rot0 = (cxs[None, :] - box_dx0/2 >= -pallet_x/2 + eps) & (cxs[None, :] + box_dx0/2 <= pallet_x/2 - eps)
+        x_valid_rot1 = (cxs[None, :] - box_dy0/2 >= -pallet_x/2 + eps) & (cxs[None, :] + box_dy0/2 <= pallet_x/2 - eps)
+        x_border_valid = x_valid_rot0 | x_valid_rot1
+        mask[:, x_start : x_start + num_x] &= x_border_valid
+        
+        # Y Border Mask
+        y_valid_rot0 = (cys[None, :] - box_dy0/2 >= -pallet_y/2 + eps) & (cys[None, :] + box_dy0/2 <= pallet_y/2 - eps)
+        y_valid_rot1 = (cys[None, :] - box_dx0/2 >= -pallet_y/2 + eps) & (cys[None, :] + box_dx0/2 <= pallet_y/2 - eps)
+        y_border_valid = y_valid_rot0 | y_valid_rot1
+        mask[:, y_start : y_start + num_y] &= y_border_valid
+
+        # --- 2. Height-based Fallback Mask ---
         pixel_xs = (grid_xs.float() / max(1, num_x - 1) * (image_w - 1)).long().clamp(0, image_w - 1)
         pixel_ys = (grid_ys.float() / max(1, num_y - 1) * (image_h - 1)).long().clamp(0, image_h - 1)
 
@@ -358,10 +386,6 @@ class PalletizerActorCritic(ActorCritic):
 
         all_y_invalid_at_x = grid_invalid.all(dim=1)  # (B, num_x)
         all_x_invalid_at_y = grid_invalid.all(dim=2)  # (B, num_y)
-
-        slot_start = self.action_dims[0]
-        x_start = slot_start + self.action_dims[1]
-        y_start = x_start + self.action_dims[2]
 
         # Mask out logits corresponding to grid X/Y that are invalid for
         # all Y/X respectively. 

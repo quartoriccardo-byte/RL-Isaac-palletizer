@@ -198,6 +198,11 @@ class PalletTaskCfg(DirectRLEnvCfg):
     drift_xy_threshold: float = 0.035
     drift_rot_threshold: float = 7.0
 
+    # --- Placement Cleaning ---
+    place_support_ratio_min: float = 0.60
+    place_support_height_tol_m: float = 0.02
+    place_border_epsilon_m: float = 1e-6
+
     # --- Rewards ---
     reward_invalid_height: float = -2.0
     reward_infeasible: float = -4.0
