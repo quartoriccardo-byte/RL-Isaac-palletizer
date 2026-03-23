@@ -18,6 +18,7 @@ import argparse
 import os
 import re
 import sys
+import traceback
 import torch
 from pallet_rl.utils.device_utils import pick_supported_cuda_device
 
@@ -209,6 +210,7 @@ def main():
     if unknown:
         apply_carb_settings(unknown)
 
+    env = None
     try:
         # ==========================================================================
         # IMPORTS AFTER AppLauncher (required for Isaac Lab compatibility)
@@ -300,9 +302,11 @@ def main():
         print("[EVAL] Registering custom policy...", flush=True)
         from pallet_rl.models.rsl_rl_wrapper import register_custom_policy
         register_custom_policy()
+        print("[EVAL] Custom policy registered.", flush=True)
 
         print("[EVAL] Building OnPolicyRunner...", flush=True)
         runner = OnPolicyRunner(env=env, train_cfg=eval_cfg, log_dir=args.log_dir, device=str(device))
+        print("[EVAL] OnPolicyRunner built.", flush=True)
 
         # Load checkpoint into runner/policy
         print(f"[EVAL] Loading checkpoint: {args.checkpoint}", flush=True)
@@ -331,12 +335,30 @@ def main():
 
         print("[EVAL] Evaluation complete.", flush=True)
 
+    except Exception as e:
+        print(f"[EVAL][FAIL] {repr(e)}", flush=True)
+        traceback.print_exc()
+        raise
+
     finally:
         print("[EVAL] Shutting down...", flush=True)
-        if simulation_app is not None:
+        if env is not None:
+            try:
+                env.close()
+                print("[EVAL] Environment closed.", flush=True)
+            except Exception as e_env:
+                print(f"[EVAL][WARN] env.close() failed: {e_env}", flush=True)
+        try:
             simulation_app.close()
             print("[EVAL] Simulation app closed.", flush=True)
+        except Exception as e_app:
+            print(f"[EVAL][WARN] simulation_app.close() failed: {e_app}", flush=True)
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[EVAL][FATAL] {repr(e)}", flush=True)
+        traceback.print_exc()
+        raise
