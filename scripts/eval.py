@@ -109,7 +109,14 @@ def apply_carb_settings(unknown_args: list) -> None:
             settings.set(path, value)
             print(f"[EVAL][INFO] Applied carb setting: {path} = {value}")
         elif arg.startswith('--/'):
-            print(f"[EVAL][WARN] Malformed Kit/Carb arg (missing '='?): {arg}")
+            print(f"[EVAL] [WARN] Malformed Kit/Carb arg (missing '='?): {arg}")
+
+
+def unwrap_obs(obs):
+    """Handle tuple returns from wrapped environments."""
+    if isinstance(obs, tuple):
+        return obs[0]
+    return obs
 
 
 # =============================================================================
@@ -320,7 +327,7 @@ def main():
         print("[EVAL] Inference policy ready.", flush=True)
 
         # Simple evaluation loop using deterministic actions
-        obs = runner.env.reset()
+        obs = unwrap_obs(runner.env.reset())
         episode_counts = torch.zeros(args.num_envs, dtype=torch.long, device=device)
 
         print(f"[EVAL] Starting evaluation rollouts (max_episodes={args.max_episodes}, num_envs={args.num_envs})...",
@@ -329,9 +336,10 @@ def main():
         while int(episode_counts.min().item()) < args.max_episodes:
             with torch.no_grad():
                 # Use the policy callable instead of direct actor_critic access
-                actions = policy(obs["policy"])
+                actions = policy(obs)
 
             obs, rewards, dones, infos = runner.env.step(actions)
+            obs = unwrap_obs(obs)
 
             # Count completed episodes
             if "time_outs" in infos:
