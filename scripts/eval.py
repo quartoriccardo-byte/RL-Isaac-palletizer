@@ -360,14 +360,26 @@ def main():
             global_step += 1
             reward_mean = rewards.mean().item()
             done_any = dones.any().item()
-            act_mean = actions.mean().item()
-            act_std = actions.std().item()
-            act_max = actions.abs().max().item()
             eps_min = int(episode_counts.min().item())
 
+            # Action diagnostics (safe for both float and long tensors)
+            act_log = actions.detach()
+            act_log_f = act_log.to(torch.float32)
+            
+            act_mean = act_log_f.mean().item()
+            act_std = act_log_f.std().item() if act_log_f.numel() > 1 else 0.0
+            act_max = act_log_f.abs().max().item()
+            
+            act_min_val = act_log.min().item()
+            act_max_val = act_log.max().item()
+            # Take a sample of the first environment's actions
+            act_sample = act_log[0].cpu().tolist()
+
             print(f"[EVAL][STEP] step={global_step} dt_wall={dt:.3f}s reward_mean={reward_mean:.4f} "
-                  f"done={done_any} episodes={eps_min} act_mean={act_mean:.4f} act_std={act_std:.4f} "
-                  f"act_max={act_max:.4f}", flush=True)
+                  f"done={done_any} episodes={eps_min}", flush=True)
+            print(f"    [ACTION] dtype={actions.dtype} shape={list(actions.shape)} "
+                  f"min={act_min_val} max={act_max_val} sample={act_sample}", flush=True)
+            print(f"    [STATS]  mean={act_mean:.4f} std={act_std:.4f} abs_max={act_max:.4f}", flush=True)
 
             # Count completed episodes
             if "time_outs" in infos:
