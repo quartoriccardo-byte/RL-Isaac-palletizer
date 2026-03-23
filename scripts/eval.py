@@ -314,6 +314,11 @@ def main():
         runner.load(args.checkpoint)
         print("[EVAL] Checkpoint loaded successfully", flush=True)
 
+        # Obtain the inference policy
+        print("[EVAL] Preparing inference policy...", flush=True)
+        policy = runner.get_inference_policy(device=str(device))
+        print("[EVAL] Inference policy ready.", flush=True)
+
         # Simple evaluation loop using deterministic actions
         obs = runner.env.reset()
         episode_counts = torch.zeros(args.num_envs, dtype=torch.long, device=device)
@@ -323,7 +328,8 @@ def main():
 
         while int(episode_counts.min().item()) < args.max_episodes:
             with torch.no_grad():
-                actions = runner.alg.actor_critic.act_inference(obs["policy"])
+                # Use the policy callable instead of direct actor_critic access
+                actions = policy(obs["policy"])
 
             obs, rewards, dones, infos = runner.env.step(actions)
 
