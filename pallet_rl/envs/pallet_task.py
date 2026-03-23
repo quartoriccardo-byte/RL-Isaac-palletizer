@@ -147,13 +147,13 @@ class PalletTaskCfg(DirectRLEnvCfg):
         ),
         render=RenderCfg(
             dlss_mode=0, enable_dl_denoiser=False,
-            carb_settings={
-                "/ngx/enabled": False, "/rtx/post/dlss/enabled": False,
-                "/rtx-transient/dlssg/enabled": False, "/rtx-transient/dldenoiser/enabled": False,
-                "/renderer/multiGpu/enabled": False,
-                "/rtx/translucency/enabled": False, "/rtx/reflections/enabled": False,
-                "/rtx/indirectDiffuse/enabled": False,
-            },
+            #carb_settings={
+            #    "/ngx/enabled": False, "/rtx/post/dlss/enabled": False,
+            #    "/rtx-transient/dlssg/enabled": False, "/rtx-transient/dldenoiser/enabled": False,
+            #    "/renderer/multiGpu/enabled": False,
+            #    "/rtx/translucency/enabled": False, "/rtx/reflections/enabled": False,
+            #    "/rtx/indirectDiffuse/enabled": False,
+            #},
         ),
     )
 
