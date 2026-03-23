@@ -260,10 +260,11 @@ def main():
         # Build minimal RSL-RL config for evaluation
         eval_cfg = {
             "seed": 42,
+            "num_steps_per_env": 24,
             "runner": {
                 "policy_class_name": "ActorCritic",
                 "algorithm_class_name": "PPO",
-                "num_steps_per_env": 16,
+                "num_steps_per_env": 24,
                 "max_iterations": 1,
                 "save_interval": 0,
                 "experiment_name": "palletizer_eval",
