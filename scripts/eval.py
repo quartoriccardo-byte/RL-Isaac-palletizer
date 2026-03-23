@@ -18,6 +18,7 @@ import argparse
 import os
 import re
 import sys
+import time
 import traceback
 import torch
 from pallet_rl.utils.device_utils import pick_supported_cuda_device
@@ -256,6 +257,13 @@ def main():
         env_cfg.scene.num_envs = args.num_envs
         env_cfg.sim.device = args.device
 
+        # Debug overrides for evaluation
+        # 1. Align render_interval with decimation to avoid multiple render calls per step
+        env_cfg.sim.render_interval = env_cfg.decimation
+        # 2. Shorten episode length for quicker visual debugging
+        if hasattr(env_cfg, "episode_length_s"):
+            env_cfg.episode_length_s = min(env_cfg.episode_length_s, 5.0)
+
         render_mode = None if args.headless else "rgb_array"
         env = PalletTask(cfg=env_cfg, render_mode=render_mode)
         print("[EVAL] Environment created", flush=True)
@@ -333,13 +341,33 @@ def main():
         print(f"[EVAL] Starting evaluation rollouts (max_episodes={args.max_episodes}, num_envs={args.num_envs})...",
               flush=True)
 
+        # rollout loop with diagnosis
+        global_step = 0
+        max_debug_steps = 50
+
         while int(episode_counts.min().item()) < args.max_episodes:
+            t_start = time.time()
             with torch.no_grad():
                 # Use the policy callable instead of direct actor_critic access
                 actions = policy(obs)
 
             obs, rewards, dones, infos = runner.env.step(actions)
             obs = unwrap_obs(obs)
+            t_end = time.time()
+            dt = t_end - t_start
+
+            # Diagnosis logging
+            global_step += 1
+            reward_mean = rewards.mean().item()
+            done_any = dones.any().item()
+            act_mean = actions.mean().item()
+            act_std = actions.std().item()
+            act_max = actions.abs().max().item()
+            eps_min = int(episode_counts.min().item())
+
+            print(f"[EVAL][STEP] step={global_step} dt_wall={dt:.3f}s reward_mean={reward_mean:.4f} "
+                  f"done={done_any} episodes={eps_min} act_mean={act_mean:.4f} act_std={act_std:.4f} "
+                  f"act_max={act_max:.4f}", flush=True)
 
             # Count completed episodes
             if "time_outs" in infos:
@@ -347,6 +375,11 @@ def main():
             else:
                 done_flags = dones
             episode_counts += done_flags.to(device=device, dtype=torch.long)
+
+            if global_step >= max_debug_steps:
+                print(f"[EVAL][INFO] Reached max_debug_steps={max_debug_steps} before finishing requested episodes.",
+                      flush=True)
+                break
 
         print("[EVAL] Evaluation complete.", flush=True)
 
