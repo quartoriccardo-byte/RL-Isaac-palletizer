@@ -1,8 +1,25 @@
 """
 Reward computation for the PalletTask environment.
 
-All reward terms are implemented as pure functions operating on tensors,
-making them independently testable without simulation.
+Refactored into clear helper functions for each reward/penalty term.
+All terms operate on vectorized tensors across all envs.
+
+Reward terms (positive):
+  - Place progress: box_idx advanced via valid placement
+  - Packing density: spatial efficiency of placement
+  - Success bonus: all boxes placed
+  - Stable placement: settling evaluation passed
+  - Valid retrieve: box retrieved from buffer
+  - Volume bonus: proportional to placed box volume
+
+Penalty terms (negative):
+  - Time: per-step cost to discourage passivity
+  - Inactivity: no progress this step
+  - Repetition: same action repeated with no progress
+  - Stagnation: terminal penalty on stagnation kill
+  - Height-invalid: placing above max stack height
+  - Infeasible: payload constraint violation
+  - Fall/drift: box fell or drifted after placement
 """
 
 from __future__ import annotations
@@ -18,13 +35,8 @@ def compute_rewards(env: PalletTask) -> torch.Tensor:
     """
     Compute rewards (pure PyTorch, JIT-compatible).
 
-    Includes:
-      - Height constraint penalty (invalid placement attempt)
-      - Settling stability rewards (drift, fall, stable)
-      - Infeasible payload penalty
-      - Buffer store/retrieve/age incentives
-      - Volume bonus for successful placements
-      - Settled KPI evaluation
+    Orchestrates all reward/penalty helper functions and updates
+    stagnation/repetition tracking state.
 
     Returns:
         rewards: ``(N,)`` tensor
@@ -36,23 +48,54 @@ def compute_rewards(env: PalletTask) -> torch.Tensor:
     rewards = torch.zeros(n, device=device)
 
     # ------------------------------------------------------------------
-    # Height-invalid penalty
+    # Detect progress this step (box_idx advanced = valid placement)
+    # ------------------------------------------------------------------
+    progress_mask = env.box_idx > env._prev_box_idx  # (N,)
+
+    # ------------------------------------------------------------------
+    # Update stagnation counter
+    # ------------------------------------------------------------------
+    _update_stagnation(env, progress_mask)
+
+    # ------------------------------------------------------------------
+    # Update action repetition tracking
+    # ------------------------------------------------------------------
+    _update_action_repetition(env, progress_mask)
+
+    # ------------------------------------------------------------------
+    # Positive rewards
+    # ------------------------------------------------------------------
+    rewards += _reward_place_progress(env, progress_mask)
+    rewards += _reward_packing_density(env, progress_mask)
+    rewards += _reward_success_bonus(env)
+
+    # ------------------------------------------------------------------
+    # Penalties
+    # ------------------------------------------------------------------
+    rewards += _penalty_time(env)
+    rewards += _penalty_inactivity(env, progress_mask)
+    rewards += _penalty_repetition(env)
+    rewards += _penalty_stagnation(env)
+
+    # ------------------------------------------------------------------
+    # Legacy: Height-invalid penalty
     # ------------------------------------------------------------------
     rewards += cfg.reward_invalid_height * env._height_invalid_mask.float()
-    # Track invalid action rate for diagnostics
     if env._height_invalid_mask.any():
-        env._kpi_invalid_action_count = getattr(env, "_kpi_invalid_action_count", torch.zeros(1, device=device))
+        env._kpi_invalid_action_count = getattr(
+            env, "_kpi_invalid_action_count", torch.zeros(1, device=device)
+        )
         env._kpi_invalid_action_count += env._height_invalid_mask.float().sum()
 
     # ------------------------------------------------------------------
-    # Infeasible payload penalty
+    # Legacy: Infeasible payload penalty
     # ------------------------------------------------------------------
     rewards += cfg.reward_infeasible * env._infeasible_mask.float()
     if env._infeasible_mask.any():
         env._kpi_infeasible_count += env._infeasible_mask.float().sum()
 
     # ------------------------------------------------------------------
-    # Buffer incentives
+    # Legacy: Buffer incentives
     # ------------------------------------------------------------------
     rewards -= 0.1 * env.store_mask.float()
     rewards += 2.0 * env.valid_retrieve.float()
@@ -60,10 +103,9 @@ def compute_rewards(env: PalletTask) -> torch.Tensor:
     rewards -= 0.01 * ages
 
     # ------------------------------------------------------------------
-    # Placement success / failure
+    # Placement success / failure (legacy settling-based)
     # ------------------------------------------------------------------
     valid_eval = env.last_moved_box_id >= 0
-
     if "boxes" in env.scene.keys() and valid_eval.any():
         rewards = _eval_placement_rewards(env, rewards, valid_eval, n, device)
 
@@ -82,6 +124,13 @@ def compute_rewards(env: PalletTask) -> torch.Tensor:
     env._kpi_total_payload += env.payload_kg.sum()
 
     # ------------------------------------------------------------------
+    # Snapshot current state for next-step delta detection
+    # ------------------------------------------------------------------
+    env._prev_box_idx.copy_(env.box_idx)
+    if hasattr(env, "_actions"):
+        env._prev_actions.copy_(env._actions)
+
+    # ------------------------------------------------------------------
     # Log task KPIs to extras
     # ------------------------------------------------------------------
     _log_kpis(env)
@@ -90,7 +139,145 @@ def compute_rewards(env: PalletTask) -> torch.Tensor:
 
 
 # =============================================================================
-# Internal Helpers
+# Progress Tracking Helpers
+# =============================================================================
+
+def _update_stagnation(env: PalletTask, progress_mask: torch.Tensor):
+    """Update per-env stagnation counters.
+
+    Resets to zero when box_idx advances; increments otherwise.
+    """
+    env._stagnation_counter[progress_mask] = 0
+    env._stagnation_counter[~progress_mask] += 1
+
+
+def _update_action_repetition(env: PalletTask, progress_mask: torch.Tensor):
+    """Track consecutive identical actions with no progress.
+
+    Compares current decoded action 5-tuple against previous step.
+    Only counts repetitions when no progress occurred.
+    """
+    if not hasattr(env, "_actions"):
+        return
+
+    current = env._actions  # (N, 5)
+    prev = env._prev_actions  # (N, 5)
+
+    same_action = (current == prev).all(dim=-1)  # (N,)
+    # Only penalise repetition when there's no task progress
+    repeating_no_progress = same_action & ~progress_mask
+
+    env._prev_action_repeated_count[repeating_no_progress] += 1
+    env._prev_action_repeated_count[~repeating_no_progress] = 0
+
+
+# =============================================================================
+# Positive Reward Helpers
+# =============================================================================
+
+def _reward_place_progress(
+    env: PalletTask, progress_mask: torch.Tensor
+) -> torch.Tensor:
+    """Reward for advancing box_idx (successful valid placement).
+
+    Encourages the agent to actually place boxes rather than stall.
+    """
+    return env.cfg.reward_place_progress_scale * progress_mask.float()
+
+
+def _reward_packing_density(
+    env: PalletTask, progress_mask: torch.Tensor
+) -> torch.Tensor:
+    """Bonus for placing boxes near existing ones (spatial efficiency).
+
+    Uses the heightmap: if the mean height under the placement footprint
+    is above the pallet surface, the box is being stacked — reward more.
+    Only awarded on placement progress steps.
+    """
+    n = env.num_envs
+    device = env._device
+    bonus = torch.zeros(n, device=device)
+
+    if not progress_mask.any() or env._last_heightmap is None:
+        return bonus
+
+    prog_envs = progress_mask.nonzero(as_tuple=False).flatten()
+    # Mean height across the whole heightmap — crude proxy for packing density
+    mean_h = env._last_heightmap[prog_envs].mean(dim=(-2, -1))
+    # Normalise: pallet surface ~ 0.15 m, reward increases with fill level
+    density_signal = (mean_h / env.cfg.max_height).clamp(0.0, 1.0)
+    bonus[prog_envs] = env.cfg.reward_packing_density_scale * density_signal
+
+    return bonus
+
+
+def _reward_success_bonus(env: PalletTask) -> torch.Tensor:
+    """Large bonus when all boxes are placed and buffer is empty.
+
+    Must exceed the total penalties accumulate over a full episode
+    to ensure net-positive incentive for task completion.
+    """
+    n = env.num_envs
+    device = env._device
+
+    all_consumed = env.box_idx >= env.cfg.num_boxes
+    buffer_empty = ~env.buffer_has_box.any(dim=1)
+    no_pending = env._settle_box_id < 0
+    success = all_consumed & buffer_empty & no_pending
+
+    return env.cfg.reward_success_scale * success.float()
+
+
+# =============================================================================
+# Penalty Helpers
+# =============================================================================
+
+def _penalty_time(env: PalletTask) -> torch.Tensor:
+    """Constant per-step cost to discourage passive survival.
+
+    Small enough not to overwhelm progress rewards, but large enough
+    that doing nothing for many steps is clearly negative.
+    """
+    return torch.full(
+        (env.num_envs,), env.cfg.penalty_time_scale, device=env._device
+    )
+
+
+def _penalty_inactivity(
+    env: PalletTask, progress_mask: torch.Tensor
+) -> torch.Tensor:
+    """Penalty when no box_idx advance occurred this step.
+
+    Targets steps where the agent chose an invalid placement, a store
+    into a full slot, or any action that doesn't advance progress.
+    Stronger than the time penalty but weaker than progress rewards.
+    """
+    inactive = ~progress_mask
+    return env.cfg.penalty_inactivity_scale * inactive.float()
+
+
+def _penalty_repetition(env: PalletTask) -> torch.Tensor:
+    """Mild penalty for repeating the same action with no progress.
+
+    Only triggers after 2+ consecutive identical non-progress actions.
+    Discourages the stuck-in-a-loop failure mode while allowing
+    legitimate repeated placements that advance box_idx.
+    """
+    repeating = env._prev_action_repeated_count >= 2
+    return env.cfg.penalty_repetition_scale * repeating.float()
+
+
+def _penalty_stagnation(env: PalletTask) -> torch.Tensor:
+    """Terminal penalty applied on the step stagnation kills the episode.
+
+    Acts as a clear negative signal for sustained non-progress.
+    """
+    stag_kill = env._stagnation_counter >= env.cfg.stagnation_window
+    return env.cfg.penalty_stagnation_scale * stag_kill.float()
+
+
+# =============================================================================
+# Legacy Placement / Settling / KPI Helpers (preserved from original)
 # =============================================================================
 
 def _eval_placement_rewards(
@@ -308,10 +495,17 @@ def _log_kpis(env: PalletTask):
     infeasible_episode_rate = env._kpi_infeasible_episodes / total_episodes
     failure_episode_rate = env._kpi_failure_episodes / total_episodes
     buffer_nonempty_end_rate = env._kpi_buffer_nonempty_at_end / total_episodes
+    stagnation_episode_rate = getattr(
+        env, "_kpi_stagnation_episodes", torch.zeros(1, device=env._device)
+    ) / total_episodes
 
     invalid_action_rate = getattr(env, "_kpi_invalid_action_count", torch.zeros(1)).to(env._device) / (
         float(env.num_envs) * env.common_step_counter + 1e-8
     )
+
+    # Stagnation / repetition diagnostic signals
+    avg_stagnation = env._stagnation_counter.float().mean()
+    avg_repetition = env._prev_action_repeated_count.float().mean()
 
     env.extras["metrics/place_success_rate"] = place_success_rate.detach().cpu().item()
     env.extras["metrics/place_failure_rate"] = place_failure_rate.detach().cpu().item()
@@ -328,5 +522,8 @@ def _log_kpis(env: PalletTask):
     env.extras["metrics/episode_success_rate"] = success_episode_rate.detach().cpu().item()
     env.extras["metrics/episode_infeasible_rate"] = infeasible_episode_rate.detach().cpu().item()
     env.extras["metrics/episode_failure_rate"] = failure_episode_rate.detach().cpu().item()
+    env.extras["metrics/episode_stagnation_rate"] = stagnation_episode_rate.detach().cpu().item()
     env.extras["metrics/episode_buffer_nonempty_end_rate"] = buffer_nonempty_end_rate.detach().cpu().item()
     env.extras["metrics/invalid_action_rate"] = invalid_action_rate.detach().cpu().item()
+    env.extras["metrics/avg_stagnation_counter"] = avg_stagnation.detach().cpu().item()
+    env.extras["metrics/avg_repetition_counter"] = avg_repetition.detach().cpu().item()

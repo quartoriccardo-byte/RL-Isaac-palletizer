@@ -203,12 +203,30 @@ class PalletTaskCfg(DirectRLEnvCfg):
     place_support_height_tol_m: float = 0.02
     place_border_epsilon_m: float = 1e-6
 
-    # --- Rewards ---
+    # --- Episode Horizon ---
+    max_episode_steps: int = 200
+
+    # --- Stagnation Detection ---
+    stagnation_window: int = 50
+    stagnation_box_advance_required: bool = True
+
+    # --- Rewards (legacy, kept for settling logic) ---
     reward_invalid_height: float = -2.0
     reward_infeasible: float = -4.0
     reward_fall: float = -25.0
     reward_drift: float = -3.0
     reward_stable: float = 1.0
+
+    # --- Reward Scales (progress) ---
+    reward_place_progress_scale: float = 5.0
+    reward_packing_density_scale: float = 2.0
+    reward_success_scale: float = 50.0
+
+    # --- Penalty Scales ---
+    penalty_time_scale: float = -0.05
+    penalty_inactivity_scale: float = -0.3
+    penalty_repetition_scale: float = -0.2
+    penalty_stagnation_scale: float = -5.0
 
     # --- Visual Features ---
     use_pallet_mesh_visual: bool = False
@@ -305,6 +323,11 @@ class PalletTask(DirectRLEnv):
 
     def __init__(self, cfg: PalletTaskCfg, render_mode: str | None = None, **kwargs):
         self._device = cfg.sim.device
+
+        # Auto-compute episode_length_s from max_episode_steps so that
+        # DirectRLEnv.max_episode_length matches the user-facing step count.
+        step_dt = cfg.sim.dt * cfg.decimation
+        cfg.episode_length_s = float(cfg.max_episode_steps) * step_dt
 
         # Create container prims BEFORE scene construction
         env_ns = getattr(cfg.scene, "env_ns", "/World/envs")
@@ -449,6 +472,14 @@ class PalletTask(DirectRLEnv):
         self._kpi_failure_episodes = torch.zeros(1, device=device)
         self._kpi_episode_count = torch.zeros(1, device=device)
         self._kpi_buffer_nonempty_at_end = torch.zeros(1, device=device)
+        self._kpi_stagnation_episodes = torch.zeros(1, device=device)
+
+        # --- Stagnation / repetition tracking ---
+        self._stagnation_counter = torch.zeros(n, dtype=torch.long, device=device)
+        self._prev_box_idx = torch.zeros(n, dtype=torch.long, device=device)
+        self._prev_actions = torch.zeros(n, 5, dtype=torch.float32, device=device)
+        self._prev_action_repeated_count = torch.zeros(n, dtype=torch.long, device=device)
+        self._termination_reason = torch.zeros(n, dtype=torch.long, device=device)
 
         self.extras = {}
 
@@ -552,6 +583,12 @@ class PalletTask(DirectRLEnv):
         terminated = terminated | self._infeasible_mask
 
         # ------------------------------------------------------------------
+        # Stagnation termination
+        # ------------------------------------------------------------------
+        stagnation_kill = self._stagnation_counter >= self.cfg.stagnation_window
+        terminated = terminated | stagnation_kill
+
+        # ------------------------------------------------------------------
         # Successful completion: all active boxes placed and buffer empty,
         # after the final placement has gone through settling evaluation.
         #
@@ -575,6 +612,20 @@ class PalletTask(DirectRLEnv):
         terminated = terminated | success_only
 
         # ------------------------------------------------------------------
+        # Record termination reasons (0=none, 1=success, 2=timeout,
+        # 3=stagnation, 4=failure/drop, 5=infeasible)
+        # Timeout (reason=2) is handled by DirectRLEnv base class via
+        # truncation, so we only set reasons for terminated envs here.
+        # ------------------------------------------------------------------
+        self._termination_reason[:] = 0
+        # Order matters: later assignments override earlier ones for
+        # envs matching multiple conditions (most specific wins).
+        self._termination_reason[terminated] = 4               # generic failure
+        self._termination_reason[self._infeasible_mask] = 5    # infeasible
+        self._termination_reason[stagnation_kill] = 3          # stagnation
+        self._termination_reason[success_only] = 1             # success
+
+        # ------------------------------------------------------------------
         # Episode-level KPI bookkeeping for diagnostics
         # ------------------------------------------------------------------
         if not hasattr(self, "_kpi_success_episodes"):
@@ -584,15 +635,19 @@ class PalletTask(DirectRLEnv):
             self._kpi_failure_episodes = torch.zeros(1, device=device)
             self._kpi_episode_count = torch.zeros(1, device=device)
             self._kpi_buffer_nonempty_at_end = torch.zeros(1, device=device)
+        if not hasattr(self, "_kpi_stagnation_episodes"):
+            self._kpi_stagnation_episodes = torch.zeros(1, device=device)
 
         ended = terminated
         if ended.any():
             success_envs = ended & success_only
             infeasible_envs = ended & self._infeasible_mask
-            failure_envs = ended & ~(success_envs | infeasible_envs)
+            stagnation_envs = ended & stagnation_kill
+            failure_envs = ended & ~(success_envs | infeasible_envs | stagnation_envs)
 
             self._kpi_success_episodes += success_envs.float().sum()
             self._kpi_infeasible_episodes += infeasible_envs.float().sum()
+            self._kpi_stagnation_episodes += stagnation_envs.float().sum()
             self._kpi_failure_episodes += failure_envs.float().sum()
             self._kpi_episode_count += ended.float().sum()
             self._kpi_buffer_nonempty_at_end += (ended & buffer_nonempty).float().sum()
@@ -639,6 +694,13 @@ class PalletTask(DirectRLEnv):
 
         self._height_invalid_mask[env_ids] = False
         self._infeasible_mask[env_ids] = False
+
+        # Stagnation / repetition state
+        self._stagnation_counter[env_ids] = 0
+        self._prev_box_idx[env_ids] = 0
+        self._prev_actions[env_ids] = 0.0
+        self._prev_action_repeated_count[env_ids] = 0
+        self._termination_reason[env_ids] = 0
 
         # Randomize box dimensions
         base_dims = torch.tensor([0.4, 0.3, 0.2], device=device)
