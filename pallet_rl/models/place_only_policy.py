@@ -53,6 +53,7 @@ class PlaceOnlyActorCritic(nn.Module):
     ):
         super().__init__()
 
+        self.is_recurrent = False
         self.num_actor_obs = num_actor_obs
         self.num_critic_obs = num_critic_obs
         self.num_actions = num_actions
