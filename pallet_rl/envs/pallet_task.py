@@ -442,8 +442,7 @@ class PalletTask(DirectRLEnv):
         self.last_target_quat = torch.zeros(n, 4, device=device)
         self.last_target_quat[:, 0] = 1.0
 
-        if cfg.place_only:
-            # In place-only mode, the policy outputs a single int column
+        if self.cfg.place_only:
             self._actions = torch.zeros(n, 1, dtype=torch.float32, device=device)
         else:
             self._actions = torch.zeros(n, 5, dtype=torch.float32, device=device)
@@ -501,7 +500,7 @@ class PalletTask(DirectRLEnv):
         # --- Stagnation / repetition tracking ---
         self._stagnation_counter = torch.zeros(n, dtype=torch.long, device=device)
         self._prev_box_idx = torch.zeros(n, dtype=torch.long, device=device)
-        if cfg.place_only:
+        if self.cfg.place_only:
             self._prev_actions = torch.zeros(n, 1, dtype=torch.float32, device=device)
         else:
             self._prev_actions = torch.zeros(n, 5, dtype=torch.float32, device=device)
