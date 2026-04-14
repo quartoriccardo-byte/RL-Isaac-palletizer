@@ -1,25 +1,33 @@
 """
 Action Adapter: Centralizes the semantic action space contract.
 
-This environment exposes a continuous Box([-1, 1] x 5) interface to the trainer
-(e.g., RSL-RL PPO) for compatibility. However, the true semantic action space
-is a factored discrete 5-tuple.
+Supports two action modes:
 
-This module provides the rigorous mapping from the trainer's normalized float
-tensor to the canonical DecodedAction representation used by all downstream
-environment logic. No downstream module should consume the raw float actions.
+1. **Factored discrete** (Stage D / legacy):
+   Continuous Box([-1, 1] x 5) → factored 5-tuple (op, slot, x, y, rot).
+   Used when buffer operations (STORE/RETRIEVE) are enabled.
+
+2. **Joint place-only** (Stages A–C):
+   Single categorical index → (x, y, rot) triple.
+   The agent selects one placement from the full joint space.
+   No buffer operations are available.
 """
 
 from __future__ import annotations
 from dataclasses import dataclass
 import torch
 
+
+# =========================================================================
+# Factored Discrete (Stage D / legacy)
+# =========================================================================
+
 @dataclass
 class DecodedAction:
     op_type: torch.Tensor   # 0=Place, 1=Store, 2=Retrieve
     slot_idx: torch.Tensor  # 0..9 (buffer slot)
-    grid_x: torch.Tensor    # 0..15 (pallet X)
-    grid_y: torch.Tensor    # 0..23 (pallet Y)
+    grid_x: torch.Tensor    # 0..X-1 (pallet X)
+    grid_y: torch.Tensor    # 0..Y-1 (pallet Y)
     rot_idx: torch.Tensor   # 0=0°, 1=90°
 
 def _to_discrete(a: torch.Tensor, k: int) -> torch.Tensor:
@@ -107,3 +115,72 @@ def decode_normalized_action(action_norm: torch.Tensor, action_dims: tuple[int, 
         grid_y=_to_discrete(action_norm[:, 3], action_dims[3]),
         rot_idx=_to_discrete(action_norm[:, 4], action_dims[4])
     )
+
+
+# =========================================================================
+# Joint Place-Only (Stages A–C)
+# =========================================================================
+
+@dataclass
+class DecodedPlaceAction:
+    """Decoded joint spatial placement action for place-only stages."""
+    grid_x: torch.Tensor    # 0..X-1
+    grid_y: torch.Tensor    # 0..Y-1
+    rot_idx: torch.Tensor   # 0..R-1
+
+
+def decode_joint_place_action(
+    action_idx: torch.Tensor,
+    grid_x_dim: int,
+    grid_y_dim: int,
+    num_rotations: int,
+) -> DecodedPlaceAction:
+    """
+    Decode a flat joint action index into (grid_x, grid_y, rot_idx).
+
+    Encoding order: ``index = rot * (grid_y * grid_x) + y * grid_x + x``
+
+    This is the canonical decoder for place-only curriculum stages.
+    The joint index eliminates invalid factored combinations.
+
+    Args:
+        action_idx: (N,) tensor of joint action indices in [0, total_actions).
+        grid_x_dim: Number of X grid cells.
+        grid_y_dim: Number of Y grid cells.
+        num_rotations: Number of rotation options (typically 2).
+
+    Returns:
+        DecodedPlaceAction with integer tensors of shape (N,).
+    """
+    action_idx = action_idx.long()
+    spatial_size = grid_x_dim * grid_y_dim
+
+    rot_idx = action_idx // spatial_size
+    spatial = action_idx % spatial_size
+    grid_y = spatial // grid_x_dim
+    grid_x = spatial % grid_x_dim
+
+    return DecodedPlaceAction(
+        grid_x=grid_x.clamp(0, grid_x_dim - 1),
+        grid_y=grid_y.clamp(0, grid_y_dim - 1),
+        rot_idx=rot_idx.clamp(0, num_rotations - 1),
+    )
+
+
+def encode_joint_place_action(
+    grid_x: torch.Tensor,
+    grid_y: torch.Tensor,
+    rot_idx: torch.Tensor,
+    grid_x_dim: int,
+    grid_y_dim: int,
+) -> torch.Tensor:
+    """
+    Encode (grid_x, grid_y, rot_idx) into a flat joint action index.
+
+    Inverse of :func:`decode_joint_place_action`.
+
+    Returns:
+        (N,) tensor of flat action indices.
+    """
+    spatial_size = grid_x_dim * grid_y_dim
+    return rot_idx.long() * spatial_size + grid_y.long() * grid_x_dim + grid_x.long()

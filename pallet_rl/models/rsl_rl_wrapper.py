@@ -38,18 +38,23 @@ Total: 91
 """
 
 
-def register_custom_policy():
+def register_custom_policy(place_only: bool = False):
     """
-    Registers the custom PalletizerActorCritic with RSL-RL.
+    Register the appropriate Actor-Critic policy with RSL-RL.
 
-    Isaac Lab relies on RSL-RL for PPO generation. In this repo's 
-    intended stack, the OnPolicyRunner resolves the policy class by 
-    looking up `rsl_rl.modules.PolicyName`. The cleanest available 
-    workaround to inject a custom architecture is to patch 
-    this global namespace before the runner is instantiated.
+    For place-only curriculum stages (A–C), registers
+    :class:`PlaceOnlyActorCritic`.  For Stage D (full factored),
+    registers :class:`PalletizerActorCritic`.
+
+    RSL-RL OnPolicyRunner resolves the policy via
+    ``getattr(rsl_rl.modules, policy_class_name)``.
     """
     import rsl_rl.modules
-    rsl_rl.modules.ActorCritic = PalletizerActorCritic
+    if place_only:
+        from pallet_rl.models.place_only_policy import PlaceOnlyActorCritic
+        rsl_rl.modules.ActorCritic = PlaceOnlyActorCritic
+    else:
+        rsl_rl.modules.ActorCritic = PalletizerActorCritic
 
 from rsl_rl.modules import ActorCritic
 

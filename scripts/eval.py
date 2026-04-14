@@ -46,6 +46,11 @@ def parse_args():
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to RSL-RL checkpoint (.pt)")
     parser.add_argument("--max_episodes", type=int, default=10, help="Max evaluation episodes per env")
     parser.add_argument("--log_dir", type=str, default="runs/eval", help="Eval log directory")
+    parser.add_argument("--stage", type=str, default="A",
+                        choices=["A", "B", "C", "D"],
+                        help="Curriculum stage (default: A = place-only)")
+    parser.add_argument("--debug_max_steps", type=int, default=0,
+                        help="Optional debug step cap (0 = disabled, run full episodes)")
 
     # Isaac Lab launcher args (must be defined before AppLauncher init)
     parser.add_argument("--livestream", type=int, default=0, help="Livestream mode (0=off, 1=native, 2=webrtc)")
@@ -257,12 +262,15 @@ def main():
         env_cfg.scene.num_envs = args.num_envs
         env_cfg.sim.device = args.device
 
-        # Debug overrides for evaluation
-        # 1. Align render_interval with decimation to avoid multiple render calls per step
+        # Apply curriculum stage configuration
+        from pallet_rl.configs.curriculum import get_stage, get_stage_config, apply_stage_to_cfg
+        stage = get_stage(args.stage)
+        stage_cfg = get_stage_config(stage)
+        apply_stage_to_cfg(stage, env_cfg)
+        print(f"[EVAL] Curriculum stage: {stage.value} (place_only={env_cfg.place_only})")
+
+        # Align render_interval with decimation for eval
         env_cfg.sim.render_interval = env_cfg.decimation
-        # 2. Shorten episode length for quicker visual debugging
-        if hasattr(env_cfg, "episode_length_s"):
-            env_cfg.episode_length_s = min(env_cfg.episode_length_s, 5.0)
 
         render_mode = None if args.headless else "rgb_array"
         env = PalletTask(cfg=env_cfg, render_mode=render_mode)
@@ -275,11 +283,11 @@ def main():
         # Build minimal RSL-RL config for evaluation
         eval_cfg = {
             "seed": 42,
-            "num_steps_per_env": 24,
+            "num_steps_per_env": stage_cfg.num_steps_per_env,
             "runner": {
                 "policy_class_name": "ActorCritic",
                 "algorithm_class_name": "PPO",
-                "num_steps_per_env": 24,
+                "num_steps_per_env": stage_cfg.num_steps_per_env,
                 "max_iterations": 1,
                 "save_interval": 0,
                 "experiment_name": "palletizer_eval",
@@ -314,11 +322,16 @@ def main():
             },
         }
 
-        # Register custom policy class with RSL-RL
+        # Inject place-only grid config for policy construction
+        if env_cfg.place_only:
+            eval_cfg["policy"]["grid_x"] = env_cfg.place_only_grid[0]
+            eval_cfg["policy"]["grid_y"] = env_cfg.place_only_grid[1]
+            eval_cfg["policy"]["num_rotations"] = env_cfg.place_only_rotations
+
         print("[EVAL] Registering custom policy...", flush=True)
         from pallet_rl.models.rsl_rl_wrapper import register_custom_policy
-        register_custom_policy()
-        print("[EVAL] Custom policy registered.", flush=True)
+        register_custom_policy(place_only=env_cfg.place_only)
+        print(f"[EVAL] Registered: {'PlaceOnlyActorCritic' if env_cfg.place_only else 'PalletizerActorCritic'}")
 
         print("[EVAL] Building OnPolicyRunner...", flush=True)
         runner = OnPolicyRunner(env=env, train_cfg=eval_cfg, log_dir=args.log_dir, device=str(device))
@@ -343,7 +356,6 @@ def main():
 
         # rollout loop with diagnosis
         global_step = 0
-        max_debug_steps = 50
 
         while int(episode_counts.min().item()) < args.max_episodes:
             t_start = time.time()
@@ -388,8 +400,8 @@ def main():
                 done_flags = dones
             episode_counts += done_flags.to(device=device, dtype=torch.long)
 
-            if global_step >= max_debug_steps:
-                print(f"[EVAL][INFO] Reached max_debug_steps={max_debug_steps} before finishing requested episodes.",
+            if args.debug_max_steps > 0 and global_step >= args.debug_max_steps:
+                print(f"[EVAL][INFO] Reached --debug_max_steps={args.debug_max_steps}.",
                       flush=True)
                 break
 

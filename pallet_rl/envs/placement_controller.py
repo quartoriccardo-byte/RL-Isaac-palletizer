@@ -1,17 +1,28 @@
 """
 Placement controller: action decoding and physical placement for PalletTask.
 
-Handles:
-  - Continuous [-1, 1] → discrete/continuous sub-action decoding
-  - Grid index → world position mapping
-  - Height constraint validation
-  - Pose writing to simulation via RigidObjectCollection API
-  - Settling window arm for PLACE operations
+Handles two operating modes:
 
-Action Semantics
-================
-The factored discrete action space has 5 dimensions:
+1. **Place-only** (Stages A–C):
+   - Single joint categorical action → (x, y, rot) decoding
+   - No buffer operations, always op_type=PLACE
+   - Stage-specific grid resolution
 
+2. **Full factored** (Stage D):
+   - 5-dim factored discrete → (op, slot, x, y, rot)
+   - Buffer store/retrieve operations
+   - Original action space
+
+Both modes share the same validation, grid→world mapping, and pose writing
+logic via internal helpers.
+
+Action Semantics (Place-Only Mode)
+==================================
+  Single integer index in [0, grid_x * grid_y * num_rotations):
+    index = rot * (grid_y * grid_x) + y * grid_x + x
+
+Action Semantics (Factored Mode)
+================================
   ======== =========== ======================== ============================
   Index    Name        Values                   Semantic
   ======== =========== ======================== ============================
@@ -24,11 +35,11 @@ The factored discrete action space has 5 dimensions:
 
 Grid → World Mapping
 ====================
-  - Pallet size = (1.2, 0.8) m, centered at origin.
-  - grid_x: 0..15 → X: -0.6..+0.6 m  (step = 0.075 m)
-  - grid_y: 0..23 → Y: -0.4..+0.4 m  (step = 0.0333 m)
+  - Pallet size = (px, py) m, centered at origin.
+  - grid_x: 0..N_x-1 → X: -px/2..+px/2 m
+  - grid_y: 0..N_y-1 → Y: -py/2..+py/2 m
 
-This component is the AUTHORITATIVE source of truth for action validity 
+This component is the AUTHORITATIVE source of truth for action validity
 and environment-side physical constraints.
 """
 
@@ -42,12 +53,200 @@ if TYPE_CHECKING:
 
 
 # =============================================================================
-# Public API
+# Public API — Place-Only (Stages A–C)
+# =============================================================================
+
+def pre_physics_step_place_only(env: PalletTask, actions: torch.Tensor) -> None:
+    """
+    RL-step action commit for place-only curriculum stages.
+
+    The agent outputs a single joint categorical index. This function:
+    1. Decodes to (x, y, rot) via the joint action adapter.
+    2. Validates height/border/support constraints.
+    3. Writes poses for valid placements.
+    4. Advances box_idx.
+
+    No buffer operations occur in this path.
+    """
+    from pallet_rl.envs.action_adapter import decode_joint_place_action
+
+    actions = actions.to(env._device)
+    n = env.num_envs
+    device = env._device
+    cfg = env.cfg
+
+    gx_dim, gy_dim = cfg.place_only_grid
+    n_rot = cfg.place_only_rotations
+
+    # Flatten to 1-D index if needed (policy outputs (N,1) or (N,))
+    if actions.dim() == 2:
+        action_idx = actions[:, 0].long()
+    else:
+        action_idx = actions.long()
+
+    # Store raw action for repetition tracking
+    env._actions = action_idx.float().unsqueeze(-1)
+
+    # Decode joint action
+    dec = decode_joint_place_action(action_idx, gx_dim, gy_dim, n_rot)
+
+    # All envs are doing PLACE (no buffer ops)
+    env.active_place_mask[:] = True
+    env.active_motion_mask[:] = True
+    env.store_mask[:] = False
+    env.retrieve_mask[:] = False
+    env.valid_store[:] = False
+    env.valid_retrieve[:] = False
+    env.last_moved_box_id[:] = -1
+
+    # Height constraint validation
+    _validate_height_constraint_place_only(
+        env, dec.grid_x, dec.grid_y, dec.rot_idx, gx_dim, gy_dim, n, device,
+    )
+
+    place_mask = ~env._height_invalid_mask
+
+    # Grid → world coordinates (using stage-specific resolution)
+    pallet_x, pallet_y = cfg.pallet_size
+    step_x = pallet_x / gx_dim
+    step_y = pallet_y / gy_dim
+    half_x = pallet_x / 2.0
+    half_y = pallet_y / 2.0
+
+    target_x = dec.grid_x.float() * step_x - half_x + step_x / 2
+    target_y = dec.grid_y.float() * step_y - half_y + step_y / 2
+    target_z = torch.full((n,), 1.5, device=device)
+
+    target_pos = torch.stack([target_x, target_y, target_z], dim=-1)
+
+    # Rotation quaternion
+    quat = torch.zeros(n, 4, device=device)
+    quat[:, 0] = 1.0
+    rot_mask = dec.rot_idx == 1
+    quat[rot_mask, 0] = 0.7071068
+    quat[rot_mask, 3] = 0.7071068
+
+    # Save for stability checks
+    env.last_target_pos[:, 0] = target_x
+    env.last_target_pos[:, 1] = target_y
+    env.last_target_pos[:, 2] = 0.0
+    env.last_target_quat.copy_(quat)
+
+    # Only place if box_idx < num_boxes and height valid
+    has_fresh_box = env.box_idx < cfg.num_boxes
+    valid_place = place_mask & has_fresh_box
+
+    # Write poses
+    if "boxes" in env.scene.keys() and valid_place.any():
+        _write_place_poses(env, valid_place, target_pos, quat, n, device)
+
+    # Record last_moved_box_id and advance box_idx
+    env.last_moved_box_id = torch.where(
+        valid_place, env.box_idx, env.last_moved_box_id
+    )
+    env.box_idx = torch.minimum(
+        env.box_idx + valid_place.long(),
+        torch.full_like(env.box_idx, cfg.num_boxes),
+    )
+
+
+def get_action_mask_place_only(env: PalletTask) -> torch.Tensor:
+    """
+    Return an action mask over the joint place actions.
+
+    Shape: ``(num_envs, total_place_actions)``, dtype=bool.
+
+    Masks invalid (x, y, rot) combinations based on:
+      - Border check: footprint fully inside pallet
+      - Height check: predicted top within max_stack_height
+      - Support check: sufficient support ratio
+    """
+    n = env.num_envs
+    device = env._device
+    cfg = env.cfg
+
+    gx_dim, gy_dim = cfg.place_only_grid
+    n_rot = cfg.place_only_rotations
+    total_actions = gx_dim * gy_dim * n_rot
+
+    mask = torch.ones(n, total_actions, dtype=torch.bool, device=device)
+
+    # Current fresh box dims
+    idx = env.box_idx.clamp(0, cfg.max_boxes - 1)
+    env_idx = torch.arange(n, device=device)
+    fresh_box_dims = env.box_dims[env_idx, idx]  # (N, 3)
+
+    px, py = cfg.pallet_size
+    eps = getattr(cfg, "place_border_epsilon_m", 1e-6)
+
+    # Pre-compute grid centers
+    grid_xs = torch.arange(gx_dim, device=device)
+    grid_ys = torch.arange(gy_dim, device=device)
+
+    step_x = px / gx_dim
+    step_y = py / gy_dim
+    cxs = grid_xs.float() * step_x - px / 2 + step_x / 2  # (gx_dim,)
+    cys = grid_ys.float() * step_y - py / 2 + step_y / 2  # (gy_dim,)
+
+    for r in range(n_rot):
+        eff_xy = _get_effective_xy_dims(fresh_box_dims, r)  # (N, 2)
+        dx = eff_xy[:, 0:1]  # (N, 1)
+        dy = eff_xy[:, 1:2]  # (N, 1)
+
+        # Border validity: (N, gx_dim) and (N, gy_dim)
+        x_valid = (cxs[None, :] - dx / 2 >= -px / 2 + eps) & \
+                  (cxs[None, :] + dx / 2 <= px / 2 - eps)
+        y_valid = (cys[None, :] - dy / 2 >= -py / 2 + eps) & \
+                  (cys[None, :] + dy / 2 <= py / 2 - eps)
+
+        # Joint validity: (N, gy_dim, gx_dim) → flatten to (N, gy*gx)
+        xy_valid = y_valid.unsqueeze(-1) & x_valid.unsqueeze(1)  # (N, gy, gx)
+        xy_flat = xy_valid.reshape(n, -1)  # (N, gy*gx)
+
+        # Slice into mask at the rotation offset
+        offset = r * (gx_dim * gy_dim)
+        mask[:, offset:offset + gx_dim * gy_dim] &= xy_flat
+
+    # Height-based masking
+    if env._last_heightmap is not None:
+        box_h = fresh_box_dims[:, 2]  # (N,)
+        hmap = env._last_heightmap  # (N, H, W)
+        H, W = cfg.map_shape
+
+        for r in range(n_rot):
+            eff_xy = _get_effective_xy_dims(fresh_box_dims, r)
+            # Skip per-cell height check — use sampled grid points
+            for yi in range(gy_dim):
+                for xi in range(gx_dim):
+                    # Map grid cell to heightmap pixel
+                    px_idx = int(xi / max(1, gx_dim - 1) * (W - 1))
+                    py_idx = int(yi / max(1, gy_dim - 1) * (H - 1))
+                    px_idx = min(px_idx, W - 1)
+                    py_idx = min(py_idx, H - 1)
+
+                    h_at_cell = hmap[:, py_idx, px_idx]  # (N,)
+                    predicted_top = h_at_cell + box_h
+                    invalid = predicted_top > cfg.max_stack_height
+
+                    flat_idx = r * (gx_dim * gy_dim) + yi * gx_dim + xi
+                    mask[:, flat_idx] &= ~invalid
+
+    # Ensure at least one action is valid per env to prevent NaN in sampling
+    all_masked = ~mask.any(dim=1)
+    if all_masked.any():
+        # Fallback: unmask action 0 (center-ish placement, rot 0)
+        mask[all_masked, 0] = True
+
+    return mask
+
+
+# =============================================================================
+# Public API — Factored (Stage D / legacy)
 # =============================================================================
 
 def pre_physics_step(env: PalletTask, actions: torch.Tensor) -> None:
     """
-    RL-step action commit for DirectRLEnv.
+    RL-step action commit for DirectRLEnv (factored discrete mode).
 
     DirectRLEnv calls ``_pre_physics_step`` once per RL step but may call
     ``_apply_action`` on every physics substep when ``decimation > 1``.
@@ -157,7 +356,7 @@ def pre_physics_step(env: PalletTask, actions: torch.Tensor) -> None:
 
 def get_action_mask(env: PalletTask) -> torch.Tensor:
     """
-    Return an action mask over the flattened discrete logits.
+    Return an action mask over the flattened discrete logits (factored mode).
 
     Shape: ``(num_envs, sum(action_dims))``, dtype=bool.
 
@@ -210,7 +409,7 @@ def get_action_mask(env: PalletTask) -> torch.Tensor:
     # Y validity: (N, num_y)
     dy0, dy1 = eff_xy_rot0[:, 1:2], eff_xy_rot1[:, 1:2] # (N, 1)
     y_valid_rot0 = (cys[None, :] - dy0/2 >= -py/2 + eps) & (cys[None, :] + dy0/2 <= py/2 - eps)
-    y_valid_rot1 = (cys[None, :] - dy1/2 >= -py/2 + eps) & (cys[None, :] + dy1/2 <= py/2 - eps)
+    y_valid_rot1 = (cys[None, :] - dx0/2 >= -py/2 + eps) & (cys[None, :] + dx0/2 <= py/2 - eps)
     y_border_valid = y_valid_rot0 | y_valid_rot1
     mask[:, y_start : y_start + num_y] &= y_border_valid
 
@@ -269,7 +468,7 @@ def decode_action(
 
 
 # =============================================================================
-# Internal Helpers
+# Internal Helpers (shared by both modes)
 # =============================================================================
 
 def _grid_to_pallet_center(
@@ -283,6 +482,25 @@ def _grid_to_pallet_center(
     num_x, num_y = action_dims[2], action_dims[3]
     step_x = pallet_x / num_x
     step_y = pallet_y / num_y
+    half_x = pallet_x / 2.0
+    half_y = pallet_y / 2.0
+
+    center_x = grid_x.float() * step_x - half_x + step_x / 2
+    center_y = grid_y.float() * step_y - half_y + step_y / 2
+    return center_x, center_y
+
+
+def _grid_to_pallet_center_direct(
+    grid_x: torch.Tensor,
+    grid_y: torch.Tensor,
+    pallet_size: tuple[float, float],
+    gx_dim: int,
+    gy_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Convert grid indices to pallet-centered coords with explicit grid dims."""
+    pallet_x, pallet_y = pallet_size
+    step_x = pallet_x / gx_dim
+    step_y = pallet_y / gy_dim
     half_x = pallet_x / 2.0
     half_y = pallet_y / 2.0
 
@@ -359,14 +577,12 @@ def _get_footprint_pixel_bounds(
     dx, dy = effective_xy[:, 0], effective_xy[:, 1]
     
     # Pallet-centered to normalized [0, 1]
-    # x: [-px/2, px/2] -> [0, 1] => (x + px/2) / px
     x_min = (center_x - dx/2 + px/2) / px
     x_max = (center_x + dx/2 + px/2) / px
     y_min = (center_y - dy/2 + py/2) / py
     y_max = (center_y + dy/2 + py/2) / py
     
     # Normalized to pixel indices
-    # Be conservative: floor for min, ceil for max
     ix_min = torch.floor(x_min * W).long()
     ix_max = torch.ceil(x_max * W).long()
     iy_min = torch.floor(y_min * H).long()
@@ -451,7 +667,7 @@ def _validate_height_constraint(
         retrieve_box_dims,
     )
 
-    # Core loop over active checked envs (acceptable for runtime path as n_active is small)
+    # Core loop over active checked envs
     for i in check_indices:
         idx = i.item()
         
@@ -494,6 +710,63 @@ def _validate_height_constraint(
         
         if not bool(valid.item()):
             env._height_invalid_mask[idx] = True
+
+
+def _validate_height_constraint_place_only(
+    env: PalletTask,
+    grid_x: torch.Tensor,
+    grid_y: torch.Tensor,
+    rot_idx: torch.Tensor,
+    gx_dim: int,
+    gy_dim: int,
+    n: int,
+    device,
+):
+    """
+    Height constraint validation for place-only mode.
+
+    Simplified version that only checks PLACE operations with
+    stage-specific grid resolution.
+    """
+    cfg = env.cfg
+    border_eps = getattr(cfg, "place_border_epsilon_m", 1e-6)
+    support_tol = getattr(cfg, "place_support_height_tol_m", 0.02)
+    support_ratio_min = getattr(cfg, "place_support_ratio_min", 0.45)
+
+    env._height_invalid_mask[:] = False
+
+    if env._last_heightmap is None:
+        return
+
+    env_idx_tensor = torch.arange(n, device=device)
+    box_idx_clamped = env.box_idx.clamp(0, cfg.max_boxes - 1)
+    box_dims = env.box_dims[env_idx_tensor, box_idx_clamped]
+
+    for i in range(n):
+        cx, cy = _grid_to_pallet_center_direct(
+            grid_x[i:i + 1], grid_y[i:i + 1],
+            cfg.pallet_size, gx_dim, gy_dim,
+        )
+
+        eff_xy = _get_effective_xy_dims(box_dims[i], rot_idx[i])
+
+        border_valid = _check_inside_pallet(cx, cy, eff_xy, cfg.pallet_size, border_eps)
+        if not bool(border_valid.item()):
+            env._height_invalid_mask[i] = True
+            continue
+
+        ix_min, ix_max, iy_min, iy_max = _get_footprint_pixel_bounds(
+            cx, cy, eff_xy, cfg.pallet_size, cfg.map_shape,
+        )
+
+        patch = env._last_heightmap[i, iy_min[0]:iy_max[0] + 1, ix_min[0]:ix_max[0] + 1]
+
+        valid = _evaluate_patch_support(
+            patch, box_dims[i, 2],
+            cfg.max_stack_height, support_tol, support_ratio_min,
+        )
+        if not bool(valid.item()):
+            env._height_invalid_mask[i] = True
 
 
 def _write_place_poses(

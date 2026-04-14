@@ -52,7 +52,9 @@ from pallet_rl.envs.observation_builder import build_observations
 from pallet_rl.envs.reward_manager import compute_rewards
 from pallet_rl.envs.placement_controller import (
     pre_physics_step as _placement_pre_physics_step,
+    pre_physics_step_place_only as _placement_pre_physics_step_place_only,
     get_action_mask as _get_action_mask_impl,
+    get_action_mask_place_only as _get_action_mask_place_only_impl,
 )
 
 
@@ -228,6 +230,11 @@ class PalletTaskCfg(DirectRLEnvCfg):
     penalty_repetition_scale: float = -0.2
     penalty_stagnation_scale: float = -5.0
 
+    # --- Curriculum / Place-Only Mode ---
+    place_only: bool = False
+    place_only_grid: tuple[int, int] = (8, 12)
+    place_only_rotations: int = 2
+
     # --- Visual Features ---
     use_pallet_mesh_visual: bool = False
     pallet_mesh_stl_path: str = "assets/EuroPalletH0_2.STL"
@@ -292,7 +299,16 @@ class PalletTaskCfg(DirectRLEnvCfg):
 
     @property
     def num_actions(self) -> int:
+        if self.place_only:
+            # Single joint categorical index
+            return 1
         return len(self.action_dims)
+
+    @property
+    def total_place_actions(self) -> int:
+        """Total joint (x, y, rot) placement actions for place-only mode."""
+        gx, gy = self.place_only_grid
+        return gx * gy * self.place_only_rotations
 
 
 # =============================================================================
@@ -334,7 +350,11 @@ class PalletTask(DirectRLEnv):
         _create_prim(f"{env_ns}/env_0/Boxes", "Xform")
 
         # Set action space before super().__init__()
-        cfg.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
+        if cfg.place_only:
+            total_actions = cfg.total_place_actions
+            cfg.action_space = gym.spaces.Discrete(total_actions)
+        else:
+            cfg.action_space = gym.spaces.Box(low=-1.0, high=1.0, shape=(5,), dtype=np.float32)
 
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -422,7 +442,11 @@ class PalletTask(DirectRLEnv):
         self.last_target_quat = torch.zeros(n, 4, device=device)
         self.last_target_quat[:, 0] = 1.0
 
-        self._actions = torch.zeros(n, 5, dtype=torch.float32, device=device)
+        if cfg.place_only:
+            # In place-only mode, the policy outputs a single int column
+            self._actions = torch.zeros(n, 1, dtype=torch.float32, device=device)
+        else:
+            self._actions = torch.zeros(n, 5, dtype=torch.float32, device=device)
         self._inactive_box_pos = torch.tensor([1e6, 1e6, -1e6], device=device)
 
         # KPI settling
@@ -477,7 +501,10 @@ class PalletTask(DirectRLEnv):
         # --- Stagnation / repetition tracking ---
         self._stagnation_counter = torch.zeros(n, dtype=torch.long, device=device)
         self._prev_box_idx = torch.zeros(n, dtype=torch.long, device=device)
-        self._prev_actions = torch.zeros(n, 5, dtype=torch.float32, device=device)
+        if cfg.place_only:
+            self._prev_actions = torch.zeros(n, 1, dtype=torch.float32, device=device)
+        else:
+            self._prev_actions = torch.zeros(n, 5, dtype=torch.float32, device=device)
         self._prev_action_repeated_count = torch.zeros(n, dtype=torch.long, device=device)
         self._termination_reason = torch.zeros(n, dtype=torch.long, device=device)
 
@@ -517,7 +544,7 @@ class PalletTask(DirectRLEnv):
         updates, buffer mutations, payload accounting, settling arming)
         must therefore happen here to remain decimation-safe.
         """
-        _placement_pre_physics_step(self, actions)
+        _placement_pre_physics_step(self, actions) if not self.cfg.place_only else _placement_pre_physics_step_place_only(self, actions)
 
     def _apply_action(self) -> None:
         """
@@ -531,7 +558,9 @@ class PalletTask(DirectRLEnv):
         return None
 
     def get_action_mask(self) -> torch.Tensor:
-        """Delegate to placement_controller module."""
+        """Delegate to placement_controller module (mode-aware)."""
+        if self.cfg.place_only:
+            return _get_action_mask_place_only_impl(self)
         return _get_action_mask_impl(self)
 
     # =====================================================================

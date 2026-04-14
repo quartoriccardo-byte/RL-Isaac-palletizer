@@ -1,7 +1,13 @@
 # RSL-RL Configuration for Palletizer
 # Isaac Lab 4.0+ Compatible
+# Curriculum-aware: defaults set for Stage A (place-only)
 
 seed: 42
+
+# Curriculum stage (A, B, C, D)
+# Stage A: place-only, coarse grid, easy task
+# Stage D: full factored actions with buffer ops
+curriculum_stage: A
 
 runner:
   # Runner class to use
@@ -11,8 +17,8 @@ runner:
   policy_class_name: ActorCritic
   algorithm_class_name: PPO
   
-  # Rollout settings
-  num_steps_per_env: 24  # Short horizon for palletizing
+  # Rollout settings (stage-dependent, overridden by curriculum)
+  num_steps_per_env: 48
   
   # Training settings
   max_iterations: 2000
@@ -28,14 +34,13 @@ runner:
   checkpoint: -1
   
   # Observation groups mapping (required by RSL-RL OnPolicyRunner)
-  # Maps algorithm obs sets to env observation dict keys returned by _get_observations()
   obs_groups:
     policy: ["policy"]
     critic: ["critic"]
 
 policy:
   # Custom policy class will be injected via monkey-patch
-  # These dims are for reference - actual architecture is in PalletizerActorCritic
+  # PlaceOnlyActorCritic for stages A-C, PalletizerActorCritic for D
   
   init_noise_std: 1.0
   
@@ -48,7 +53,7 @@ policy:
   # Activation function
   activation: elu
   
-  # Vision encoder config (used by PalletizerActorCritic)
+  # Vision encoder config (used by both policy variants)
   # Input: (N, 1, 160, 240) heightmap
   # Output: 256-dim latent
   vision:
@@ -59,7 +64,7 @@ policy:
     output_dim: 256
   
   # Vector encoder config (buffer state)
-  # Input: 53 (50 buffer + 3 box dims)
+  # Input: 91 (buffer 60 + box dims 3 + payload/mass/constraints 4 + proprio 24)
   # Output: 64-dim latent
   vector:
     type: mlp
@@ -76,8 +81,8 @@ algorithm:
   # Policy clipping
   clip_param: 0.2
   
-  # Entropy bonus for exploration
-  entropy_coef: 0.01
+  # Entropy bonus (stage-dependent, higher for early stages)
+  entropy_coef: 0.02
   
   # Training epochs per rollout
   num_learning_epochs: 5
@@ -101,22 +106,19 @@ algorithm:
 env:
   num_envs: 4096
   
-  # Observation structure (updated for constraints)
+  # Observation structure (unchanged across stages)
   obs_dim: 38491
   # - Heightmap: 160 * 240 = 38400
-  # - Buffer: 10 * 6 = 60 (added mass feature)
+  # - Buffer: 10 * 6 = 60 (zero-padded in place-only stages)
   # - Box dims: 3
   # - Payload norm: 1
   # - Mass norm: 1
-  # - Max payload norm: 1 (for domain randomization)
-  # - Max stack height norm: 1 (for domain randomization)
+  # - Max payload norm: 1
+  # - Max stack height norm: 1
   # - Proprio: 24
   
-  # Action space (Continuous Box translated to Factored Discrete)
-  action_dims: [3, 10, 16, 24, 2]
-  # - Operation: 3 (Place, Store, Retrieve)
-  # - Buffer slot: 10
-  # - Grid X: 16
-  # - Grid Y: 24
-  # - Rotation: 2
-
+  # Action space (stage-dependent):
+  # Stage A: Discrete(192) = 8*12*2 joint placement
+  # Stage B: Discrete(432) = 12*18*2
+  # Stage C: Discrete(768) = 16*24*2
+  # Stage D: Factored [3, 10, 16, 24, 2] = 55 logits

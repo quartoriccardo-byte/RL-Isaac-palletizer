@@ -95,12 +95,13 @@ def compute_rewards(env: PalletTask) -> torch.Tensor:
         env._kpi_infeasible_count += env._infeasible_mask.float().sum()
 
     # ------------------------------------------------------------------
-    # Legacy: Buffer incentives
+    # Legacy: Buffer incentives (disabled in place-only stages)
     # ------------------------------------------------------------------
-    rewards -= 0.1 * env.store_mask.float()
-    rewards += 2.0 * env.valid_retrieve.float()
-    ages = env.buffer_state[:, :, 4].sum(dim=1)
-    rewards -= 0.01 * ages
+    if not getattr(cfg, "place_only", False):
+        rewards -= 0.1 * env.store_mask.float()
+        rewards += 2.0 * env.valid_retrieve.float()
+        ages = env.buffer_state[:, :, 4].sum(dim=1)
+        rewards -= 0.01 * ages
 
     # ------------------------------------------------------------------
     # Placement success / failure (legacy settling-based)
@@ -193,10 +194,17 @@ def _reward_packing_density(
     Uses the heightmap: if the mean height under the placement footprint
     is above the pallet surface, the box is being stacked — reward more.
     Only awarded on placement progress steps.
+
+    Disabled when ``reward_packing_density_scale == 0`` (default in early
+    curriculum stages) to avoid misleading global-occupancy signals.
     """
     n = env.num_envs
     device = env._device
     bonus = torch.zeros(n, device=device)
+
+    # Early exit when scale is zero (disabled in early curriculum stages)
+    if env.cfg.reward_packing_density_scale == 0.0:
+        return bonus
 
     if not progress_mask.any() or env._last_heightmap is None:
         return bonus

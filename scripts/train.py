@@ -65,6 +65,11 @@ def parse_args():
     parser.add_argument("--depth_debug_save_dir", type=str, default=None,
                         help="Directory for depth debug frames")
     
+    # Curriculum stage selection
+    parser.add_argument("--stage", type=str, default="A",
+                        choices=["A", "B", "C", "D"],
+                        help="Curriculum stage (default: A = place-only, easy)")
+    
     # Use parse_known_args to accept unknown Kit/Carb settings (--/path=value)
     args, unknown = parser.parse_known_args()
     return args, unknown
@@ -255,6 +260,9 @@ def main():
     # Project imports
     from pallet_rl.envs.pallet_task import PalletTask, PalletTaskCfg
     from pallet_rl.models.rsl_rl_wrapper import PalletizerActorCritic
+    from pallet_rl.configs.curriculum import (
+        get_stage, get_stage_config, apply_stage_to_cfg,
+    )
 
     # =========================================================================
     # RenderNormWrapper: Ensure render() returns uint8 RGB for RecordVideo
@@ -453,6 +461,16 @@ def main():
         env_cfg.scene.num_envs = args.num_envs
         env_cfg.sim.device = args.device
         
+        # Apply curriculum stage configuration
+        stage = get_stage(args.stage)
+        stage_cfg = get_stage_config(stage)
+        apply_stage_to_cfg(stage, env_cfg)
+        print(f"[INFO] Curriculum stage: {stage.value} (place_only={env_cfg.place_only})")
+        print(f"[INFO]   Grid: {env_cfg.place_only_grid}, Rotations: {env_cfg.place_only_rotations}")
+        print(f"[INFO]   num_boxes={env_cfg.num_boxes}, max_stack_height={env_cfg.max_stack_height}")
+        print(f"[INFO]   reward_place_progress={env_cfg.reward_place_progress_scale}, "
+              f"reward_success={env_cfg.reward_success_scale}")
+        
         # CLI overrides for depth-camera heightmap validation
         if args.heightmap_source is not None:
             env_cfg.heightmap_source = args.heightmap_source
@@ -572,13 +590,29 @@ def main():
         # By assigning our CNN-based policy to the "ActorCritic" name, the
         # OnPolicyRunner will instantiate PalletizerActorCritic automatically.
         from pallet_rl.models.rsl_rl_wrapper import register_custom_policy
-        register_custom_policy()
+        register_custom_policy(place_only=env_cfg.place_only)
+        print(f"[INFO] Registered policy: {'PlaceOnlyActorCritic' if env_cfg.place_only else 'PalletizerActorCritic'}")
         
         # ---------------------------------------------------------------------
         # Step 7: Create RSL-RL runner
         # ---------------------------------------------------------------------
         print("Initializing RSL-RL runner...")
         rsl_cfg = get_rsl_rl_cfg(args)
+        
+        # Override training hyperparameters from curriculum stage
+        rsl_cfg.setdefault("algorithm", {})["entropy_coef"] = stage_cfg.entropy_coef
+        rsl_cfg.setdefault("runner", {})["num_steps_per_env"] = stage_cfg.num_steps_per_env
+        rsl_cfg["num_steps_per_env"] = stage_cfg.num_steps_per_env
+        print(f"[INFO] PPO entropy_coef={stage_cfg.entropy_coef}, "
+              f"num_steps_per_env={stage_cfg.num_steps_per_env}")
+        
+        # Inject place-only grid config into policy kwargs so
+        # PlaceOnlyActorCritic receives grid_x/grid_y/num_rotations.
+        if env_cfg.place_only:
+            policy_cfg = rsl_cfg.setdefault("policy", {})
+            policy_cfg["grid_x"] = env_cfg.place_only_grid[0]
+            policy_cfg["grid_y"] = env_cfg.place_only_grid[1]
+            policy_cfg["num_rotations"] = env_cfg.place_only_rotations
         
         # DEBUG: Verify obs_groups is present at required locations
         print(f"[DEBUG] rsl_cfg top-level keys: {list(rsl_cfg.keys())}")
